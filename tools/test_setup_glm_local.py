@@ -282,7 +282,7 @@ class LocalGlm53(unittest.TestCase):
                 patch.object(maya.S, "UI", None), patch.object(maya, "setup_gpus", return_value=[]), \
                 patch.object(maya, "mem_gb", return_value=(512, 400)), \
                 patch.object(maya, "import_catalog", side_effect=AssertionError("catalog consulted")):
-            kind, linked = maya.choose_model(a, self.models, {}, "glm53")
+            kind, linked = maya.choose_model(a, self.models, {}, family="glm53")
         self.assertEqual(kind, "linked")
         self.assertEqual(linked["model"].resolve(), self.shards[0].resolve())
         self.assertEqual(len(linked["files"]), 7)

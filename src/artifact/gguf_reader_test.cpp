@@ -9,8 +9,8 @@
 // The fixture is a minimal GGUF v3 written here (header, no metadata, two F32[8] tensors, 32-byte
 // alignment), so the test needs neither gguf-py nor a shard.  The file is closed before it is removed:
 // on Windows an open mapping keeps it.
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/qsa.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/kernels/qsa.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -46,7 +46,7 @@ std::filesystem::path write_gguf(const std::vector<std::string>& names, int inde
     put<uint64_t>(b, indexer_top_k >= 0 ? 1 : 0); // n_kv
     if (indexer_top_k >= 0) {
         put_str(b, "qwen4exp.attention.indexer.top_k");
-        put<uint32_t>(b, (uint32_t) strata::MetaType::U32);
+        put<uint32_t>(b, (uint32_t) maya::MetaType::U32);
         put<uint32_t>(b, (uint32_t) indexer_top_k);
     }
     for (size_t i = 0; i < names.size(); ++i) {
@@ -57,7 +57,7 @@ std::filesystem::path write_gguf(const std::vector<std::string>& names, int inde
         put<uint64_t>(b, 32 * i);    // offset from data_start
     }
     b.resize((b.size() + 31) / 32 * 32 + 32 * names.size(), 0);
-    const auto path = std::filesystem::temp_directory_path() / "strata_gguf_reader_test.gguf";
+    const auto path = std::filesystem::temp_directory_path() / "maya_gguf_reader_test.gguf";
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
     return path;
 }
@@ -71,7 +71,7 @@ int main() {
         size_t n = 0;
         bool both = false;
         try {
-            strata::GgufFile g(path.string());
+            maya::GgufFile g(path.string());
             n = g.tensors().size();
             both = g.find("blk.0.attn_q.weight") && g.find("blk.0.attn_k.weight");
         } catch (const std::exception& e) {
@@ -84,7 +84,7 @@ int main() {
         const auto path = write_gguf({"blk.0.attn_q.weight", "blk.0.attn_q.weight"});
         std::string err;
         try {
-            strata::GgufFile g(path.string());
+            maya::GgufFile g(path.string());
         } catch (const std::exception& e) {
             err = e.what();
         }
@@ -99,8 +99,8 @@ int main() {
         int64_t top_k = 0;
         std::string err;
         try {
-            strata::GgufFile g(path.string());
-            err = strata::qwen_indexer_top_k(g, top_k);
+            maya::GgufFile g(path.string());
+            err = maya::qwen_indexer_top_k(g, top_k);
         } catch (const std::exception& e) {
             err = e.what();
         }
@@ -110,8 +110,8 @@ int main() {
                           err.find("supported: 2048 or 4096") != std::string::npos,
               ("indexer budget in GGUF: " + std::to_string(declared)).c_str());
         if (supported) {
-            const auto shapes = strata::kernels::qsa_real_shapes(top_k);
-            check(strata::kernels::qsa_selection_width(5000, shapes) == top_k + 3,
+            const auto shapes = maya::kernels::qsa_real_shapes(top_k);
+            check(maya::kernels::qsa_selection_width(5000, shapes) == top_k + 3,
                   ("QSA selection width follows GGUF budget " + std::to_string(top_k)).c_str());
         }
     }

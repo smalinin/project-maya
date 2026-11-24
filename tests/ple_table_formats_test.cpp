@@ -1,6 +1,6 @@
 // Synthetic GGUF Engram tables in every supported encoding, through mmap and direct I/O.
 // The pinned ggml CPU dequantizer is the independent value reference.
-#include "strata/kernels/ngram.hpp"
+#include "maya/kernels/ngram.hpp"
 
 #include "ggml.h"
 
@@ -17,7 +17,7 @@
 
 namespace {
 namespace fs = std::filesystem;
-namespace k = strata::kernels;
+namespace k = maya::kernels;
 
 constexpr int kRows = 64;
 

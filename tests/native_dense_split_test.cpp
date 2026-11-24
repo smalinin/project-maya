@@ -1,8 +1,8 @@
 // A split Qwen GGUF may describe its embedded MTP only in shard 0. Both header
 // discovery and upload must exclude that block in later shards, while still
 // rejecting a genuinely missing canonical trunk matrix.
-#include "strata/core/native_dense.hpp"
-#include "strata/core/weights.hpp"
+#include "maya/core/native_dense.hpp"
+#include "maya/core/weights.hpp"
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
@@ -66,19 +66,19 @@ int main() {
         shard(d / "first.gguf", 0, mtp, {"blk.0.attn_q.weight"}); shard(d / "last.gguf", 1, mtp, last);
         const std::vector<std::string> paths = {(d / "first.gguf").string(), (d / "last.gguf").string()};
         std::set<std::string> names; std::string err;
-        check(strata::core::NativeDense::served_names(paths, false, names, err) && names == expected,
+        check(maya::core::NativeDense::served_names(paths, false, names, err) && names == expected,
               d.filename().string() + " discovery: only trunk matrices (" + err + ")");
         if (!gpu) continue;
         index(d, expected);
         {
-            strata::core::WeightTable table; strata::core::NativeDense dense;
+            maya::core::WeightTable table; maya::core::NativeDense dense;
             const bool ok = table.load(d.string(), nullptr, 0, err, &expected) && dense.load(paths, table, err);
             check(ok && dense.tensor_count() == 2 && table.find(*expected.rbegin())->native_data,
                   d.filename().string() + " upload: late-shard trunk loaded, MTP excluded (" + err + ")");
         }
         index(d, {"blk.0.attn_q.weight"}); err.clear();
         {
-            strata::core::WeightTable table; strata::core::NativeDense dense;
+            maya::core::WeightTable table; maya::core::NativeDense dense;
             check(table.load(d.string(), nullptr, 0, err, &expected) && !dense.load(paths, table, err) &&
                   err.find("absent from canonical table: blk.47.attn_output.weight") != std::string::npos,
                   d.filename().string() + " missing trunk matrix is still rejected");

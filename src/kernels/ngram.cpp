@@ -1,11 +1,11 @@
 // src/kernels/ngram.cpp - P2.S4: the PLE n-gram hash and IQ4_NL/Q5_1/Q8_0/BF16 table reads.
 //
-// See include/strata/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
-#include "strata/kernels/ngram.hpp"
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/ngram/ple_reader.hpp"
+// See include/maya/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
+#include "maya/kernels/ngram.hpp"
+#include "maya/artifact/gguf_reader.hpp"
+#include "maya/kernels/f16_bits.hpp"
+#include "maya/kernels/bf16_bits.hpp"
+#include "maya/ngram/ple_reader.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -19,7 +19,7 @@
 #include <windows.h>
 #endif
 
-namespace strata::kernels {
+namespace maya::kernels {
 
 namespace {
 /// The A/B arm.  Host-token-path only, so it needs no atomics; see the note on `ple_prefetch_enable`.
@@ -172,8 +172,8 @@ struct PleTable::Impl {
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
     PleIo mode = PleIo::Mmap;
-    strata::ngram::PleReader reader;
-    strata::ngram::PleReader::Ticket ticket;
+    maya::ngram::PleReader reader;
+    maya::ngram::PleReader::Ticket ticket;
     bool pending = false;
     uint32_t rows[PLE_N_HEADS] = {};
     uint8_t raw[PLE_N_HEADS * PLE_MAX_ROW_BYTES] = {};
@@ -363,7 +363,7 @@ void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_del
 
 std::string PleTable::io_report() const {
     if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return {};
-    const strata::ngram::ReaderStats& s = impl_->reader.stats();
+    const maya::ngram::ReaderStats& s = impl_->reader.stats();
     char buf[320];
     std::snprintf(buf, sizeof buf,
                   "ple io: %llu rows, %.1f%% row-cache hits, %llu SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
@@ -419,4 +419,4 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
     for (int h = 0; h < PLE_N_HEADS; ++h) read_row(rows16[h], out2560 + (size_t) h * PLE_HEAD_DIM);
 }
 
-}  // namespace strata::kernels
+}  // namespace maya::kernels

@@ -32,7 +32,7 @@ namespace mm3::gg {
 
 constexpr int kF32 = 0, kF16 = 1, kBF16 = 30;
 
-namespace x3 = strata::mm3::exl3;
+namespace x3 = maya::mm3::exl3;
 
 /// x3::Mat::fmt / x3::ExpertLayout::fmt of a GGUF's weights (Mat: raw = [n][k] blocks of gg_type, ld bytes a row).
 constexpr int kFmtGG = 4;

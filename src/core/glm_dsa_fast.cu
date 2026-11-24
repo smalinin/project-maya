@@ -12,15 +12,15 @@
 #include "glm_dsa_fast.hpp"
 #include "glm_fast_state.hpp"
 
-#include "strata/core/glm_env.hpp"
-#include "strata/kernels/glmd_graph.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/kernels/glmd_graph.hpp"
 
 #include <cstdio>
 #include <string>
 
-namespace strata::core {
+namespace maya::core {
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 static_assert(glmdsa::kTypeF32 == gf::kTypeF32 && glmdsa::kTypeBF16 == gf::kTypeBF16, "glmdsa type ids mirror gf's");
 static_assert(glmdsa::kMaxMvJobs == gf::kMaxMvJobs, "one fallback row per mv job");
 
@@ -79,8 +79,8 @@ void q8_1_to_f32(const void* xq, int n, float* y, cudaStream_t s) {
 static bool run_mv(const GlmDsaFast* ext, const gf::MvJob* jobs, int n, cudaStream_t s) {
     if (ext == nullptr) return gf::mv(jobs, n, s);
     static const int cfg = [] {
-        const int v = strata::glmenv::env_switch("MAYA_GLMD_MV_DSA", strata::glmenv::kAuto, true);
-        return v == strata::glmenv::kOff ? gf::kMvDsaOff : v == strata::glmenv::kOn ? gf::kMvDsaOn : gf::kMvDsaAuto;
+        const int v = maya::glmenv::env_switch("MAYA_GLMD_MV_DSA", maya::glmenv::kAuto, true);
+        return v == maya::glmenv::kOff ? gf::kMvDsaOff : v == maya::glmenv::kOn ? gf::kMvDsaOn : gf::kMvDsaAuto;
     }();
     return gf::mv_dsa(jobs, n, s, cfg);
 }
@@ -221,6 +221,8 @@ void Glm5Model::fast_bind_dsa(int il, std::string& missing) {
     Ly.recr = false;
     Ly.moe = il >= g.dense_lead;
     Ly.mtp = is_mtp;
+    Ly.ff = g.n_ff_exp;
+    Ly.ffd = g.n_ff_dense;
     if (is_mtp) {
         Ly.eh = mvw("nextn.eh_proj.weight", 2 * E, E);
         Ly.enorm = f32("nextn.enorm.weight");
@@ -361,4 +363,4 @@ bool Glm5Model::fast_dsa_arena(std::string& err) {
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace maya::core

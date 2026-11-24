@@ -4,7 +4,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
-namespace strata::core::dflash_detail {
+namespace maya::core::dflash_detail {
 
 inline bool selector_packed(int type, int rank) {
     return type == 0 || type == 1 || type == 30 || (type == 8 && rank % 32 == 0) ||
@@ -35,4 +35,4 @@ __device__ __forceinline__ float q5_k_at(const uint8_t* tab, int rank, int row, 
     return __low2float(q->dm) * (float) sc * (float) v - __high2float(q->dm) * (float) mn;
 }
 
-} // namespace strata::core::dflash_detail
+} // namespace maya::core::dflash_detail

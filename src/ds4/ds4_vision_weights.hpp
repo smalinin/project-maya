@@ -2,14 +2,14 @@
 // stay separate on disk; F32/F16/Q8_0 are converted only while loading into RAM.
 #pragma once
 
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "maya/kernels/bf16_bits.hpp"
+#include "maya/kernels/f16_bits.hpp"
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 template <class Pack>
 bool vision_read_bf16(const Pack& pk, const std::string& name, std::vector<int64_t>& shape, void* dst,
@@ -67,4 +67,4 @@ bool vision_read_bf16(const Pack& pk, const std::string& name, std::vector<int64
     }
     return true;
 }
-}  // namespace strata::ds4
+}  // namespace maya::ds4

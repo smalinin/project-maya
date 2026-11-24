@@ -20,7 +20,7 @@
 
 __global__ void decode(const uint8_t* table, int rank, int rows, float* out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rank * rows) out[i] = strata::core::dflash_detail::q5_k_at(table, rank, i / rank, i % rank);
+    if (i < rank * rows) out[i] = maya::core::dflash_detail::q5_k_at(table, rank, i / rank, i % rank);
 }
 
 int main() {
@@ -41,7 +41,7 @@ int main() {
         ggml_quantize_chunk(type, values.data(), packed.data(), 0, rows, rank, nullptr);
         // Also exercise every packed scale/high-bit pattern, including the
         // upper two bits shared between scales and minima in groups 4..7.
-        auto* blocks = reinterpret_cast<strata::core::dflash_detail::BlkQ5K*>(packed.data());
+        auto* blocks = reinterpret_cast<maya::core::dflash_detail::BlkQ5K*>(packed.data());
         for (int i = 2 * rank / 256; i < rows * rank / 256; ++i) {
             blocks[i].dm = __floats2half2_rn(0.03125f, 0.015625f);
             for (auto& b : blocks[i].scales) b = (uint8_t) rng();

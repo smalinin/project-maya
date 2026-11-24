@@ -34,7 +34,7 @@ int main() {
     std::string err;
     std::vector<int64_t> shape;
     uint16_t out[64] = {};
-    auto read = [&](const char* n) { return strata::ds4::vision_read_bf16(pk, n, shape, out, err); };
+    auto read = [&](const char* n) { return maya::ds4::vision_read_bf16(pk, n, shape, out, err); };
     pk.add<uint16_t>("bf16", "BF16", {3}, {0x3f80, 0xc000, 0x0001});
     assert(read("bf16") && out[0] == 0x3f80 && out[1] == 0xc000 && out[2] == 1);
     pk.add<float>("f32", "F32", {4}, {1.0f, -2.0f, 1.00390625f, 1.01171875f});
@@ -49,7 +49,7 @@ int main() {
     pk.add<float>("w1.part.1", "F32", {1, 2}, {-1.0f, -2.0f});
     assert(read("w1") && shape == std::vector<int64_t>({2, 2}) &&
            out[0] == 0x3f80 && out[1] == 0x4000 && out[2] == 0xbf80 && out[3] == 0xc000);
-    assert(strata::ds4::vision_read_bf16(pk, "w1", shape, nullptr, err));
+    assert(maya::ds4::vision_read_bf16(pk, "w1", shape, nullptr, err));
     pk.tensors["w1.part.1"].shape = {2, 1};
     assert(!read("w1"));
     pk.tensors["q8"].bytes = 33;
