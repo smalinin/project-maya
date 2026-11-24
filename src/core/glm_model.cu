@@ -32,6 +32,7 @@
 #include "maya/kernels/iq_kernels.hpp"
 
 #include "maya/core/glm_split_devices.hpp"
+#include "maya/core/pcie_probe.hpp"
 #include "maya/platform/env_switch.hpp"
 
 #include "ggml.h"
@@ -1496,10 +1497,10 @@ static double host_read_bps(bool dsa) {
 //     two-part split with the draft block, where the GPUs work on consecutive tokens: there a token costs the slower
 //     part (the draft on the last one), and the sum breaks the tie;
 //   - the startability gate (upstream #1094): every part keeps its pool's floor and can lend a 512-token prompt chunk.
-// Two to four GPUs try every placement (memoised per part and range, as Strata's four-way search); more keep the
-// proportional split (glm_auto_bounds) - except a DFlash drafter's pipelined window, whose slowest part paces every
-// draft: there a DP over the layers for each cap on the slowest part.  MAYA_GLM_SPLIT_LOG=1 prints every
-// placement's prediction.
+// Two to four GPUs try every placement, memoised per part and range. More GPUs use dynamic programming for
+// glm-dsa's additive cost or a DFlash window's cost at each sampled cap on the slowest part. For large glm-dsa
+// splits, also price the expert weights a prefill may have to move over each card's measured host link.
+// MAYA_GLM_SPLIT_LOG=1 prints the placements compared by the search.
 // only: price only these bounds (devs.size() - 1 of them; one device allowed) and return them; startable: whether
 // the placement returned leaves every part its pool's floor and a 512-token prompt chunk (glm-dsa KV auto, decision 36)
 static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& devs,
@@ -1741,25 +1742,32 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if (!cv.empty()) return cv[(size_t) std::min<int64_t>(s, (int64_t) cv.size() - 1)];
         return 1.0 - std::pow(1.0 - (double) s / g.n_expert, cover_b);
     };
-    // the cards: free VRAM, memory bandwidth (the bus: 2 x memory clock x width); the host's RAM read speed
+    const char* prefill_mode = getenv("MAYA_GLM_PREFILL_CHUNK");
+    if (prefill_mode == nullptr || prefill_mode[0] == '\0') prefill_mode = getenv("MAYA_GLM_PREFILL");
+    const bool chunked_prefill = prefill_mode == nullptr || prefill_mode[0] == '\0' ||
+                                 std::strcmp(prefill_mode, "auto") == 0 || std::atoll(prefill_mode) > 0;
+    const bool probe_links = fast && n > 4 && g.arch == GlmArch::GlmDsa && !df_pipe && only == nullptr && chunked_prefill;
+    // the cards: free VRAM, memory bandwidth (2 x memory clock x width), and the measured H2D link
     struct Card {
         int dev;
-        double free, total, bw;
-        std::string name;
+        double free = 0, total = 0, bw = 0, h2d = 0;
+        std::string name{};
     };
     std::vector<Card> cards;
-    // glm-dsa: MAYA_GLM_SPLIT_CARDS="<free GiB>:<GB/s>[:<name>],..." (one per device) stands in for the cards - the
-    // split plan checked without GPUs (tests/glm_dsa/glm_dsa_loader_test.cpp, glm_split_search); Flash never reads it
+    // The optional simulated H2D rate follows the card name. Older fixtures without a rate price decode only.
     if (const char* sim = g.arch == GlmArch::GlmDsa ? getenv("MAYA_GLM_SPLIT_CARDS") : nullptr;
         sim != nullptr && sim[0] != '\0') {
         std::istringstream ss(sim);
         std::string item;
         while (std::getline(ss, item, ',') && cards.size() < devs.size()) {
-            Card c{devs[cards.size()], 0, 0, 0, "simulated"};
+            Card c{devs[cards.size()]};
             const size_t a = item.find(':'), b = a == std::string::npos ? a : item.find(':', a + 1);
+            const size_t e = b == std::string::npos ? b : item.find(':', b + 1);
             c.free = c.total = std::atof(item.c_str()) * 1073741824.0;
             c.bw = a == std::string::npos ? 0.0 : std::atof(item.c_str() + a + 1) * 1e9;
-            if (b != std::string::npos) c.name = item.substr(b + 1);
+            c.name = b == std::string::npos ? "simulated"
+                                           : item.substr(b + 1, e == std::string::npos ? e : e - b - 1);
+            if (e != std::string::npos) c.h2d = std::atof(item.c_str() + e + 1) * 1e9;
             cards.push_back(c);
         }
         if (cards.size() != devs.size()) {
@@ -1768,29 +1776,35 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             return {};
         }
     } else {
-    int cur = 0;
-    cudaGetDevice(&cur);
-    for (int d : devs) {
-        Card c{d, 0, 0, 0, ""};
-        size_t fr = 0, tot = 0;
-        cudaSetDevice(d);
-        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) cudaGetLastError();
-        int khz = 0, bits = 0;
-        if (cudaDeviceGetAttribute(&khz, cudaDevAttrMemoryClockRate, d) != cudaSuccess) khz = 0;
-        if (cudaDeviceGetAttribute(&bits, cudaDevAttrGlobalMemoryBusWidth, d) != cudaSuccess) bits = 0;
-        cudaGetLastError();
-        cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) c.name = prop.name;
-        cudaGetLastError();
-        c.free = (double) fr;
-        c.total = (double) tot;
-        c.bw = 2.0 * (double) khz * 1e3 * (double) bits / 8.0;
-        cards.push_back(c);
+        int cur = 0;
+        cudaGetDevice(&cur);
+        for (int d : devs) {
+            Card c{d};
+            size_t fr = 0, tot = 0;
+            const bool selected = cudaSetDevice(d) == cudaSuccess;
+            if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) cudaGetLastError();
+            int khz = 0, bits = 0;
+            if (cudaDeviceGetAttribute(&khz, cudaDevAttrMemoryClockRate, d) != cudaSuccess) khz = 0;
+            if (cudaDeviceGetAttribute(&bits, cudaDevAttrGlobalMemoryBusWidth, d) != cudaSuccess) bits = 0;
+            cudaGetLastError();
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) c.name = prop.name;
+            cudaGetLastError();
+            c.free = (double) fr;
+            c.total = (double) tot;
+            c.bw = 2.0 * (double) khz * 1e3 * (double) bits / 8.0;
+            if (probe_links && selected) c.h2d = maya::core::probe_pcie_h2d_gbps() * 1e9;
+            cards.push_back(c);
+        }
+        cudaSetDevice(cur);
     }
-    cudaSetDevice(cur);
-    }   // (the simulated cards)
     for (auto& c : cards)
         if (c.bw <= 0) c.bw = 1e11;   // (no reading: every card the same, and the misses decide)
+    const bool price_prefill = probe_links && std::all_of(cards.begin(), cards.end(), [](const Card& c) {
+        return std::isfinite(c.h2d) && c.h2d > 0;
+    });
+    // One prefill's expert transfers plus the cost of a moderate reply. Independent of the context reservation.
+    constexpr int reply_tokens = 256;
     const double host_bps = host_read_bps(g.arch == GlmArch::GlmDsa);
     // each part's lane, all at once - except under a DFlash pipelined window (3+ GPUs): there ONE pool serves every
     // part's misses as they come (fast_setup), at about half the host's all-core read speed (Maya-L over 9 GPUs: 0.14-
@@ -1806,7 +1820,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const int64_t keep = g.n_exp_used + kSparesHere + 2;
     const auto moe_layer = [&](int l) { return l >= g.dense_lead && blob[(size_t) l] > 0; };
     struct Eval {
-        double ms = 0, routes = 0, hits = 0;
+        double ms = 0, prefill_ms = 0, routes = 0, hits = 0;
         int64_t per = 0;
         bool ok = false;
     };
@@ -1832,6 +1846,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                 dense_ffn = true;
             }
         }
+        const double prefill_blob = bsum;   // NextN cache fill does not execute the draft block's routed experts
         if (last) {
             used += head + dflash;
             if (mtp) {
@@ -1847,6 +1862,12 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                                                             (size_t) ((double) keep * ssum), (size_t) smax).avail
                           : 0.0;
         Eval ev;
+        if (price_prefill && ssum > 0) {
+            // A prompt chunk can route a wide sweep of distinct experts. Price one transfer for every expert
+            // that the pool cannot keep resident, independent of the decode's much hotter routing distribution.
+            const double slots = std::clamp(std::floor(room / ssum) - kSparesHere, 0.0, (double) g.n_expert);
+            ev.prefill_ms = 1e3 * (g.n_expert - slots) * prefill_blob / c.h2d;
+        }
         ev.per = bsum > 0 ? std::min<int64_t>(g.n_expert, (int64_t) (room / bsum)) : 0;
         while (ev.per > 0 && (double) ev.per * ssum > room) --ev.per;
         // startable: the pool's floor, and a 512-token prompt chunk lent at --prefill auto's cap
@@ -1882,16 +1903,17 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     // a placement: {objective, tie-break, startable}; parts' times in `ms`
     const auto price = [&](const std::vector<int>& b, std::vector<Eval>& ev, double& obj, double& tie) -> bool {
         ev.clear();
-        double sum = 0, slow = 0;
+        double sum = 0, slow = 0, prefill_ms = 0;
         bool ok = true;
         for (int i = 0; i < n; ++i) {
             const int lb = i == 0 ? 0 : b[(size_t) i - 1], le = i + 1 < n ? b[(size_t) i] : L;
             ev.push_back(stage(i, lb, le));
             sum += ev.back().ms;
             slow = std::max(slow, ev.back().ms);
+            prefill_ms += ev.back().prefill_ms;
             ok = ok && ev.back().ok;
         }
-        obj = pipelined ? slow : df_pipe ? (sum + kDfKept * slow) / (1.0 + kDfKept) : sum;
+        obj = pipelined ? slow : df_pipe ? (sum + kDfKept * slow) / (1.0 + kDfKept) : sum + prefill_ms / reply_tokens;
         tie = pipelined ? sum : slow;
         return ok;
     };
@@ -1907,6 +1929,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if (startable != nullptr) *startable = ok;
         return *only;
     }
+    const auto better = [&](double o, double t, double bo, double bt) {
+        return o < bo - eps || (o <= bo + eps && t < bt - eps);
+    };
     const auto consider = [&]() {
         if (!glm_split_bounds_full(g, b)) return;   // glm-dsa B6.1: glm-dsa parts start on full-indexer layers
         double obj = 0, tie = 0;
@@ -1916,9 +1941,6 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             for (int k : b) s += (s.empty() ? "" : ",") + std::to_string(k);
             std::fprintf(stderr, "glm split auto: %s -> %.2f ms%s\n", s.c_str(), obj, ok ? "" : " (cannot start)");
         }
-        const auto better = [&](double o, double t, double bo, double bt) {
-            return o < bo - eps || (o <= bo + eps && t < bt - eps);
-        };
         if (better(obj, tie, any_obj, any_tie)) { best_any = b; any_obj = obj; any_tie = tie; }
         if (ok && better(obj, tie, best_obj, best_tie)) { best = b; best_obj = obj; best_tie = tie; }
     };
@@ -1976,12 +1998,53 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             }
             consider();
         }
+    } else if (g.arch == GlmArch::GlmDsa) {
+        std::vector<int> bounds{0};
+        for (int l = 1; l < L; ++l)
+            if (g.boundary_ok(l)) bounds.push_back(l);
+        bounds.push_back(L);
+        const int end = (int) bounds.size() - 1;
+        if (end < n) return {};
+
+        // The cheapest prefix ending at a boundary leaves the same choices for all remaining GPUs.
+        struct Prefix {
+            double sum = 1e30, slow = 1e30;
+            int from = -1;
+        };
+        std::vector<std::vector<Prefix>> dp((size_t) n + 1, std::vector<Prefix>(bounds.size()));
+        dp[0][0] = {0, 0, -1};
+        for (int i = 0; i < n; ++i) {
+            const int limit = end - (n - i - 1);
+            for (int le = i + 1 == n ? end : i + 1; le <= limit; ++le) {
+                Prefix& next = dp[i + 1][le];
+                for (int lb = i; lb < le; ++lb) {
+                    const Prefix& prev = dp[i][lb];
+                    if (prev.sum >= 1e30) continue;
+                    const Eval e = stage(i, bounds[lb], bounds[le]);
+                    if (!e.ok) continue;
+                    const double sum = prev.sum + e.ms + e.prefill_ms / reply_tokens, slow = std::max(prev.slow, e.ms);
+                    if (better(sum, slow, next.sum, next.slow)) next = {sum, slow, lb};
+                }
+            }
+        }
+        if (dp[n][end].from < 0) return {};
+        for (int i = n, at = end; i > 1; --i) {
+            at = dp[i][at].from;
+            b[(size_t) i - 2] = bounds[at];
+        }
+        consider();
     } else {
         return {};
     }
     for (const auto& c : cards)
         std::fprintf(stderr, "glm split auto: CUDA%d (%s) memory %.0f GB/s, %.2f GB free\n", c.dev, c.name.c_str(),
                      c.bw / 1e9, c.free / 1073741824.0);
+    if (probe_links) {
+        for (const auto& c : cards)
+            if (c.h2d > 0) std::fprintf(stderr, "glm split auto: CUDA%d host-to-device %.1f GB/s\n", c.dev, c.h2d / 1e9);
+        if (!price_prefill)
+            std::fprintf(stderr, "glm split auto: incomplete host-to-device measurements; pricing decode only\n");
+    }
     std::fprintf(stderr, "glm split auto: the host reads RAM at %.0f GB/s (a part's CPU lane: %.0f); the routes from %s; "
                          "%s\n", host_bps / 1e9, miss_bps / 1e9,
                  cover[(size_t) g.dense_lead].empty() ? "the default coverage curve (no usage counts)" : "the usage counts",
@@ -2010,8 +2073,14 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         hits += ev[(size_t) i].hits;
         routes += ev[(size_t) i].routes;
     }
+    const double prefill_ms = std::accumulate(ev.begin(), ev.end(), 0.0,
+                                             [](double sum, const Eval& e) { return sum + e.prefill_ms; });
     std::fprintf(stderr, "glm split auto: layers %s - a token %.1f ms predicted (%s), %.0f%% of the routed experts in "
-                         "VRAM\n", where.c_str(), obj, parts.c_str(), routes > 0 ? 100.0 * hits / routes : 0.0);
+                         "VRAM\n", where.c_str(), obj - prefill_ms / reply_tokens, parts.c_str(),
+                 routes > 0 ? 100.0 * hits / routes : 0.0);
+    if (price_prefill)
+        std::fprintf(stderr, "glm split auto: %.0f ms of prefill expert transfers + %d decode tokens (%.1f ms total)\n",
+                     prefill_ms, reply_tokens, obj * reply_tokens);
     if (g.arch == GlmArch::GlmDsa && mtp && n >= 3 && !maya::platform::env_switch("MAYA_GLM_NO_SPEC")) { std::vector<glmspec::PartCost> pc; const std::vector<int> pools = glm_split_pool_ids(g, devs); for (int i = 0; i < n; ++i) pc.push_back({cards[(size_t) i].dev, ev[(size_t) i].ms, ev[(size_t) i].ms * glmspec::lane_share(ev[(size_t) i].hits, ev[(size_t) i].routes, cards[(size_t) i].bw, miss_bps), pools[(size_t) i]}); glmspec::spec_record_prices(pc); }   // glm-dsa B11.2
     return best;
 }
@@ -2150,11 +2219,11 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
         }
         if (devs.size() == 2 && getenv("MAYA_GLM_DEVS") == nullptr)
             if (const char* d1 = getenv("MAYA_GLM_DEV1")) devs[1] = std::atoi(d1);
-        // --layer-split auto: Strata's split search over two to four GPUs (and over more for a DFlash drafter's
-        // pipelined window); more (or a pack it cannot read) share the layers by free VRAM - two GPUs at the midpoint, plus two layers for the head half when the tail also runs
-        // the NextN draft block (2x V100, split 22 / 23 / 24 / 25 / 26 -> 36.3 / 36.7 / 40.0 / 37.3 / 39.4 tok/s)
+        // Search on two to four GPUs, on larger glm-dsa splits, or for a pipelined DFlash window.
+        // Keep the proportional split when the search cannot plan a start.
         const char* dfl = getenv("MAYA_GLM_DFLASH");
-        if (devs.size() <= 4 || (dfl != nullptr && dfl[0] != '\0' && dflash_pipelined((int) devs.size()))) {
+        if (devs.size() <= 4 || g_.arch == GlmArch::GlmDsa ||
+            (dfl != nullptr && dfl[0] != '\0' && dflash_pipelined((int) devs.size()))) {
             if (kv_auto) {   // decision 36: the search with every cache resident first; streamed when nothing starts
                 s_kv_auto_resident = 1;
                 bool fits = false;

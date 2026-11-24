@@ -53,6 +53,7 @@
 #include "maya/core/mtp_rows.hpp"
 #include "maya/core/split_groups.hpp"
 #include "maya/core/prefix_cut.hpp"
+#include "maya/core/pcie_probe.hpp"
 #include "maya/core/prefill_pieces.hpp"
 #include "maya/core/prefill_gaps.hpp"
 #include "maya/core/vram_mark.hpp"
@@ -1002,38 +1003,6 @@ bool load_control_vectors(const Options& o, const maya::core::ModelGeometry& g, 
     std::fprintf(stderr, "maya generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
                  o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
     return true;
-}
-
-// The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
-// reads are.  The native default share (0.55) was measured on x16 links (~26-28 GB/s); a x8 card in a x8 slot
-// carries about half of that.  Returns < 0 when the probe cannot run (then the caller keeps the default).
-double probe_pcie_h2d_gbps() {
-    constexpr size_t kBytes = 256ull << 20;
-    constexpr int kIters = 4;
-    void* h = nullptr;
-    void* d = nullptr;
-    cudaEvent_t ev0, ev1;
-    if (cudaMallocHost(&h, kBytes) != cudaSuccess) return -1.0;
-    if (cudaMalloc(&d, kBytes) != cudaSuccess || cudaEventCreate(&ev0) != cudaSuccess ||
-        cudaEventCreate(&ev1) != cudaSuccess) {
-        if (d != nullptr) cudaFree(d);
-        cudaFreeHost(h);
-        return -1.0;
-    }
-    std::memset(h, 0, kBytes);   // fault the pages in before timing
-    cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);   // warmup: context up, copy engine primed
-    cudaEventRecord(ev0);
-    for (int i = 0; i < kIters; ++i) cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
-    cudaEventRecord(ev1);
-    const bool ok = cudaEventSynchronize(ev1) == cudaSuccess;
-    float ms = 0.f;
-    const bool timed = ok && cudaEventElapsedTime(&ms, ev0, ev1) == cudaSuccess && ms > 0.01f;
-    const double bw = timed ? ((double) kIters * (double) kBytes / (ms * 1e-3)) / 1e9 : -1.0;
-    cudaEventDestroy(ev0);
-    cudaEventDestroy(ev1);
-    cudaFree(d);
-    cudaFreeHost(h);
-    return bw;
 }
 
 // ================================ the glm5-next pack path (M3.1) ================================
@@ -5301,7 +5270,7 @@ int main(int argc, char** argv) {
     // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
     if (o.pcie_frac < 0.0) {
         const double base = native_pack ? 0.55 : 0.2;
-        const double bw = native_pack ? probe_pcie_h2d_gbps() : -1.0;
+        const double bw = native_pack ? maya::core::probe_pcie_h2d_gbps() : -1.0;
         if (!native_pack) {
             o.pcie_frac = base;
         } else if (bw > 0.0) {
@@ -5686,7 +5655,7 @@ int main(int argc, char** argv) {
         // its own PCIe share of the missed experts (the same rule as CUDA0's above: its link is probed)
         st.pcie_frac = o.pcie_frac;
         if (!pcie_given && native_pack) {
-            const double bw = probe_pcie_h2d_gbps();
+            const double bw = maya::core::probe_pcie_h2d_gbps();
             if (bw > 0.0) st.pcie_frac = bw >= 20.0 ? 0.55 : bw < 4.0 ? 0.0 : std::min(0.55, std::max(0.05, 0.55 * (bw / 26.0)));
             std::fprintf(stderr, "maya generate: layer split: CUDA%d PCIe probe %.1f GB/s -> pcie_frac %.2f\n", st.dev,
                          bw, st.pcie_frac);

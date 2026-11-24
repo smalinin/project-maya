@@ -23,6 +23,7 @@
 #include "maya/core/glm_model.hpp"
 #include "maya/kernels/dequant_bf16.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -760,6 +761,19 @@ int main() {
         const std::vector<int> v4 = search("23:1008:4090,23:1008:4090,31.5:898,15:448", {0, 1, 2, 3});
         check(v4.size() == 3 && maya::core::glm_split_bounds_full(g, v4),
               "4 mixed cards: three full-indexer boundaries  [" + txt(v4) + "]");
+        const std::vector<int> six{0, 1, 2, 3, 4, 5};
+        const std::vector<int> v6 = search("47:1008,47:1008,47:1008,47:1008,47:1008,23:936", six);
+        check(v6.size() == 5 && std::is_sorted(v6.begin(), v6.end()) &&
+                  std::adjacent_find(v6.begin(), v6.end()) == v6.end() && maya::core::glm_split_bounds_full(g, v6),
+              "6 mixed cards: five increasing full-indexer boundaries  [" + txt(v6) + "]");
+        check(search("1:1008,1:1008,1:1008,1:1008,1:1008,1:936", six).empty(),
+              "6 undersized cards: no startable plan (free-VRAM split)");
+        const auto slow3 = search("35:1008:G0:12,35:1008:G1:12,35:1008:G2:12,35:1008:G3:2,35:1008:G4:24,18:936:G5:12", six);
+        const auto slow4 = search("35:1008:G0:12,35:1008:G1:12,35:1008:G2:12,35:1008:G3:24,35:1008:G4:2,18:936:G5:12", six);
+        check(slow3.size() == 5 && slow4.size() == 5 && maya::core::glm_split_bounds_full(g, slow3) &&
+                  maya::core::glm_split_bounds_full(g, slow4) && slow3[3] - slow3[2] < slow3[4] - slow3[3] &&
+                  slow4[4] - slow4[3] < slow4[3] - slow4[2],
+              "the slower of two otherwise identical cards gets fewer layers [" + txt(slow3) + " / " + txt(slow4) + "]");
         check(search("31.5:898", {0, 1}).empty(), "fewer simulated cards than devices: no plan (free-VRAM split)");
     }
 

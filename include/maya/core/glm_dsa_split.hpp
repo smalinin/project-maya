@@ -64,7 +64,7 @@ std::vector<int> glm_snap_bounds(const Glm5Geometry& g, const std::vector<int>& 
 
 /// `--layer-split auto`'s search (glm_model.cu glm_search_bounds) on the pack in `pack_dir` for the devices `devs`:
 /// the later parts' first layers, empty when it has no answer (then load_pack splits by free VRAM).  On a glm-dsa pack
-/// MAYA_GLM_SPLIT_CARDS="<free GiB>:<GB/s>[:<name>],..." (one entry per device) replaces the CUDA card query, so
+/// MAYA_GLM_SPLIT_CARDS="<free GiB>:<VRAM GB/s>[:<name>[:<H2D GB/s>]],..." replaces the CUDA card query, so
 /// the plan can be checked without GPUs; Flash always asks CUDA.
 std::vector<int> glm_split_search(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& devs);
 
