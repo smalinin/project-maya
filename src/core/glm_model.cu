@@ -1568,19 +1568,21 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     // (KV streaming: VRAM slots for kv_cells positions; the prompt path borrows a staging copy of one layer's cache)
     const int64_t kv_cells = fast ? Glm5Model::kv_resident_cells(g.idx_kpool, max_ctx) : 0;
     const double lat_rows = (double) (kv_cells > 0 ? kv_cells : max_ctx);
-    const double lat = fast ? (double) g.kv_lora * lat_rows / 2 : (double) g.kv_lora * lat_rows;
+    const bool q8 = fast && g.kv_lora % 32 == 0 && getenv("MAYA_GLM_KV_INT8") != nullptr &&
+                    std::atoi(getenv("MAYA_GLM_KV_INT8")) != 0;
+    const double lat = q8 ? (double) maya::kernels::glmf::lat8_rec_bytes(g.kv_lora) * lat_rows / 4
+                         : (double) g.kv_lora * lat_rows / (fast ? 2 : 1);
     const size_t kv_stage = kv_cells <= 0 ? 0
                             : g.arch == GlmArch::GlmDsa ? (size_t) (2 * g.kv_lora + 2 * g.qk_rope) * (size_t) max_ctx   // L1-6
                                                         : (size_t) g.kv_lora * 2 * (size_t) max_ctx;
-    const double dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
+    const int64_t index_rows = fast && g.mhc() ? glm_state_fast_ik_ring(max_ctx) : max_ctx;
+    const double dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) index_rows + (double) g.idx_key * max_pools);
     const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
     // a layer's state bytes.  glm-dsa B4.1 / B6.1: from the layout descriptor load_pack carves with (latent + k_pe on
     // every layer, the index keys on the full-indexer layers only, the NextN block at index n_layers; no pools, no
     // ring); Flash keeps Maya's terms above
     std::vector<double> dsa_bytes;
     if (g.arch == GlmArch::GlmDsa) {
-        const bool q8 = fast && g.kv_lora % 32 == 0 && getenv("MAYA_GLM_KV_INT8") != nullptr &&
-                        std::atoi(getenv("MAYA_GLM_KV_INT8")) != 0;
         GlmStateLayout Ls;
         std::string why;
         if (glm_state_carve(g, 0, g.n_layers, g.nextn > 0 ? g.n_layers : -1, max_ctx,
@@ -1744,9 +1746,14 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     };
     const char* prefill_mode = getenv("MAYA_GLM_PREFILL_CHUNK");
     if (prefill_mode == nullptr || prefill_mode[0] == '\0') prefill_mode = getenv("MAYA_GLM_PREFILL");
-    const bool chunked_prefill = prefill_mode == nullptr || prefill_mode[0] == '\0' ||
-                                 std::strcmp(prefill_mode, "auto") == 0 || std::atoll(prefill_mode) > 0;
-    const bool probe_links = fast && n > 4 && g.arch == GlmArch::GlmDsa && !df_pipe && only == nullptr && chunked_prefill;
+    const int64_t requested_chunk = prefill_mode == nullptr || !prefill_mode[0] || std::strcmp(prefill_mode, "auto") == 0
+                                        ? 8192 : std::atoll(prefill_mode);
+    const bool flash_window = fast && df_pipe && g.mhc() && glmfast::complete_pool_on();
+    const bool probe_links = fast && only == nullptr && requested_chunk > 0 &&
+                             (flash_window || (n > 4 && g.arch == GlmArch::GlmDsa && !df_pipe));
+    const size_t prompt_chunk = (size_t) std::max<int64_t>(0, std::min(requested_chunk, max_ctx));
+    const char* vision_lend = getenv("MAYA_GLM_VISION_LEND_MB");
+    const size_t vision_bytes = vision_lend != nullptr ? (size_t) std::max(0LL, std::atoll(vision_lend)) << 20 : 0;
     // the cards: free VRAM, memory bandwidth (2 x memory clock x width), and the measured H2D link
     struct Card {
         int dev;
@@ -1755,7 +1762,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     };
     std::vector<Card> cards;
     // The optional simulated H2D rate follows the card name. Older fixtures without a rate price decode only.
-    if (const char* sim = g.arch == GlmArch::GlmDsa ? getenv("MAYA_GLM_SPLIT_CARDS") : nullptr;
+    if (const char* sim = g.arch == GlmArch::GlmDsa || flash_window ? getenv("MAYA_GLM_SPLIT_CARDS") : nullptr;
         sim != nullptr && sim[0] != '\0') {
         std::istringstream ss(sim);
         std::string item;
@@ -1822,7 +1829,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     struct Eval {
         double ms = 0, prefill_ms = 0, routes = 0, hits = 0;
         int64_t per = 0;
-        bool ok = false;
+        bool ok = false, complete = false;
     };
     // part i running layers [lb, le), memoised (a part's fill and time depend on its own range and card only)
     std::map<std::tuple<int, int, int>, Eval> memo;
@@ -1862,14 +1869,23 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                                                             (size_t) ((double) keep * ssum), (size_t) smax).avail
                           : 0.0;
         Eval ev;
-        if (price_prefill && ssum > 0) {
-            // A prompt chunk can route a wide sweep of distinct experts. Price one transfer for every expert
-            // that the pool cannot keep resident, independent of the decode's much hotter routing distribution.
-            const double slots = std::clamp(std::floor(room / ssum) - kSparesHere, 0.0, (double) g.n_expert);
-            ev.prefill_ms = 1e3 * (g.n_expert - slots) * prefill_blob / c.h2d;
-        }
         ev.per = bsum > 0 ? std::min<int64_t>(g.n_expert, (int64_t) (room / bsum)) : 0;
         while (ev.per > 0 && (double) ev.per * ssum > room) --ev.per;
+        int tail = 0;
+        if (flash_window && ssum > 0) {
+            const size_t prefill = prompt_chunk > 0
+                ? glm_prefill_lend_bytes(g, prompt_chunk, kda, dsa, dense_ffn, moe, false, max_ctx,
+                                         (size_t) smax, dsa ? kv_stage : 0)
+                : 0;
+            tail = (int) std::ceil(std::max(prefill, i == 0 ? vision_bytes : 0) / ssum);
+            ev.complete = glmfast::complete_pool_slots((size_t) room, (size_t) ssum, g.n_expert, kSparesHere, tail) > 0;
+        }
+        if (price_prefill && ssum > 0 && !ev.complete) {
+            // Price one transfer per expert the prompt's chunk can miss. The complete pool lends only spare space.
+            const double slots = flash_window ? (double) ev.per - tail : std::floor(room / ssum);
+            const double held = std::clamp(slots - kSparesHere, 0.0, (double) g.n_expert);
+            ev.prefill_ms = 1e3 * (g.n_expert - held) * prefill_blob / c.h2d;
+        }
         // startable: the pool's floor, and a 512-token prompt chunk lent at --prefill auto's cap
         ev.ok = ssum == 0 || ev.per >= keep;
         if (ev.ok && ssum > 0) {
@@ -1879,7 +1895,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             ev.ok = k + keep <= ev.per && k * 100 <= 90 * ev.per;
         }
         // a token on this part: each layer's reads over the card's bandwidth, its misses over the lane's share
-        const int64_t held = std::max<int64_t>(0, ev.per - kSparesHere);
+        const int64_t held = ev.complete ? g.n_expert : std::max<int64_t>(0, ev.per - kSparesHere);
         const auto layer_ms = [&](int l, double dense_b) {
             double gpu = dense_b, cpu = 0;
             if (l == L || moe_layer(l)) {
@@ -1913,7 +1929,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             prefill_ms += ev.back().prefill_ms;
             ok = ok && ev.back().ok;
         }
-        obj = pipelined ? slow : df_pipe ? (sum + kDfKept * slow) / (1.0 + kDfKept) : sum + prefill_ms / reply_tokens;
+        const double decode = pipelined ? slow : df_pipe ? (sum + kDfKept * slow) / (1.0 + kDfKept) : sum;
+        obj = decode + prefill_ms / reply_tokens;
         tie = pipelined ? sum : slow;
         return ok;
     };
@@ -1984,9 +2001,10 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                         if (i == n - 1 && le != L) continue;
                         const Eval e = stage(i, lb, le);
                         if (!e.ok || e.ms > cap) continue;
+                        const double cost = e.ms + (1.0 + kDfKept) * e.prefill_ms / reply_tokens;
                         double& t = f[(size_t) (i + 1) * W + le];
-                        if (base + e.ms < t) {
-                            t = base + e.ms;
+                        if (base + cost < t) {
+                            t = base + cost;
                             from[(size_t) (i + 1) * W + le] = lb;
                         }
                     }
@@ -2081,6 +2099,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     if (price_prefill)
         std::fprintf(stderr, "glm split auto: %.0f ms of prefill expert transfers + %d decode tokens (%.1f ms total)\n",
                      prefill_ms, reply_tokens, obj * reply_tokens);
+    if (flash_window && std::all_of(ev.begin(), ev.end(), [](const Eval& e) { return e.routes == 0 || e.complete; }))
+        std::fprintf(stderr, "glm split auto: all experts fit in VRAM with the prefill buffers\n");
     if (g.arch == GlmArch::GlmDsa && mtp && n >= 3 && !maya::platform::env_switch("MAYA_GLM_NO_SPEC")) { std::vector<glmspec::PartCost> pc; const std::vector<int> pools = glm_split_pool_ids(g, devs); for (int i = 0; i < n; ++i) pc.push_back({cards[(size_t) i].dev, ev[(size_t) i].ms, ev[(size_t) i].ms * glmspec::lane_share(ev[(size_t) i].hits, ev[(size_t) i].routes, cards[(size_t) i].bw, miss_bps), pools[(size_t) i]}); glmspec::spec_record_prices(pc); }   // glm-dsa B11.2
     return best;
 }

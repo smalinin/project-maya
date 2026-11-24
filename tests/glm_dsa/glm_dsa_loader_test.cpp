@@ -777,6 +777,34 @@ int main() {
         check(search("31.5:898", {0, 1}).empty(), "fewer simulated cards than devices: no plan (free-VRAM split)");
     }
 
+    std::printf("[Flash DFlash2 split search with prefill residency]\n");
+    {
+        const fs::path pack = dir / "flash-pack", drafter = dir / "draft.gguf";
+        fs::create_directory(pack);
+        std::ofstream(drafter).put('\0');
+        {
+            std::ofstream experts(pack / "native_experts.txt");
+            experts << "# absolute offsets in flash.gguf\n";
+            for (int layer = 3; layer < 45; ++layer)
+                experts << layer << " 13 14 0 18415616 0 0 0\n";
+        }
+        setenv("MAYA_GLM_DFLASH", drafter.string().c_str(), 1);
+        setenv("MAYA_GLM_WIN_PIPE", "1", 1);
+        setenv("MAYA_GLM_KV_RESIDENT", "32768", 1);
+        const std::vector<int> six{0, 1, 2, 3, 4, 5};
+        setenv("MAYA_GLM_SPLIT_CARDS", "47:1008:G0:13,47:1008:G1:26,47:1008:G2:6,47:1008:G3:6,47:1008:G4:13,21:936:G5:13", 1);
+        const auto complete = maya::core::glm_split_search(pack.string(), 524288, six);
+        check(complete.size() == 5 && complete.back() >= 42,
+              "the Flash split leaves room for all experts and prefill buffers on the smaller GPU");
+        setenv("MAYA_GLM_SPLIT_CARDS", "16:1008:G0:13,16:1008:G1:26,16:1008:G2:6,16:1008:G3:6,16:1008:G4:13,10:936:G5:13", 1);
+        const auto partial = maya::core::glm_split_search(pack.string(), 524288, six);
+        check(partial.size() == 5, "Flash still finds a split when a complete pool is impossible");
+        unsetenv("MAYA_GLM_SPLIT_CARDS");
+        unsetenv("MAYA_GLM_KV_RESIDENT");
+        unsetenv("MAYA_GLM_WIN_PIPE");
+        unsetenv("MAYA_GLM_DFLASH");
+    }
+
     // ---- 7. NextN lists, gates (B1.8, B2.6)
     std::printf("[B1.8 / B2.6 lists and gates]\n");
     {

@@ -63,9 +63,10 @@ std::vector<int> glm_snap_bounds(const Glm5Geometry& g, const std::vector<int>& 
 // ---------------------------------------------------------------- B6.2: planner terms
 
 /// `--layer-split auto`'s search (glm_model.cu glm_search_bounds) on the pack in `pack_dir` for the devices `devs`:
-/// the later parts' first layers, empty when it has no answer (then load_pack splits by free VRAM).  On a glm-dsa pack
+/// the later parts' first layers, empty when it has no answer (then load_pack splits by free VRAM). On glm-dsa or
+/// in the Flash DFlash2 residency search,
 /// MAYA_GLM_SPLIT_CARDS="<free GiB>:<VRAM GB/s>[:<name>[:<H2D GB/s>]],..." replaces the CUDA card query, so
-/// the plan can be checked without GPUs; Flash always asks CUDA.
+/// the plan can be checked without GPUs.
 std::vector<int> glm_split_search(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& devs);
 
 /// The split search prices the NextN draft block (its dense VRAM, its experts' share of the pool, its state, a draft
