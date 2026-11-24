@@ -408,14 +408,19 @@ class UnslothUD(unittest.TestCase):
             self.assertEqual(maya.choose_qwen_quant(a, {"installer": {"qwen_quant": UD}}), UD)
         a.qwen_quant = UD
         self.assertEqual(maya.choose_qwen_quant(a, {}), UD)
-        a.qwen_quant = None
+
+    def test_previous_local_quant_keeps_the_standard_menu(self):
+        a = SimpleNamespace(qwen_quant=None, yes=False)
         local_first = self.d / "Qwen3.8-Flash-Next-Q8_0.gguf"
         local_first.write_bytes(b"GGUF")
         previous = {"installer": {"qwen_quant": "local", "local_quant": "Q8_0", "model_dir": str(self.d)},
                     "args": ["--native", str(local_first)]}
-        with patch.object(maya, "choose", lambda t, i, rows, default, yes: default):
-            restored = maya.choose_qwen_quant(a, previous)
-        self.assertEqual(restored["model"], local_first)
+        with patch.object(maya, "choose", side_effect=lambda t, i, rows, default, yes: default) as choose:
+            self.assertEqual(maya.choose_qwen_quant(a, {}), "q5_k_m")
+            standard_rows = choose.call_args.args[2]
+            self.assertEqual(maya.choose_qwen_quant(a, previous), "q5_k_m")
+            self.assertEqual(choose.call_args.args[2], standard_rows)
+        self.assertEqual(standard_rows[0][0], "0) Add downloaded model")
 
     def test_unlisted_q8_links_as_local_qwen_and_uses_the_selected_mtp(self):
         source = self.d / "downloads"

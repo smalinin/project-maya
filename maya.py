@@ -12031,25 +12031,8 @@ def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path,
     return {"exe": str(VEXE), "mmproj": str(files[0]), "model": str(gguf), "gpu": True}
 
 
-def qwen_local_from_config(cfg: dict) -> dict | None:
-    """Restore a local Qwen selection so a later setup offers its files again."""
-    inst = cfg.get("installer") or {}
-    args = cfg.get("args") or []
-    if inst.get("qwen_quant") != "local" or "--native" not in args[:-1]:
-        return None
-    first = Path(args[args.index("--native") + 1])
-    files = shard_set(first)
-    if not all(path.is_file() for path in files):
-        return None
-    vision = (cfg.get("vision") or {}).get("mmproj")
-    drafter = inst.get("local_drafter")
-    return {"folder": Path(inst.get("model_dir") or first.parent), "model": first, "files": files,
-            "drafter": Path(drafter) if drafter else None, "vision": Path(vision) if vision else None}
-
-
 def choose_qwen_quant(a, prev: dict) -> str | dict:
-    """Which Qwen files: --qwen-quant (or a --model id that names them), else asked - CYBER-FROST-3.8-PS's Q5_K_M or
-    unsloth's UD-IQ2_XS of the base model; the files set up before are the default."""
+    """Choose a catalog quant or add downloaded Qwen files. Use the previous catalog quant as the default."""
     given = getattr(a, "qwen_quant", None)
     if given:
         return given
@@ -12063,14 +12046,10 @@ def choose_qwen_quant(a, prev: dict) -> str | dict:
                      f"head, the experts in about {m['memory_gb']:.0f} GB of VRAM and RAM together)" if q == QWEN_UD else
                      "Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (Q5_K experts, all of them in about "
                      f"{m['memory_gb']:.0f} GB of VRAM and RAM together)"))
-    local_before = qwen_local_from_config(prev)
-    if local_before:
-        rows.append((f"Local Qwen3.8-Flash-Next · {(prev.get('installer') or {}).get('local_quant') or local_before['model'].name}", None,
-                     f"Previously linked GGUF in {local_before['folder']}"))
     pick = choose_with_add(a, "Which Qwen3.8-Flash-Next?", ["The files to set up:"], rows,
-                           len(QWEN_QUANTS) if local_before else QWEN_QUANTS.index(default), getattr(a, "yes", False),
+                           QWEN_QUANTS.index(default), getattr(a, "yes", False),
                            setup_models_dir(a, prev), "qwen")
-    return pick if isinstance(pick, dict) else local_before if local_before and pick == len(QWEN_QUANTS) else QWEN_QUANTS[pick]
+    return pick if isinstance(pick, dict) else QWEN_QUANTS[pick]
 
 
 def set_up_qwen(a, prev: dict) -> Path | None:
