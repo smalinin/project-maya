@@ -442,6 +442,24 @@ class Steps(unittest.TestCase):
             self.assertEqual(cfg["args"][4:], want, how)
             self.assertEqual(cfg["installer"]["drafting"], {"measure": "auto", None: "auto"}.get(how, how))
 
+    def test_small_layer_split_uses_all_selected_gpus(self):
+        gpus = [card(48, i) for i in range(5)] + [card(24, 5)]
+        a = args(ik2_local=True, ik2_layer_split=True, drafting="on")
+        with patch.object(maya, "WIN", False), patch.object(maya, "choose", side_effect=lambda *p: p[3]):
+            self.assertEqual(maya.choose_gpus(a, gpus, maya.IK2_MIN_CC, "ik2"), gpus)
+        self.assertIsNone(F.unsupported("cuda", False, 6, gpus, layer_split=True))
+        self.assertIsNotNone(F.unsupported("cuda", False, 6, gpus))
+        self.assertIsNotNone(F.unsupported("cuda", True, 6, gpus, layer_split=True))
+        d = self.root / "Inkling-2-Small-local-UD-IQ3_XXS"
+        gguf = d / "Inkling-2-Small-UD-IQ3_XXS.gguf"
+        with patch.object(maya, "ROOT", self.root):
+            path = maya.write_config_ik2(a, {"gpus": gpus, "backend": "cuda"}, {}, gguf,
+                                         d / "tokenizer", 32768, self.root, d, drafter=d / "dspark.gguf",
+                                         local={"variant": "small"})
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["gpu"], list(range(6)))
+        self.assertEqual(cfg["args"][4:], ["--gpus", "6", "--drafting", "off"])
+
     def test_drafter_step(self):
         """Drafting on by default: the drafter beside the GGUF, sha256-checked; none with --drafting off or a declined
         download (the prompt lookup then drafts alone); truthful where its room does not fit at the context."""

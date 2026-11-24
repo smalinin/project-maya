@@ -1627,7 +1627,7 @@ def gpus_before(before, usable: list) -> list | None:
 
 
 def ik2_gpus_asked(a) -> int:
-    """How many GPUs --gpu / --gpus name (0: none named) - Inkling-2-Mini runs on one or two (three or more refused)."""
+    """How many GPUs --gpu / --gpus name (0: none named)."""
     if getattr(a, "gpus", None):
         return len({x.strip() for x in str(a.gpus).split(",") if x.strip()})
     return 1 if getattr(a, "gpu", None) is not None else 0
@@ -1680,9 +1680,19 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -
             if IK2F.plan(one[0]["vram_gb"], IK2F.CONTEXTS[0])["resident"]:
                 labels[0] += " - it holds every expert"
             labels[1] += " - the second holds the experts the first does not"
-        pick = choose("Which GPUs?", [f"Inkling 2 runs on one GPU, or on two: the first holds the dense weights, the "
-                                      "cache and every prompt,", "the second the experts the first does not (three or "
-                                      "more: not yet)."],
+        layer_split = getattr(a, "ik2_layer_split", False)
+        if layer_split:
+            all_cards = [g for g in big if g["vram_gb"] >= IK2F.MIN_VRAM_GB][:MAX_GPUS]
+            if len(all_cards) > 2:
+                split = [byid[i] for i in kept] if kept and len(kept) > 2 else all_cards
+                opts.append(split)
+                labels.append("Layer split over GPUs " + ", ".join(str(g["index"]) for g in split))
+                if not kept or len(kept) > 2:
+                    default = len(opts) - 1
+        intro = (["Inkling 2 Small can split its layers across three or more NVIDIA GPUs."]
+                 if layer_split else ["Inkling 2 runs on one GPU, or on two: the first holds the dense weights, "
+                                      "the cache and every prompt,", "the second the experts the first does not."])
+        pick = choose("Which GPUs?", intro,
                       [(lab, "recommended" if i == rec else None, None) for i, lab in enumerate(labels)], default,
                       a.yes or a.check)
         return opts[pick]
@@ -1756,8 +1766,9 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     ik2 = family == "ik2"
+    ik2_layer_split = ik2 and getattr(a, "ik2_layer_split", False)
     if ik2:   # (Inkling-2-Mini, an experimental preview: NVIDIA, Linux, one GPU - refused in one line before anything)
-        why = IK2F.unsupported(a.backend, WIN, ik2_gpus_asked(a), [])
+        why = IK2F.unsupported(a.backend, WIN, ik2_gpus_asked(a), [], layer_split=ik2_layer_split)
         if why:
             fail(why)
     hy4 = family == "hy4"
@@ -1807,7 +1818,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
     chosen = choose_gpus(a, found, min_cc, family)
     if ik2:                                            # (the cards picked: 8 GB or more; two: the larger first)
-        why = IK2F.unsupported("cuda", False, len(chosen), chosen, ik2_ram)
+        why = IK2F.unsupported("cuda", False, len(chosen), chosen, ik2_ram, layer_split=ik2_layer_split)
         if why:
             fail(why)
         chosen = sorted(chosen, key=lambda g: -float(g["vram_gb"] or 0))
@@ -1816,7 +1827,8 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
        ("" if len(chosen) < 2 else
         ": the equal GPUs among them share every layer (tensor parallel), else the layers are split across them"
-        if family == "hy4" else ": the experts are split across the two (the first holds the rest)" if ik2 else
+        if family == "hy4" else ": the experts are split across the two (the first holds the rest)"
+        if ik2 and len(chosen) == 2 else
         f": the model's layers are split across the {len(chosen)}"))
     if ik2 and any(g.get("unified_memory") for g in chosen):
         warn(f"{IK2_SHOWN} has not been run yet on a GPU whose memory is the system's RAM: untested here")
@@ -12534,9 +12546,12 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     cfg_path = ROOT / f"{stem}.json"
     old = read_json(cfg_path)
     args = ["--model", str(gguf), "--max-context", str(ctx)]
-    two = len(pc.get("gpus") or []) == 2 and pc.get("backend") != "hip"
-    args += ["--gpus", "2"] if two else []           # (the split: the config's two GPUs, the larger first)
-    how = ik2_drafting(a)
+    n_gpu = len(pc["gpus"])
+    two = n_gpu == 2 and pc.get("backend") != "hip"
+    args += ["--gpus", str(n_gpu)] if n_gpu > 1 else []
+    how = "off" if n_gpu > 2 else ik2_drafting(a)
+    if n_gpu > 2 and drafter:
+        ok("drafting: off with the layer split")
     args += (["--draft", str(drafter)] if drafter and how != "off" else []) + ["--drafting", how]
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
     inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT, "drafting": how}
@@ -12616,6 +12631,7 @@ def set_up_ik2_local(a, prev: dict, local: dict) -> Path:
     same = (prev.get("installer") or {}).get("model_dir") == str(d)
     a.gpus_before = prev.get("gpu")
     a.ik2_local = True
+    a.ik2_layer_split = local["variant"] == "small" and a.backend == "cuda" and sys.platform.startswith("linux")
     pc = check_pc(a, "ik2")
     step(2, "your choices")
     ok(f"model: {gguf.name} (linked GGUF in {d})")
@@ -12643,6 +12659,7 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     config."""
     inst = prev.get("installer") or {}
     a.ik2_local = False
+    a.ik2_layer_split = False
     models_before = setup_models_dir(a, prev)
     if not (a.yes or getattr(a, "check", False) or getattr(a, "model", None)):
         m = ik2_entry()

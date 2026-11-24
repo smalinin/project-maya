@@ -266,7 +266,8 @@ def too_small_line(ram_gb: float, vram_gb: float, need: float | None = None) -> 
             f"{need:.0f} GB of RAM with this {vram_gb:.0f} GB card (this PC has {ram_gb:.0f} GB of RAM)")
 
 
-def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_gb: float = 0.0) -> str | None:
+def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_gb: float = 0.0, *,
+                layer_split: bool = False) -> str | None:
     """Why this PC cannot run the preview, in one plain line, or None (said before anything is built or downloaded;
     the engine's own check_preview says the same at its start).  backend: cuda / hip / metal; gpus_asked: how many GPUs
     --gpu / --gpus named (0: none named); cards: the GPUs the model would pick from (NVIDIA: {"arch", "vram_gb"},
@@ -285,7 +286,7 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_g
     # (NVIDIA: Linux and Windows alike, the same card rules; two cards on Linux only - untested on Windows)
     if windows and gpus_asked > 1:
         return "Inkling 2 Mini on Windows runs on one GPU for now (two are Linux only): pick one (--gpu N)"
-    if gpus_asked > 2:
+    if gpus_asked > 2 and not layer_split:
         return ("Inkling 2 Mini runs on one or two NVIDIA GPUs for now (three or more are not in it yet): pick one or "
                 "two (--gpu N, --gpus N,M)")
     if cards:
@@ -298,6 +299,8 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_g
             return "Inkling 2 Mini needs one NVIDIA GPU with 8 GB of VRAM or more"
         if gpus_asked == 2 and min(float(g.get("vram_gb") or 0) for g in cards) < MIN_VRAM_GB:
             return "Inkling 2 Mini on two GPUs needs 8 GB of VRAM or more on each of them (or one GPU: --gpu N)"
+        if gpus_asked > 2 and min(float(g.get("vram_gb") or 0) for g in cards) < MIN_VRAM_GB:
+            return "Inkling 2 Small needs 8 GB of VRAM or more on each GPU in the layer split"
         if ram_gb and vram - MARGIN_GIB < need_gib(CONTEXTS[0]) and ram_gb < plan(vram, CONTEXTS[0])["ram_gib"]:
             return too_small_line(ram_gb, vram)
     return None

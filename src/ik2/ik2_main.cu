@@ -11,8 +11,8 @@
 //     runs; a scan-resistant eviction keeps a pass from flushing the cache.  IK2_WARM fills the cache at load with the
 //     experts tokens pick most (a profile written with IK2_POP_OUT).
 //   * Decode a token at a time; with IK2_CPU=1 a missing expert is computed on the CPU (AVX-512) when that is sooner
-//     than its copy.  Two GPUs (--gpus 2): IK2_EP=1 deals each layer's experts to both (expert parallel - each with its
-//     own cache and PCIe link), else the layers are split between them.
+//     than its copy.  Two GPUs share experts.  On Linux with CUDA, three or more GPUs split the layers of a
+//     non-looped model, keeping each layer's experts and KV cache on the GPU that runs it.
 //
 //   maya-ik2 --model FIRST-SHARD.gguf --serve [--max-context 262144] [--cache-gb 60] [--gpus 1] [--threads 8]
 //            [--kv-streaming auto|on|off] [--kv-resident N]
@@ -5764,18 +5764,25 @@ void check_preview(int n_gpu, bool serve) {
     if (e != cudaSuccess || nd < 1)
         refuse(std::string("no ") + vendor + " GPU visible (" + (e != cudaSuccess ? cudaGetErrorString(e) : "0 devices") +
             "): the Inkling 2 preview runs on one " + vendor + " GPU");
-    if (n_gpu < 1 || n_gpu > 2)
-        refuse("--gpus " + std::to_string(n_gpu) + ": Inkling 2 runs on one or two GPUs (three or more are not in it yet)");
+#if defined(__linux__) && !defined(MAYA_USE_HIP)
+    constexpr int max_gpus = 16;
+#else
+    constexpr int max_gpus = 2;
+#endif
+    if (n_gpu < 1 || n_gpu > max_gpus)
+        refuse("--gpus " + std::to_string(n_gpu) + ": expected 1 to " + std::to_string(max_gpus));
     const bool old_two = (getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) || (getenv("IK2_TP") && std::atoi(getenv("IK2_TP")));
+    if (n_gpu > 2 && old_two)
+        refuse("IK2_EP / IK2_TP apply to two GPUs only");
     if (n_gpu == 2 && old_two && !force)
         refuse("--gpus 2 with IK2_EP=1 / IK2_TP=1: the older two-GPU modes are outside the preview (without them: "
                "the two-GPU split)" + run_anyway);
 #ifdef MAYA_USE_HIP   // (the split runs GPU 0 on the offload path, not checked on AMD yet)
     if (n_gpu == 2 && !force) refuse("--gpus 2: two AMD GPUs are not in the Inkling 2 preview yet" + run_anyway);
 #endif
-    if (n_gpu == 2 && nd < 2)
-        refuse("--gpus 2: " + std::to_string(nd) + " GPU visible");
-    for (int d = 0; d < std::min(n_gpu, nd); ++d) {
+    if (n_gpu > nd)
+        refuse("--gpus " + std::to_string(n_gpu) + ": " + std::to_string(nd) + " GPUs visible");
+    for (int d = 0; d < n_gpu; ++d) {
         cudaDeviceProp p{};
         CU(cudaGetDeviceProperties(&p, d));
 #ifdef MAYA_USE_HIP
@@ -6007,6 +6014,10 @@ int main(int argc, char** argv) {
     }
     const int n_core = c.core1 - c.core0;
     c.n_layer = c.n_visit - (c.n_pass - 1) * n_core;
+    if (n_gpu > 2 && (c.n_pass > 1 || n_gpu > c.n_layer))
+        die("three or more GPUs require a non-looped model with at least one layer per GPU");
+    if (n_gpu > 2 && !draft_path.empty())
+        die("--draft: use --drafting off with three or more GPUs");
     {   // the pattern is a visit's; a layer's is its first visit's (the same in every pass)
         const auto* sp = S.get(a + "attention.sliding_window_pattern");
         if (!sp || (int) sp->items.size() != c.n_visit) die("sliding_window_pattern");
@@ -6502,6 +6513,61 @@ int main(int argc, char** argv) {
     };
     std::vector<ExpJob> exp_jobs;
     size_t host_total = 0;
+    std::vector<int> layer_ends;
+    if (n_gpu > 2) {
+        // Keep contiguous layer ranges and account for larger expert formats and full-context attention layers.
+        std::vector<size_t> layer_bytes(c.n_layer + 1, 0);
+        for (int l = 0; l < c.n_layer; ++l) {
+            const std::string prefix = "blk." + std::to_string(l) + ".ffn_";
+            size_t experts = 0;
+            for (auto it = S.by_name.lower_bound(prefix);
+                 it != S.by_name.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it)
+                if (it->first.ends_with("_exps.weight")) experts += tensor_bytes(*it->second.second);
+            const size_t kv_cap = c.sliding[l] ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
+            layer_bytes[l + 1] = layer_bytes[l] + experts + 2 * kv_cap * KD * (g_kv_fp8 ? 1 : 2);
+        }
+        const auto* head = S.info("output.weight");
+        if (!head) die("no tensor output.weight");
+        std::vector<double> capacity;
+        for (int d = 0; d < n_gpu; ++d) {
+            use_dev(d);
+            size_t free = 0, device_bytes = 0;
+            CU(mem_info(&free, &device_bytes));
+            const double head_bytes = d + 1 == n_gpu ? 2.0 * head->elements() : 0.0;
+            capacity.push_back(std::max(1.0, (double) free - (2ull << 30) - head_bytes));
+        }
+        // Minimize the largest memory share across the cards.  Rounding each boundary on its own can
+        // overload one card while the next has room for a layer.
+        std::vector<double> peak(c.n_layer + 1, INFINITY);
+        peak[0] = 0;
+        std::vector<std::vector<int>> starts(n_gpu, std::vector<int>(c.n_layer + 1, -1));
+        for (int d = 0; d < n_gpu; ++d) {
+            std::vector<double> next(c.n_layer + 1, INFINITY);
+            const int limit = c.n_layer - (n_gpu - d - 1);
+            for (int last = d + 1; last <= limit; ++last) {
+                for (int first = d; first < last; ++first) {
+                    const double share = (layer_bytes[last] - layer_bytes[first]) / capacity[d];
+                    const double used = std::max(peak[first], share);
+                    if (used < next[last]) {
+                        next[last] = used;
+                        starts[d][last] = first;
+                    }
+                }
+            }
+            peak.swap(next);
+        }
+        layer_ends.resize(n_gpu);
+        for (int d = n_gpu - 1, last = c.n_layer; d >= 0; --d) {
+            layer_ends[d] = last;
+            last = starts[d][last];
+        }
+        for (int d = 0; d < n_gpu; ++d) {
+            const int first = d == 0 ? 0 : layer_ends[d - 1], last = layer_ends[d];
+            std::printf("layer split: GPU %d loads layers %d-%d (%.1f GiB of experts and KV)\n", d, first, last - 1,
+                        (layer_bytes[last] - layer_bytes[first]) / 1073741824.0);
+        }
+        use_dev(0);
+    }
     M.embd_norm = load_f32(S, "token_embd_norm.weight", C);   // (on GPU 0, where the embedding rows go)
     std::vector<float> lp_q, lp_kv;   // a looped core's message queries, [2 n_core][C] each
     std::vector<float> lp_all;
@@ -6512,7 +6578,8 @@ int main(int argc, char** argv) {
     for (int l = 0; l < c.n_layer; ++l) {
         Layer& Ly = M.L[l];
         const std::string b = "blk." + std::to_string(l) + ".";
-        Ly.dev = dual() ? 0 : l * n_gpu / c.n_layer;
+        Ly.dev = !layer_ends.empty() ? (int) (std::upper_bound(layer_ends.begin(), layer_ends.end(), l) - layer_ends.begin())
+                                    : dual() ? 0 : l * n_gpu / c.n_layer;
         use_dev(Ly.dev);
         Ly.sliding = c.sliding[l];
         auto sink_v = host_f32(S, b + "attn_sink_proj.weight", (size_t) c.H * C);
@@ -6749,7 +6816,7 @@ int main(int argc, char** argv) {
     // (the resident path keeps every expert in VRAM, so no pinned host copy is needed: the experts go from where the
     //  files are mapped straight to their slots, and stay in the page cache for the next load - IK2_HOST=pinned: as
     //  for the other models)
-    const bool host_mmap = getenv("IK2_HOST") ? std::string(getenv("IK2_HOST")) == "mmap" : g_fast_want;
+    const bool host_mmap = getenv("IK2_HOST") ? std::string(getenv("IK2_HOST")) == "mmap" : g_fast_want || n_gpu > 2;
     // The offload path pins only the experts the VRAM tier does not hold (owner, v1.1.73): the layers' blocks only
     // reserved here (no RAM), the tier planned on the real free VRAM (EC.init), copied in from where the files are
     // mapped, then the rest read and pinned (below the warm) - an 8 GB card's tier is RAM a 16 GB PC does not need.
