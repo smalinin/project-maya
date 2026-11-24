@@ -2805,9 +2805,7 @@ def g53_memory_note(pc: dict | None = None, quant: str | None = None) -> str:
 def tools_step(a, packages=PY_PACKAGES) -> Path:
     """The Python packages (into .venv) and llama.cpp's source at the pinned commit - listed, and asked, first."""
     step(3, "Python packages and llama.cpp's source")
-    stamp = Path(sys.prefix) / ".strata-pip.json"          # S.pip_install's record of what it installed
-    have = read_json(stamp) if stamp.exists() else []
-    need = [p for p in packages if p not in (have if isinstance(have, list) else [])]
+    _, _, need = S.pip_package_status(packages)
     llama = Path(a.llama_dir).expanduser().resolve() if a.llama_dir else ROOT / "third_party" / "llama.cpp"
     llama_ok = (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir()
     if a.llama_dir and not llama_ok:

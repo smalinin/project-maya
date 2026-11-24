@@ -9,6 +9,7 @@ import argparse
 import ctypes
 import hashlib
 import http.client
+import importlib.metadata
 import json
 import os
 import platform
@@ -787,20 +788,37 @@ def pip_command(need, machine=None, system=None, which=None) -> list:
     return [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *need]
 
 
-def pip_install(packages, what):
-    """pip (uv on Linux ppc64le, pip_command) into .venv, skipped when the same list was installed before."""
+def pip_package_status(packages):
+    """Report missing packages in the current Python environment for both preview and installation."""
     stamp = Path(sys.prefix) / ".strata-pip.json"
     try:
-        have = json.loads(stamp.read_text()) if stamp.exists() else []
-    except ValueError:                                  # half written (power loss): install again
+        have = json.loads(stamp.read_text())
+    except (OSError, ValueError):
         have = []
-    need = [p for p in packages if p not in have]
+    have = {p for p in have if isinstance(p, str)} if isinstance(have, list) else set()
+    need = []
+    for package in packages:
+        # The stamp records that pip previously checked a version constraint. Bare distribution names can be
+        # checked directly, including packages installed into this environment outside Setup.
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", package):
+            try:
+                importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                need.append(package)
+        elif package not in have:
+            need.append(package)
+    return stamp, have, need
+
+
+def pip_install(packages, what):
+    """Install missing requirements into .venv with pip (or uv on Linux ppc64le)."""
+    stamp, have, need = pip_package_status(packages)
     if not need:
         ok(f"{what} already installed")
         return
     say(f"  Installing {what} ...")
     run(pip_command(need))
-    stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
+    stamp.write_text(json.dumps(sorted(have | set(need)), indent=0))
     ok(f"{what} installed")
 
 
