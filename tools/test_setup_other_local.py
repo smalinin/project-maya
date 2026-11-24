@@ -1,4 +1,4 @@
-"""Local DeepSeek/MiniMax GGUF selection through config writing, without downloads or GPU."""
+"""Local GGUF selection through config writing, without downloads or GPU."""
 import json
 from pathlib import Path
 import subprocess
@@ -12,6 +12,7 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).res
 import maya
 import maya_import as MI
 from test_setup_glm_local import gguf
+import test_hy4_pack_gguf as hy4_fixture
 
 
 class LocalOther(unittest.TestCase):
@@ -190,6 +191,95 @@ class LocalOther(unittest.TestCase):
                 if family == "deepseek":
                     self.assertIn(524288, context.call_args.args[2])
                 self.assertEqual(cfg["model_name"], f"custom-{family}-q3_k")
+
+    def local_setup(self, family, source):
+        a = SimpleNamespace(model=None, models_dir=str(self.models), yes=False, check=False, context=4096, backend="cuda",
+                            no_vision=False, repack=False, env=[], port=None, host=None, api_key=None)
+        pc = {"backend": "cuda", "gpus": [{"index": 0, "vram_gb": 48}]}
+        exe = self.root / "maya-ik2"
+        exe.touch()
+        choose = [0 if family == "hy4" else 1, 3]  # 0) Add downloaded model, then Link files
+        with patch.multiple(maya, ROOT=self.root, IK2_EXE=exe), \
+                patch.object(maya, "choose", side_effect=choose), \
+                patch.object(maya.S, "ask_text", return_value=str(source)), \
+                patch.object(maya, "hy4_published", return_value=False), \
+                patch.object(maya, "check_pc", return_value=pc), \
+                patch.object(maya, "tools_step", return_value=self.root / "llama"), \
+                patch.object(maya, "build_step", return_value={}), \
+                patch.object(maya, "vision_encoder_ready", return_value=True), \
+                patch.object(maya, "ik2_tokenizer_step", return_value=self.root / "tokenizer") as tokenizer, \
+                patch.object(maya, "write_run_script", return_value=self.root / "run-test.sh"):
+            setup = maya.set_up_hy4 if family == "hy4" else maya.set_up_ik2
+            path = setup(a, {})
+        return path, json.loads(path.read_text()), tokenizer
+
+    def test_hy4_local_setup_indexes_the_shared_engram_and_selected_companions(self):
+        (self.root / "tools").symlink_to(Path(maya.__file__).parent / "tools", target_is_directory=True)
+        source = hy4_fixture.indexed(self.root / "hy4")
+        first, second = sorted(source.glob("*.gguf"))
+        first = first.rename(source / "custom-00001-of-00002.gguf_file")
+        second = second.rename(source / Path(next(iter(maya.read_json(maya.HY4_MANIFEST)["ngram"]))).name)
+        vision = hy4_fixture.mmproj(source / "mmproj.gguf")
+        drafter = hy4_fixture.drafter(source / "custom.dfly2")
+        path, cfg, _ = self.local_setup("hy4", source)
+        self.assertEqual(path.name, "maya-hy4-flash-local-custom.json")
+        self.assertIn("--dfly2", cfg["args"])
+        self.assertTrue(cfg["installer"]["draft_block"])
+        pack = Path(maya.flag_value(cfg["args"], "--pack"))
+        self.assertTrue(maya.hy4_pack_has_vision(pack))
+        self.assertEqual([f.resolve() for f in maya.pack_index_files(pack)], [first, second, drafter, vision])
+        self.assertTrue(all(f.is_symlink() for f in maya.pack_index_files(pack)))
+
+    def test_both_inkling_variants_have_their_own_local_config(self):
+        stock = self.root / "maya-inkling-2-mini.json"
+        stock.write_text('{"preserve": true}')
+        for variant, width in (("mini", 2304), ("small", 4608)):
+            with self.subTest(variant=variant):
+                source = self.root / variant
+                first = gguf(source / "custom-00001-of-00002.gguf", "inkling2", metadata={
+                    "inkling2.embedding_length": width, "inkling2.num_loops": 3 if variant == "mini" else 1,
+                    "split.count": 2})
+                second = gguf(source / "custom-00002-of-00002.gguf", "inkling2")
+                draft = gguf(source / "dspark-custom.gguf", "dflash", metadata={"dflash.embedding_length": width},
+                             tensors=[("dspark_hidden_out.weight", [1, width])])
+                vision = gguf(source / "mmproj.gguf", "clip", metadata={"clip.vision.projector_type": "inkling2v"})
+                path, cfg, tokenizer = self.local_setup("ik2", source)
+                self.assertEqual(path.name, f"maya-inkling-2-{variant}-local-custom.json")
+                self.assertEqual(maya.Q.is_ik2_mini(cfg), variant == "mini")
+                linked = Path(maya.flag_value(cfg["args"], "--model"))
+                tokenizer.assert_called_once()
+                self.assertEqual(tokenizer.call_args.args[2], linked)
+                targets = [*maya.shard_set(linked), Path(maya.flag_value(cfg["args"], "--draft")),
+                           Path(cfg["vision"]["mmproj"])]
+                self.assertTrue(all(p.is_symlink() for p in targets))
+                self.assertEqual([p.resolve() for p in targets], [first, second, draft, vision])
+        self.assertEqual(stock.read_text(), '{"preserve": true}')
+
+    def test_inkling_rejects_an_unsupported_expert_type_before_linking(self):
+        source = self.root / "inkling"
+        source.mkdir()
+        first = source / "Inkling-2-Mini-F32-Experts.gguf"
+        hy4_fixture.gguf(first, {"general.architecture": (8, "inkling2"), "inkling2.embedding_length": (4, 2304),
+                                "inkling2.num_loops": (4, 3)}, [("blk.0.ffn_down_exps.weight", 0, [1])])
+        chosen = {"model": maya.review_candidate(first, "model", [first]), "drafter": None, "vision": None}
+        self.assertIsNone(maya.link_hy4_or_ik2(self.models, chosen, "ik2"))
+        self.assertIn("F32", maya.warn.call_args.args[0])
+        self.assertFalse(self.models.exists())
+
+    def test_inkling_links_bf16_experts_and_embeddings(self):
+        source = self.root / "inkling"
+        source.mkdir()
+        first = source / "Inkling-2-Mini-UD-Q8_K_XL.gguf"
+        hy4_fixture.gguf(first, {"general.architecture": (8, "inkling2"), "inkling2.embedding_length": (4, 2304),
+                                "inkling2.num_loops": (4, 3)},
+                         [(name, 30, [1]) for name in ("token_embd.weight", "output.weight",
+                                                       "blk.23.ffn_down_exps.weight")])
+        choices = maya.review_candidates(source, "ik2")
+        chosen = {role: items[0] if items else None for role, items in choices.items()}
+        linked = maya.link_hy4_or_ik2(self.models, chosen, "ik2")
+        self.assertEqual(linked["variant"], "mini")
+        self.assertTrue(linked["model"].is_symlink())
+        self.assertEqual(linked["model"].resolve(), first)
 
     def test_linked_config_model_names_distinguish_quants_and_source_folders(self):
         a = SimpleNamespace(no_vision=True, parallel=None, env=[], port=None, host=None, api_key=None)

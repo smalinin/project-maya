@@ -291,8 +291,8 @@ without pictures.
 - **The pack:** `python tools/hy4/pack_gguf.py --model <folder>` indexes the GGUF set and the vision tower's file
   beside it (no weights copied).
 
-Other GGUF sets of the model are not offered by the setup; `tools/hy4/pack_gguf.py` indexes one by hand
-([SETTINGS.md](SETTINGS.md#hy4-flash)).
+For a local Hy4-Flash GGUF, choose **Add downloaded model → Link files** in setup. Keep the Engram shard with the
+model when it is a separate file. The file review also accepts a matching vision projector, MTP head or DFly2 drafter.
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
 
@@ -323,11 +323,12 @@ GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-m
   page turns them off and on.
 - One request at a time for now.
 
-## Inkling-2-Small (by hand, for now)
+## Inkling-2-Small
 
 **[Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)** (thinkingmachines; 594 B, ~17 B active,
-Apache 2.0) runs on its own engine, `maya-ik2` (#974), from unsloth's GGUFs as they are - not from the setup yet: a
-tokenizer folder and a run config by hand, then `serve/server.py` ([INKLING2.md](INKLING2.md) section 6).
+Apache 2.0) runs on `maya-ik2` (#974). In setup, choose **Inkling 2 → Add downloaded model → Link files** to use a
+compatible Small or Mini GGUF. Setup exports the tokenizer and writes a separate run config for each linked model.
+Manual configuration is described in [INKLING2.md](INKLING2.md#6-phase-2-the-engine-maya-ik2).
 
 | Files | Size | Runs on |
 | --- | --- | --- |

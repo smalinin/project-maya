@@ -172,7 +172,7 @@ Without it the layers are split between the GPUs.
 - `tools/strata_tokenizer.py` reads the tokenizer under both names unsloth's files give its pre-tokenizer (`gpt-4o`,
   `inkling`): 442 strings against the model's own `tokenizer.json`, all equal, with both files.
 
-To run it (no setup in `maya.py` yet):
+To run it with a manual configuration:
 
     python tools/strata_tokenizer.py --gguf Inkling-2-Small-UD-Q4_K_XL-00001-of-00009.gguf --out ik2 \
         --chat-template tools/ik2/chat_template.jinja --check
@@ -213,8 +213,8 @@ as an option); the drafter (`--draft`: 2.4-2.7 tokens a step, but verifying 8 co
 
 ## 7. Next
 
-1. Setup in `maya.py` (download, the RAM / VRAM check, the run config), as Hy4-Flash has - done for Inkling-2-Mini as
-   an experimental preview (`maya.py --setup --model inkling-2-mini`: docs/MODELS.md); Inkling-2-Small by hand still.
+1. The setup offers the catalog download for Inkling-2-Mini and **Add downloaded model** for compatible local
+   Inkling-2-Mini and Inkling-2-Small GGUFs ([MODELS.md](MODELS.md)).
 2. Several requests at once; the vision tower inside the engine (pictures work through `maya-vision`: section 8).
 3. A Maya quant of the experts in the shape of DeepSeek XS (section 5), for 160 GB of host memory.
 
@@ -235,7 +235,8 @@ histories are a visit's. `ref/inkling2.py` and `maya-ik2` keep a list of visits;
 **The file.** unsloth's Mini GGUFs are in the layout llama.cpp master reads (other tensor and key names, the convs
 not folded, gate and up merged into `ffn_gate_up_exps`); the reference and the engine read both layouts.
 UD-Q4_K_XL (17.6 GB) holds the experts of layers 0-19 in NVFP4 - their original bits - and those of layers 20-23
-and the dense weights in Q8_0. (UD-Q8_K_XL keeps layers 20-23's experts in BF16: not read here.)
+and the dense weights in Q8_0. UD-Q8_K_XL keeps layers 20-23's experts and the dense matrices in BF16. The engine
+reads those weights from the GGUF, and uses the regular GPU expert path when weights are offloaded.
 Against llama.cpp (b12590 with the Inkling 2 PRs) the reference agrees on 47 of 47 top-1 tokens, KL 2.5e-3; the
 engine against the reference on 45-46 of 47, KL 6e-3..7e-3 - near ties of the router, as section 6.1 found; with
 the messages left out the KL is 0.56.

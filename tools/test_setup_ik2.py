@@ -62,7 +62,7 @@ class Names(unittest.TestCase):
         self.assertEqual((maya.IK2, maya.IK2_SHOWN, maya.IK2_MODEL_NAME),
                          ("Inkling-2-Mini", "Inkling 2 Mini", "inkling-2-mini"))
         self.assertIn("ik2", maya.FAMILIES)
-        self.assertEqual(maya.FAMILY_TITLE["ik2"], "Inkling-2-Mini")
+        self.assertEqual(maya.FAMILY_TITLE["ik2"], "Inkling 2")
 
     def test_model_option(self):
         a = args(model="inkling-2-mini")
@@ -355,8 +355,8 @@ class Picker(unittest.TestCase):
             return len(opts) - 1
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             fam = maya.choose_family(args(model=None, model_dir=None, gguf_dir=None, draft=None), {})
-        self.assertEqual((got["rows"][-1], fam), ("Inkling 2 Mini (experimental)", "ik2"))
-        about = got["about"]["Inkling 2 Mini (experimental)"]
+        self.assertEqual((got["rows"][-1], fam), ("Inkling 2 (experimental)", "ik2"))
+        about = got["about"]["Inkling 2 (experimental)"]
         for part in ("EXPERIMENTAL PREVIEW", "thinkingmachines' Inkling-2-Mini", "UD-Q4_K_XL", "18 GB",
                      "V100 / RTX 20", "Linux", "8 GB or more", "Halo / APU with 24 GB", "pictures"):
             self.assertIn(part, about)

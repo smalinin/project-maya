@@ -18,8 +18,7 @@ from pathlib import Path
 
 FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
-# ("ik2": thinkingmachines' Inkling 2 on maya-ik2 - the setup's is Inkling-2-Mini, an experimental preview; the 594B
-#  Inkling-2-Small runs by hand, docs/INKLING2.md)
+# ("ik2": thinkingmachines' Inkling 2 on maya-ik2; the catalog download is Inkling-2-Mini)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
          "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
 SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
@@ -123,6 +122,8 @@ def is_ik2_mini(cfg: dict) -> bool:
     """An Inkling 2 config that runs Inkling-2-Mini (the setup's: its installer record; one written by hand: its
     model_name or its GGUF's name) rather than Inkling-2-Small."""
     inst = cfg.get("installer") or {}
+    if inst.get("ik2_variant"):
+        return inst["ik2_variant"] == "mini"
     if inst.get("ik2_quant"):
         return True
     args = [str(a) for a in cfg.get("args") or []]
@@ -381,6 +382,8 @@ def config_label(cfg: dict) -> str | None:
     None for a config the setup did not write."""
     if not isinstance(cfg.get("installer"), dict):
         return None
+    if cfg["installer"].get("local_model") and family_of(cfg) in ("hy4", "ik2"):
+        return cfg["installer"]["local_model"]
     if is_glm53(cfg):
         what = glm53_quant(config_key(cfg))
         return _g53.LABEL + (SEP + what if what else "")

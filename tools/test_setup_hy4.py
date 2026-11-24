@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -386,16 +387,14 @@ class Picker(unittest.TestCase):
             got["family"] = maya.choose_family(a, prev or {})
         return got
 
-    def test_not_listed_until_published(self):
+    def test_local_setup_is_listed_before_publication(self):
         got = self.rows()
-        self.assertNotIn("Hy4-Flash", got["rows"])
-        self.assertEqual(got["rows"][-2:], ["Qwen-3.8-Flash-Next", "Inkling 2 Mini (experimental)"])   # (as before;
-        #  Inkling-2-Mini's preview the last row)
+        self.assertEqual(got["rows"][-2:], ["Hy4-Flash", "Inkling 2 (experimental)"])
         self.assertEqual(got["family"], "glm")
 
     def test_listed_once_published(self):
         got = self.rows(man=manifest())
-        self.assertEqual(got["rows"][-2:], ["Hy4-Flash", "Inkling 2 Mini (experimental)"])
+        self.assertEqual(got["rows"][-2:], ["Hy4-Flash", "Inkling 2 (experimental)"])
         about = got["about"]["Hy4-Flash"]
         for part in ("Tencent's Hy4-flash", "Hy4-Flash-Maya-XS (108 GB)", "NVIDIA from V100 on", "Linux or Windows",
                      "pictures (its vision tower", "thinking High or Off", "tool calls", "Tencent's own Q4_K_M (AngelSlim",
@@ -1070,7 +1069,10 @@ class Files(unittest.TestCase):
             self.assertEqual([f.name for f in files], [TRUNK, NGRAM])
             self.assertEqual(set(json.loads((d / maya.VERIFIED).read_text())), {TRUNK, NGRAM})   # (remembered)
             self.assertTrue(any("never loaded into RAM" in s for s in self.said))
-            (d / TRUNK).write_bytes(b"\xff" + body[trunk][1:])        # (one byte changed, the size kept)
+            changed = d / TRUNK
+            mtime = changed.stat().st_mtime_ns
+            changed.write_bytes(b"\xff" + body[trunk][1:])        # (one byte changed, the size kept)
+            os.utime(changed, ns=(mtime, mtime + 1_000_000_000))
             with self.assertRaisesRegex(Failed, "sha256 does not match"):
                 maya.hy4_model_step(args(), d, "maya-xs", "standard", self.models)
 
