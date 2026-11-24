@@ -562,7 +562,7 @@ void test_decode() {
             if (type == k::kQ8_0) fix(0);
             if (type == k::kQ5_K) fix(0), fix(2);
             if (type == k::kQ6_K) fix(208);
-        if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
+        if (type == k::kIQ3_XXS || type == k::kIQ2_S || type == k::kIQ3_S || type == k::kIQ4_XS) fix(0);
         }
         std::vector<float> hostv(n);
         k::decode_host(type, raw.data(), n, hostv.data());
@@ -595,10 +595,43 @@ void test_decode() {
     }
 }
 
-// random blocks of `type` whose F16 scales are finite and moderate
+void test_bf16_decode() {
+    const std::vector<uint8_t> raw = {0x00, 0x00, 0x00, 0x80, 0x80, 0x3f, 0xa0, 0xbf,
+                                      0x00, 0x3e, 0x00, 0x38, 0x01, 0x40, 0x80, 0xc0};
+    const std::vector<float> want = {0.0f, -0.0f, 1.0f, -1.25f, 0.125f, 0x1p-15f, 2.015625f, -4.0f};
+    const size_t n = want.size();
+    expect_true("BF16 geometry", k::block_values(k::kBF16) == 1 && k::block_bytes(k::kBF16) == 2);
+    std::vector<float> decoded(n);
+    k::decode_host(k::kBF16, raw.data(), n, decoded.data());
+    expect_true("BF16 host decode", std::memcmp(decoded.data(), want.data(), n * sizeof(float)) == 0);
+    uint8_t* d_raw = dev(raw);
+    float* d_f32 = dev_n<float>(n);
+    uint16_t* d_f16 = dev_n<uint16_t>(n);
+    k::decode_f32(k::kBF16, d_raw, n, d_f32, 0);
+    k::decode_f16(k::kBF16, d_raw, n, d_f16, 0);
+    const auto got32 = host(d_f32, n);
+    expect_true("BF16 GPU decode to F32", std::memcmp(got32.data(), want.data(), n * sizeof(float)) == 0);
+    const auto got16 = host(d_f16, n);
+    std::vector<float> round_trip(n);
+    for (size_t i = 0; i < n; ++i) round_trip[i] = h2f_host(got16[i]);
+    expect_true("BF16 GPU decode to F16", std::memcmp(round_trip.data(), want.data(), n * sizeof(float)) == 0);
+    cudaFree(d_raw), cudaFree(d_f32), cudaFree(d_f16);
+}
+
+// random blocks of `type` whose weights or scales are finite and moderate
 std::vector<uint8_t> rand_blocks(int type, size_t n_values) {
     const size_t bb = k::block_bytes(type), nb = n_values / k::block_values(type);
     std::vector<uint8_t> raw(nb * bb);
+    if (type == k::kBF16) {
+        std::mt19937 weights(151);
+        for (size_t i = 0; i < nb; ++i) {
+            const uint32_t bits = weights();
+            const uint16_t value = (uint16_t) ((bits & 0x807F) | ((120 + (bits >> 8) % 6) << 7));
+            raw[2 * i] = (uint8_t) value;
+            raw[2 * i + 1] = (uint8_t) (value >> 8);
+        }
+        return raw;
+    }
     for (auto& b : raw) b = (uint8_t) rng();
     for (size_t b = 0; b < nb; ++b) {
         auto fix = [&](size_t off) {
@@ -678,7 +711,66 @@ void test_iq_ref() {
     }
 }
 
-void test_experts_mv() {
+void test_iq_s_formats() {
+    const int N = 11, K = 512;
+    for (int type : {k::kIQ2_S, k::kIQ3_S}) {
+        const bool iq2 = type == k::kIQ2_S;
+        const char* name = iq2 ? "IQ2_S" : "IQ3_S";
+        const size_t n = (size_t) N * K;
+        const size_t bytes = iq2 ? 82 : 110;
+        expect_true(name, k::block_values(type) == 256 && k::block_bytes(type) == bytes);
+        const auto raw = rand_blocks(type, n);
+        std::vector<float> ref(n);
+        for (size_t block = 0; block < n / 256; ++block) {
+            const uint8_t* b = raw.data() + block * bytes;
+            const float d = h2f_host((uint16_t) (b[0] | (b[1] << 8)));
+            float* out = ref.data() + block * 256;
+            for (int group = 0; group < 8; ++group) {
+                const uint8_t* qs = b + 2 + (iq2 ? 4 : 8) * group;
+                const unsigned qh = b[66 + group];
+                const uint8_t* signs = b + (iq2 ? 34 : 74) + 4 * group;
+                for (int part = 0; part < 4; ++part) {
+                    const uint8_t scales = iq2 ? b[74 + group] : b[106 + group / 2];
+                    const float scale = iq2 ? d * (0.5f + ((scales >> (4 * (part / 2))) & 15)) * 0.25f :
+                                           d * (1 + 2 * ((scales >> (4 * (group % 2))) & 15));
+                    uint64_t grid;
+                    if (iq2) {
+                        grid = ik2_iq::host::iq2s_grid[qs[part] | ((qh << (8 - 2 * part)) & 0x300)];
+                    } else {
+                        const auto lo = ik2_iq::host::iq3s_grid[qs[2 * part] | ((qh << (8 - 2 * part)) & 256)];
+                        const auto hi = ik2_iq::host::iq3s_grid[qs[2 * part + 1] | ((qh << (7 - 2 * part)) & 256)];
+                        grid = lo | ((uint64_t) hi << 32);
+                    }
+                    for (int j = 0; j < 8; ++j)
+                        *out++ = scale * (float) ((grid >> (8 * j)) & 255) * (signs[part] & (1 << j) ? -1.f : 1.f);
+                }
+            }
+        }
+        std::vector<float> decoded(n);
+        k::decode_host(type, raw.data(), n, decoded.data());
+        expect_true(name, decoded == ref);
+        uint8_t* dr = dev(raw);
+        float* dw = dev_n<float>(n);
+        uint16_t* dh = dev_n<uint16_t>(n);
+        k::decode_f32(type, dr, n, dw, 0);
+        k::decode_f16(type, dr, n, dh, 0);
+        expect_true(name, host(dw, n) == ref);
+        const auto halves = host(dh, n);
+        bool same = true;
+        for (size_t i = 0; i < n; ++i) same &= halves[i] == f2h_host(ref[i]);
+        expect_true(name, same);
+        const auto x = fvec(K, 1.5f);
+        float* dx = dev(x), *dy = dev_n<float>(N);
+        k::mv_blocks(type, dr, N, K, dx, dy, 0);
+        std::vector<double> want(N, 0.0);
+        for (int row = 0; row < N; ++row)
+            for (int j = 0; j < K; ++j) want[row] += (double) ref[row * K + j] * x[j];
+        expect(name, host(dy, N), want, 2e-4, 2e-3);
+        cudaFree(dr), cudaFree(dw), cudaFree(dh), cudaFree(dx), cudaFree(dy);
+    }
+}
+
+void test_experts_mv(bool bf16_only = false) {
     const int C = 512, F = 256, S = 5;
     struct Case {
         int tg, tu, td;
@@ -688,8 +780,10 @@ void test_experts_mv() {
                           {k::kQ5_K, k::kQ5_K, k::kQ6_K, "Q5_K / Q6_K"},
                           {k::kQ8_0, k::kNVFP4, k::kQ6_K, "mixed"},
                           {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4, "IQ3_XXS / NVFP4"},
-                          {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"}};
+                          {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"},
+                          {k::kBF16, k::kBF16, k::kBF16, "BF16"}};
     for (const Case& cs : cases) {
+        if ((cs.tg == k::kBF16) != bf16_only) continue;
         const int E = 3;
         auto g = rand_blocks(cs.tg, (size_t) E * F * C), u = rand_blocks(cs.tu, (size_t) E * F * C),
              d = rand_blocks(cs.td, (size_t) E * C * F);
@@ -760,17 +854,19 @@ void test_experts_mv() {
 }
 
 // the grouped kernels against the per-slot ones: 8 tokens, variable group sizes (1, 2, 3, 5, 8) over all quant types
-void test_experts_grouped() {
+void test_experts_grouped(bool bf16_only = false) {
     const int C = 512, F = 256, E = 5, T = 8, K = 8, S = T * K;
     const int types[][3] = {{k::kNVFP4, k::kNVFP4, k::kNVFP4},
                             {k::kQ5_K, k::kQ5_K, k::kQ6_K},
                             {k::kQ8_0, k::kQ8_0, k::kQ8_0},
                             {k::kQ8_0, k::kNVFP4, k::kQ6_K},
                             {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4},
-                            {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K}};
-    const char* tnames[] = {"NVFP4", "Q5_K/Q6_K", "Q8_0", "Q8_0/NVFP4/Q6_K", "IQ3_XXS/NVFP4", "IQ4_XS/Q6_K"};
-    for (int ti = 0; ti < 6; ++ti) {
+                            {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K},
+                            {k::kBF16, k::kBF16, k::kBF16}};
+    const char* tnames[] = {"NVFP4", "Q5_K/Q6_K", "Q8_0", "Q8_0/NVFP4/Q6_K", "IQ3_XXS/NVFP4", "IQ4_XS/Q6_K", "BF16"};
+    for (size_t ti = 0; ti < std::size(types); ++ti) {
         const auto& ty = types[ti];
+        if ((ty[0] == k::kBF16) != bf16_only) continue;
         auto g = rand_blocks(ty[0], (size_t) E * F * C), u = rand_blocks(ty[1], (size_t) E * F * C),
              d = rand_blocks(ty[2], (size_t) E * C * F);
         const size_t eb0 = g.size() / E, eb1 = u.size() / E, eb2 = d.size() / E, slot = (eb0 + eb1 + eb2 + 255) / 256 * 256;
@@ -873,7 +969,7 @@ void test_attn_multi() {
     for (float* p : {dk, dv, dq, dr, ds, dp, scratch, out, one}) cudaFree(p);
 }
 
-void test_mv_blocks() {
+void test_mv_blocks(bool bf16_only = false) {
     struct Case {
         int type, N, K;
         const char* name;
@@ -888,8 +984,10 @@ void test_mv_blocks() {
         {k::kQ5_K, 513, 4608, "Q5_K N=513"},
         {k::kIQ3_XXS, 1031, 4608, "IQ3_XXS N=1031"},
         {k::kIQ4_XS, 513, 4608, "IQ4_XS N=513"},
+        {k::kBF16, 513, 2304, "BF16 N=513"},
     };
     for (const Case& cs : cases) {
+        if ((cs.type == k::kBF16) != bf16_only) continue;
         const int N = cs.N, K = cs.K;
         auto raw = rand_blocks(cs.type, (size_t) N * K);
         auto x = fvec(K, 2.0f);
@@ -3213,6 +3311,7 @@ int main() {
     test_route();
     test_moe_pieces();
     test_decode();
+    test_bf16_decode();
     test_iq_ref();
     test_experts_mv();
     test_attn_decode();
@@ -3236,6 +3335,11 @@ int main() {
 #endif
     test_window_exact(p.major >= 7);   // (Volta and Turing: their own tensor-core kernels)
     test_window_launches();
+    // Keep the established random fixtures of the other formats stable.
+    test_experts_mv(true);
+    test_mv_blocks(true);
+    test_experts_grouped(true);
+    test_iq_s_formats();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -374,6 +374,7 @@ struct Drafter {
     int n_rows = 0;
     const int8_t* head_q8 = nullptr;      // the target's head as planar Q8_0 (set_head_q8): the base logits through it
     const uint16_t* head_q8d = nullptr;
+    const uint16_t* head_bf16 = nullptr;
     bool head_tiles = true;               // its product on the tensor cores (q8_tile: sm_80 on), else mv_q8p_cols
     int* shortlist = nullptr;
     float* shortlist_scores = nullptr;
@@ -757,7 +758,7 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
 }
 
 namespace {
-// the fold, the head's rows a chunk at a time as F32 from lm_f16 (FP16 [n_rows][C]) or from planar Q8_0 (q8, q8d)
+// The fold reads the FP16, BF16 or planar Q8_0 head as F32 a chunk at a time.
 void fold_impl(Drafter* d, const uint16_t* lm_f16, const int8_t* q8, const uint16_t* q8d, int n_rows) {
     const int C = d->C, R = d->R;
     d->n_rows = n_rows;
@@ -794,6 +795,9 @@ void fold_impl(Drafter* d, const uint16_t* lm_f16, const int8_t* q8, const uint1
         const size_t elems = (size_t) m * C;
         if (lm_f16)
             f16_to_f32_kernel<<<(unsigned) ((elems + 255) / 256), 256, 0, d->s>>>(lm_f16 + (size_t) r0 * C, elems, dlm);
+        else if (d->head_bf16)
+            k::decode_f32(k::kBF16, reinterpret_cast<const uint8_t*>(d->head_bf16 + (size_t) r0 * C),
+                          elems, dlm, d->s);
         else
             q8p_f32_kernel<<<(unsigned) ((elems + 255) / 256), 256, 0, d->s>>>(q8 + (size_t) r0 * C,
                                                                                q8d + (size_t) r0 * C / 32, elems, dlm);
@@ -847,6 +851,10 @@ void fold_impl(Drafter* d, const uint16_t* lm_f16, const int8_t* q8, const uint1
 
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) { fold_impl(d, lm_f16, nullptr, nullptr, n_rows); }
 void fold_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d, int n_rows) { fold_impl(d, nullptr, q8, q8d, n_rows); }
+void fold_bf16(Drafter* d, const uint16_t* lm_bf16, int n_rows) {
+    d->head_bf16 = lm_bf16;
+    fold_impl(d, nullptr, nullptr, nullptr, n_rows);
+}
 
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0) {
     const int C = d->C, KD = d->KV * 128;
@@ -915,13 +923,18 @@ void propose_launches(Drafter* d, int anchor, const float* anchor_h, int P, cons
     k::add(d->x, d->res, TC, d->res, d->s);
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
     // base logits of rows 1 .. 7 through the target's head
-    k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
-    if (d->head_q8 && !d->head_tiles)
+    if (d->head_bf16) {
+        k::to_bf16(d->h + C, (size_t) proposals * C, d->hb, d->s);
+        gemm_bf(d, d->head_bf16, n_rows, C, d->hb, proposals, d->base, n_rows);
+    } else if (d->head_q8 && !d->head_tiles) {
         k::mv_q8p_cols(d->head_q8, d->head_q8d, n_rows, C, d->h + C, C, proposals, d->base, n_rows, d->s);
-    else if (d->head_q8)
-        k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
-    else
-        gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
+    } else {
+        k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
+        if (d->head_q8)
+            k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
+        else
+            gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
+    }
     const int shortlist_n = (n_vocab + 31) / 32;
     if (d->shortlist)
         draft_shortlist<<<dim3((n_vocab + 127) / 128, proposals), 128, 0, d->s>>>(

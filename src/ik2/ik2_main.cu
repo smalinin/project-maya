@@ -181,13 +181,6 @@ size_t tensor_bytes(const maya::TensorInfo& t) {
     return (size_t) (t.elements() / e) * b;
 }
 
-float bf16_to_f32(uint16_t b) {
-    const uint32_t u = (uint32_t) b << 16;
-    float f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-
 // ---- the model
 
 struct Config {
@@ -670,8 +663,6 @@ std::vector<float> host_f32(const Shards& S, const std::string& n, size_t expect
     const uint8_t* p = S.data(n);
     if (t->type == 0) {
         std::memcpy(v.data(), p, expect * 4);
-    } else if (t->type == 30) {
-        for (size_t i = 0; i < expect; ++i) v[i] = bf16_to_f32((uint16_t) (p[2 * i] | (p[2 * i + 1] << 8)));
     } else if (k::block_values((int) t->type)) {
         k::decode_host((int) t->type, p, expect, v.data());
     } else {
@@ -6988,11 +6979,12 @@ int main(int argc, char** argv) {
     // the drafter: loaded on GPU 0 below, after the work buffers and before the expert cache (draft_path: planned)
     ik2::draft::Drafter* drafter = nullptr;
     uint16_t* draft_head = M.out_w.f16;
+    const uint16_t* draft_head_bf16 = M.out_w.type == k::kBF16 ?
+        reinterpret_cast<const uint16_t*>(M.out_w.raw) : nullptr;
     if (!draft_path.empty()) {
         if (n_gpu != 1) die("--draft: one GPU only so far");
-        // (a Q8_0 head: the fold reads its blocks a chunk at a time and the base logits are products with them - no
-        //  FP16 copy of it, 0.9 GiB for Inkling 2's, which at a long context's start had no room beside the cache)
-        if (!draft_head && !M.out_w.q8) die("--draft: the output head is neither FP16 nor planar Q8_0");
+        // BF16 and planar Q8_0 by chunk for the fold, then directly for base logits, saving a full FP16 head copy.
+        if (!draft_head && !M.out_w.q8 && !draft_head_bf16) die("--draft: the output head needs FP16, BF16 or planar Q8_0");
         g_final_tap = c.n_pass == 1 ? 7 : 3;
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
     }
@@ -7215,6 +7207,8 @@ int main(int argc, char** argv) {
                 dr = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s, kv8 != 0);
                 if (draft_head) {
                     ik2::draft::fold(dr, draft_head, c.n_rows);
+                } else if (draft_head_bf16) {
+                    ik2::draft::fold_bf16(dr, draft_head_bf16, c.n_rows);
                 } else {
                     ik2::draft::fold_q8(dr, M.out_w.q8, M.out_w.q8d, c.n_rows);
                     ik2::draft::set_head_q8(dr, M.out_w.q8, M.out_w.q8d);

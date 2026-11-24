@@ -49,12 +49,14 @@ void fold(Drafter* d, const uint16_t* lm_f16, int n_rows);
 /// ... through the head kept as planar Q8_0 (set_head_q8's form), read a chunk at a time: the same fold as through
 /// its FP16 copy, without the copy.
 void fold_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d, int n_rows);
+/// Fold the native BF16 head and reuse it for base logits. The model owns the device allocation.
+void fold_bf16(Drafter* d, const uint16_t* lm_bf16, int n_rows);
 /// The context caches for positions pos0 .. pos0 + m - 1 from tap rows r0 .. r0 + m - 1 (taps [8][ld][C] F32).
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0);
 /// f_rnn from tap row `row`.
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row);
 /// Drafts 7 tokens (out, host) after the anchor at position P; anchor_h: its embedding, normed (device [C] F32).
-/// lm_f16: the target's output head; n_vocab: the real rows (the argmax's range).
+/// lm_f16: the target's FP16 head when used; n_vocab: the real rows (the argmax's range).
 /// noise (a sampled request, or null): the drafts are then drawn - draft j the argmax of its softcapped logits over
 /// the temperature plus k::gumbel_noise(salt, P + 1 + j, token), the noise the model's own token of that position
 /// is drawn with - instead of the drafter's best tokens (a GGUF drafter's int8 fold; else its best tokens).
