@@ -47,6 +47,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <io.h>
+#include <process.h>
 #define O_RDONLY (_O_RDONLY | _O_BINARY)
 #define open _open
 #define close _close
@@ -66,6 +67,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
@@ -100,13 +102,22 @@ static inline int munmap(void*, size_t) { return 0; }
 namespace {
 
 namespace k = ik2::k;
+// A fatal error ends the engine at once: stdout and stderr are flushed, then out WITHOUT std::exit - its flush of every
+// stdio stream takes stdin's lock, which the --serve reader thread holds while it waits for input, and its static
+// destructors may wait on the GPU while our threads still use it (#1136).
+[[noreturn]] inline void fatal_exit() {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+
 
 #define CU(x)                                                                                              \
     do {                                                                                                   \
         cudaError_t e_ = (x);                                                                              \
         if (e_ != cudaSuccess) {                                                                           \
             std::fprintf(stderr, "maya-ik2: %s: %s (%s:%d)\n", #x, cudaGetErrorString(e_), __FILE__, __LINE__); \
-            std::exit(1);                                                                                  \
+            fatal_exit();                                                                                   \
         }                                                                                                  \
     } while (0)
 #define CB(x)                                                                                              \
@@ -114,13 +125,13 @@ namespace k = ik2::k;
         cublasStatus_t e_ = (x);                                                                           \
         if (e_ != CUBLAS_STATUS_SUCCESS) {                                                                 \
             std::fprintf(stderr, "maya-ik2: %s: cuBLAS status %d (line %d)\n", #x, (int) e_, __LINE__);    \
-            std::exit(1);                                                                                  \
+            fatal_exit();                                                                                   \
         }                                                                                                  \
     } while (0)
 
 [[noreturn]] void die(const std::string& m) {
     std::fprintf(stderr, "maya-ik2: %s\n", m.c_str());
-    std::exit(1);
+    fatal_exit();
 }
 
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -4713,6 +4724,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 CU(cudaMemcpyPeer(Tn.blocks + (size_t) i * Tn.blk_ld * C, Ly.dev, F.blocks + (size_t) i * F.blk_ld * C,
                                   from, TC * 4));
             CU(cudaMemcpyPeer(Tn.pos, Ly.dev, F.pos, from, (size_t) T * 4));
+            // A hop inside a looped core's later pass: the layers over there read their messages from the pass before's
+            // bank, filled on this GPU - it goes along too (#1107). (lp_pre is written and read at core0 only.)
+            if (c.n_pass > 1 && M.V[vis].pass > 0 && n_bank > 0)
+                CU(cudaMemcpyPeer(Tn.lp_bank, Ly.dev, F.lp_bank, from, (size_t) n_bank * TC * 4));
             use_dev(Ly.dev);
             Wp = &dev_work(g_cur);
             ECp = &dev_cache(g_cur);
@@ -5665,6 +5680,122 @@ void draft_remember(const std::string& key, const double* tps, int c) {
     std::remove(f);
     std::rename(tmp.c_str(), f);
 }
+// the fastest of the four figures (-1: not measured); a drafter within `tie` of no drafting: no drafting
+int draft_best(const double* tps, double tie) {
+    int best = 0;
+    for (int m = 1; m < 4; ++m)
+        if (tps[m] > tps[best]) best = m;
+    if (best && tps[best] < tps[0] * (1.0 + tie)) best = 0;   // (no clear gain: no drafting)
+    return best;
+}
+
+// The first start where the experts wait in host memory (the offload path): the drafter's room comes out of the
+// experts' VRAM tier, so plain decoding and drafting are two layouts - each is timed on its own, in a short run of
+// this program before this process takes any VRAM (IK2_DRAFT_PART=draft: the drafting layout's sources;
+// plain: --drafting off's layout), a line each in IK2_DRAFT_FILE.part ("<part>\t<key>\t<4 figures>", "skip": nothing
+// to split here), their start lines in IK2_DRAFT_FILE.measure.log.  The start itself then finds the remembered
+// choice, as every later start does - its layout, its tokens, its speed.
+int g_part = 0;   // (1: the drafting layout's run, 2: plain decoding's)
+FILE* g_part_out = nullptr;   // (a part run: the start's own output)
+FILE* part_dup_stdout() {
+#ifdef _WIN32
+    return _fdopen(_dup(_fileno(stdout)), "w");
+#else
+    return fdopen(dup(fileno(stdout)), "w");
+#endif
+}
+std::string draft_part_file() {
+    const char* f = getenv("IK2_DRAFT_FILE");
+    return f && *f ? std::string(f) + ".part" : std::string();
+}
+[[noreturn]] void draft_part_done(const char* part, const std::string& key, const double* tps) {
+    const std::string f = draft_part_file();
+    if (!f.empty()) {
+        if (FILE* out = std::fopen(f.c_str(), "a")) {
+            std::fprintf(out, "%s\t%s\t%.3f %.3f %.3f %.3f\n", part, key.c_str(), tps ? tps[0] : -1.0,
+                         tps ? tps[1] : -1.0, tps ? tps[2] : -1.0, tps ? tps[3] : -1.0);
+            std::fclose(out);
+        }
+    }
+    std::printf("measurement run (%s): done\n", part);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);   // (the driver frees this run's VRAM; nothing of it is kept)
+}
+// the part's line: true with its key and figures
+bool draft_part_read(const char* part, std::string& key, double* tps) {
+    std::ifstream in(draft_part_file());
+    std::string line;
+    bool ok = false;
+    while (std::getline(in, line)) {
+        const size_t t1 = line.find('\t'), t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+        if (t2 == std::string::npos || line.compare(0, t1, part) != 0) continue;
+        double v[4];
+        if (std::sscanf(line.c_str() + t2 + 1, "%lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3]) != 4) continue;
+        key = line.substr(t1 + 1, t2 - t1 - 1);
+        for (int i = 0; i < 4; ++i) tps[i] = v[i];
+        ok = true;
+    }
+    return ok;
+}
+void env_set(const char* k, const char* v) {
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    if (*v) setenv(k, v, 1);
+    else unsetenv(k);
+#endif
+}
+// this program again with the same arguments and IK2_DRAFT_PART=part, waited for; its exit code (-1: not started)
+int draft_part_run(int argc, char** argv, const char* part) {
+    env_set("IK2_DRAFT_PART", part);
+    int rc = -1;
+#ifdef _WIN32
+    char exe[MAX_PATH + 1] = "";
+    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        auto quote = [](const std::string& a) {   // (the C runtime's rules: \" a quote, the backslashes before one doubled)
+            if (!a.empty() && a.find_first_of(" \t\"") == std::string::npos) return a;
+            std::string q = "\"";
+            size_t bs = 0;
+            for (char ch : a) {
+                if (ch == '\\') {
+                    ++bs;
+                } else if (ch == '"') {
+                    q.append(bs + 1, '\\');
+                    bs = 0;
+                } else {
+                    bs = 0;
+                }
+                q.push_back(ch);
+            }
+            q.append(bs, '\\');
+            return q + "\"";
+        };
+        std::vector<std::string> qs;
+        qs.push_back(quote(exe));
+        for (int i = 1; i < argc; ++i) qs.push_back(quote(argv[i]));
+        std::vector<const char*> av;
+        for (const auto& s : qs) av.push_back(s.c_str());
+        av.push_back(nullptr);
+        rc = (int) _spawnv(_P_WAIT, exe, av.data());
+    }
+#else
+    std::vector<char*> av(argv, argv + argc);
+    av.push_back(nullptr);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        execv("/proc/self/exe", av.data());
+        _exit(127);
+    }
+    if (pid > 0) {
+        int st = 0;
+        if (waitpid(pid, &st, 0) == pid && WIFEXITED(st)) rc = WEXITSTATUS(st);
+    }
+#endif
+    env_set("IK2_DRAFT_PART", "");
+    return rc;
+}
 
 // --check-sampling (no GPU, no model): sampled drafting keeps the distribution - a drafted position's pick (spec_pick:
 // the draft with the model's probability of it, else the distribution without it) against the plain pick
@@ -5888,6 +6019,17 @@ int main(int argc, char** argv) {
         else die("unknown argument " + a);
     }
     g_depth = getenv("IK2_DEPTH") ? std::max(0, std::atoi(getenv("IK2_DEPTH"))) : 0;   // (tests: a long context's speed without its prompt)
+    if (const char* pt = getenv("IK2_DRAFT_PART"); pt && *pt && serve) {   // (a first start's measurement run)
+        g_part = std::string(pt) == "draft" ? 1 : std::string(pt) == "plain" ? 2 : 0;
+        const std::string pf = draft_part_file();
+        if (!g_part || pf.empty()) die("IK2_DRAFT_PART: draft or plain, with IK2_DRAFT_FILE");
+        std::fflush(stdout);
+        g_part_out = part_dup_stdout();   // (the start's own output: one line of the draft run)
+        const std::string lf = pf.substr(0, pf.size() - 5) + ".measure.log";
+        if (!std::freopen(lf.c_str(), "a", stdout)) die("cannot write " + lf);
+        std::printf("--- measurement run: %s ---\n", pt);
+        if (g_part == 2) drafting = "off";   // (plain decoding's own layout: nothing of the drafter's planned)
+    }
     if (drafting.empty()) drafting = draft_path.empty() ? "off" : "on";   // (--draft alone: as before, drafting on)
     if (drafting == "off") draft_path.clear();
     g_lookup = drafting != "off" && !(getenv("IK2_LOOKUP") && !std::atoi(getenv("IK2_LOOKUP")));
@@ -5941,6 +6083,56 @@ int main(int argc, char** argv) {
         maya::ds4::lt::set_store(ls != nullptr ? ls : (dir + "/lt-picks.txt").c_str(), "IK2_LT_STORE");
     }
 #endif
+    // --drafting auto, nothing remembered for this PC yet: where the experts wait in host memory, plain decoding and
+    // drafting are timed each on its own layout, in two runs of this program before this one takes any VRAM (the
+    // drafting run says "skip" at once where there is nothing to split: every expert in VRAM, no room for a drafter).
+    // (NVIDIA; IK2_DRAFT_SPLIT=1: on AMD too, =0: off - then, and when a run fails, the one-load measurement below)
+    {
+#ifdef MAYA_USE_HIP
+        const bool split_def = false;
+#else
+        const bool split_def = true;
+#endif
+        const char* sp = getenv("IK2_DRAFT_SPLIT");
+        const char* idf = getenv("IK2_DRAFT_IDS");
+        if (serve && !g_part && drafting == "auto" && (!draft_path.empty() || g_lookup) && !g_two.want && n_gpu == 1 &&
+            (sp && *sp ? std::atoi(sp) != 0 : split_def) && !draft_part_file().empty() && idf && *idf) {
+            const std::string key = draft_key(model, draft_path, ctx);
+            double tp[4] = {-1, -1, -1, -1}, td[4] = {-1, -1, -1, -1};
+            std::string date, k1, k2;
+            if (draft_remembered(key, tp, date) < 0) {
+                const std::string pf = draft_part_file();
+                std::remove(pf.c_str());
+                std::remove((pf.substr(0, pf.size() - 5) + ".measure.log").c_str());
+                std::fflush(stdout);
+                const double tm0 = now();
+                const int r1 = draft_part_run(argc, argv, "draft");
+                if (r1 == 0 && draft_part_read("draft", k1, td)) {
+                    const int r2 = draft_part_run(argc, argv, "plain");
+                    if (r2 == 0 && draft_part_read("plain", k2, tp) && tp[0] > 0) {
+                        const double tie = getenv("IK2_DRAFT_TIE") ? std::atof(getenv("IK2_DRAFT_TIE")) : 0.03;
+                        const double tps[4] = {tp[0], td[1], td[2], td[3]};
+                        const int best = draft_best(tps, tie);
+                        draft_remember(k1, tps, best);
+                        env_set("IK2_DRAFT_MEASURE", "0");   // (measured now: the start below takes it)
+                        std::printf("NOTE maya-ik2: measured this PC once in %.0f s: drafting - %s (no drafting %.1f, "
+                                    "the prompt lookup %.1f, the drafter %.1f, both %.1f tokens/s); plain decoding and "
+                                    "drafting were timed each on its own layout - this start and every later one run "
+                                    "on the faster one's\n", now() - tm0, kDraftNames[best], tps[0], tps[1], tps[2],
+                                    tps[3]);
+                    } else {
+                        std::printf("NOTE maya-ik2: plain decoding's measurement run did not finish (exit %d) - "
+                                    "measured in this start instead\n", r2);
+                    }
+                } else if (r1 != 0 || !draft_part_read("skip", k1, td)) {
+                    std::printf("NOTE maya-ik2: the drafting measurement run did not finish (exit %d) - measured in "
+                                "this start instead\n", r1);
+                }
+                std::remove(pf.c_str());
+                std::fflush(stdout);
+            }
+        }
+    }
     // IK2_VRAM_GB=N (tests): the first GPU as a card of N GiB - the rest of its memory taken now and kept, so every
     // figure the engine reads (cudaMemGetInfo) is a smaller card's
     // (two GPUs: each of them; IK2_VRAM_GB1: GPU 1's own)
@@ -6353,18 +6545,17 @@ int main(int argc, char** argv) {
                     : g_off_want ? "the experts in host memory, a tier of them in VRAM, the rest fetched by the GPU"
                                  : "the experts in host memory, a cache of them in VRAM");
         // Drafting never changes the context, the cache or the pictures' room of this plan.  Where every expert stays
-        // in VRAM (the resident path) a loaded drafter takes room only where everything above stays as it is: its
-        // room - the drafter's, or the prompt lookup's window records alone - beside the model at this context, and
-        // not the room the pictures' encoder would have had on the GPU (IK2_VISION_GIB, the server's: the encoder
-        // starts on the GPU when the free VRAM holds it).  Where the experts already left VRAM for the cache (the
-        // offload path: a long context) the drafter's room is the experts' too - the tier gives it, at most half of
-        // what it had, with the verify window's staging; the drafter's context rows FP16, else FP8, else FP8 rows of
+        // in VRAM (the resident path) a loaded drafter takes room only where everything above stays as it is: its room
+        // - the drafter's, or the prompt lookup's window records alone - beside the model at this context.  The
+        // pictures' encoder has no room in this plan and takes none from the drafter: the server starts it when a
+        // picture arrives, on the GPU only while the VRAM then free holds it beside the model and the drafter, else on
+        // the CPU (the plan is the same with pictures on or off).  Where the experts already left VRAM for the cache
+        // (the offload path: a long context) the drafter's room is the experts' too - the tier gives it, at most half
+        // of what it had, with the verify window's staging; the drafter's context rows FP16, else FP8, else FP8 rows of
         // the last positions only (half the context, a quarter .. 65,536: its drafts read less far back, the model
-        // checks every token as ever).  The window there is mode A's (the resident kernels over the tier's bytes):
-        // one GPU, the whole cache in VRAM, no lane parity.  Else it is left out, said why.
+        // checks every token as ever).  The window there is mode A's (the resident kernels over the tier's bytes): one
+        // GPU, the whole cache in VRAM, no lane parity.  Else it is left out, said why.
         const size_t used = exp_b + dense_b + kv_b + reserve;
-        const double vis = getenv("IK2_VISION_GIB") ? std::atof(getenv("IK2_VISION_GIB")) * 1073741824.0 : 0.0;
-        const double left = fr0 > used ? (double) (fr0 - used) : 0.0;
         const bool off_layout = g_off_want && !g_fast_want;
         std::string off_why;
         size_t tier_room = 0, stage_b = 0;
@@ -6399,8 +6590,6 @@ int main(int argc, char** argv) {
                 else if (need + stage_b > tier_room / 2) why = "its room does not fit beside the model at this context";
             } else if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";
             else if (used + need > fr0) why = "its room does not fit beside the model at this context";
-            else if (vis > 0 && left >= vis && left - (double) need < vis)
-                why = "its room would move the pictures' encoder from the GPU to the CPU";
             return why.empty();
         };
         for (int pass = 0; pass < 2; ++pass) {   // (the drafter, else the prompt lookup alone)
@@ -6464,6 +6653,13 @@ int main(int argc, char** argv) {
     } else if (!draft_path.empty() || g_lookup) {
         std::printf("NOTE maya-ik2: drafting off - it runs on one GPU with every expert in VRAM, not here\n");
         draft_path.clear(), g_lookup = false;
+    }
+    if (g_part == 1) {
+        if (!(g_off_draft && drafting == "auto" && draft_choice < 0)) draft_part_done("skip", draft_key_s, nullptr);
+        std::fprintf(g_part_out, "NOTE maya-ik2: measuring this PC once, before the first answer: drafting and plain "
+                                 "decoding, each on its own layout (two short runs of the engine before the start "
+                                 "itself); remembered, the next starts skip it\n");
+        std::fflush(g_part_out);
     }
 
     // the dense weights
@@ -7771,7 +7967,9 @@ int main(int argc, char** argv) {
                 if (G.exec) cudaGraphExecDestroy(G.exec), cudaGraphDestroy(G.graph), G.exec = nullptr, G.graph = nullptr;
             g_lane = on;
         };
-        if (drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && (spec_path() || lane_meas)) {
+        const bool meas = drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && (spec_path() || lane_meas);
+        if (g_part == 1 && !(meas && g_off && g_off_draft)) draft_part_done("skip", draft_key_s, nullptr);
+        if (meas || g_part == 2) {
             std::vector<std::vector<int>> reqs;
             if (const char* f = getenv("IK2_DRAFT_IDS")) {
                 std::ifstream in(f);
@@ -7782,6 +7980,7 @@ int main(int argc, char** argv) {
                         if (!v.empty() && (int) v.size() + 256 < ctx) reqs.push_back(std::move(v));
                     }
             }
+            if (reqs.empty() && g_part) draft_part_done("skip", draft_key_s, nullptr);
             if (reqs.empty() && lane_meas) {
                 std::printf("NOTE maya-ik2: drafting off, not measured against plain decoding here (no requests to time "
                             "it on: IK2_DRAFT_IDS) - lane parity, as without a drafter; --drafting on drafts (mode A)\n");
@@ -7791,7 +7990,8 @@ int main(int argc, char** argv) {
             } else {
                 const int gen_n = getenv("IK2_DRAFT_TOKENS") ? std::max(16, std::atoi(getenv("IK2_DRAFT_TOKENS"))) : 128;
                 const double tie = getenv("IK2_DRAFT_TIE") ? std::atof(getenv("IK2_DRAFT_TIE")) : 0.03;
-                const bool have[4] = {true, g_lookup, drafter != nullptr, drafter && g_lookup};
+                // (a part run: the drafting layout's sources, or plain decoding alone on its own)
+                const bool have[4] = {g_part != 1, g_lookup, drafter != nullptr, drafter && g_lookup};
                 std::printf("NOTE maya-ik2: measuring this PC once, before the first answer: drafting (%zu requests, %d "
                             "tokens each, a source at a time); remembered, the next starts skip it\n", reqs.size(), gen_n);
                 std::fflush(stdout);
@@ -7833,13 +8033,11 @@ int main(int argc, char** argv) {
                     return made / std::max(1e-9, secs);
                 };
                 double warm = 0, tps[4] = {-1, -1, -1, -1};
-                trial(have[3] ? 3 : have[2] ? 2 : 1, 24, warm);   // (the windows' graphs made once, untimed)
+                trial(have[3] ? 3 : have[2] ? 2 : have[1] ? 1 : 0, 24, warm);   // (the windows' graphs made once, untimed)
                 for (int m = 0; m < 4; ++m)
                     if (have[m]) tps[m] = trial(m, gen_n, warm);
-                int best = 0;
-                for (int m = 1; m < 4; ++m)
-                    if (tps[m] > tps[best]) best = m;
-                if (best && tps[best] < tps[0] * (1.0 + tie)) best = 0;   // (no clear gain: no drafting)
+                if (g_part) draft_part_done(g_part == 1 ? "draft" : "plain", draft_key_s, tps);
+                const int best = draft_best(tps, tie);
                 draft_choice = best;
                 draft_remember(draft_key_s, tps, best);
                 if (lane_meas) {

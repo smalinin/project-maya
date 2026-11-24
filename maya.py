@@ -39,7 +39,7 @@ no tuning step - it balances its own split):
      Maya-S, Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits or the
      self-calibrated one at 4.10: NVIDIA from V100, and AMD)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
-  4. compiles the engine (`build/maya`, or `build-hip/maya`) for your GPU(s): 10-30 minutes, once
+  4. compiles the engine (`build/maya`, or `build-hip/maya`) for your GPU(s): a few minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
      and the size - and starts only after you answer y (or pass --download-model)
   6. builds the pack (the engine's index of the model files) inside the model folder
@@ -2904,7 +2904,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     targets = [target] + [t for t in also if t != target]
     build = [cmake, "--build", str(BUILD), "--target", *targets, "-j", str(jobs)]
     say("  Compiling the engine" + ("s " + ", ".join(targets) if len(targets) > 1 else "") + " for " +
-        ", ".join(f"sm_{x}" for x in archs) + " (10-30 minutes the first time, a few minutes after an update) ...")
+        ", ".join(f"sm_{x}" for x in archs) + " (a few minutes) ...")
     stopped = cmake_steps(conf, build, env, "build-maya.bat", nvcc=nvcc)
     if stopped:
         return stop(stopped)
@@ -2958,12 +2958,33 @@ def vs_env(env=None) -> dict:
     return env
 
 
-def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None) -> str | None:
+def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None, what="the engine",
+                log="build-engine.log") -> str | None:
     """CMake's configure, then its build (once more when that stops: it continues where it stopped).  None when both
     worked, else what stopped.  On Windows both run in a .bat that first calls Visual Studio's vcvars64.bat - the
     compiler's environment - the way Strata's setup.py builds there (cmake_build).  `nvcc` says which toolkit the
-    CUDA build uses: its release decides whether a VS 2026-only PC is usable (S.find_vcvars)."""
-    if not WIN:
+    CUDA build uses: its release decides whether a VS 2026-only PC is usable (S.find_vcvars).
+    The screen gets ONE line for the step (`what`: files done, time so far); the tools' own output goes to `log` in
+    the install folder, whose last lines are printed when the step stops (S.BuildLog).  MAYA_BUILD_OUTPUT=full, or
+    --full-build-output: every line on the screen as it comes, no log."""
+    full = S.full_build_output()
+    bat = None
+    if WIN:
+        vcvars = vcvars or S.find_vcvars(nvcc=nvcc)
+        if vcvars is None:
+            return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
+        bat = ROOT / bat_name
+        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{cmdline(conf)} || exit /b 3\r\n{cmdline(build)} && exit /b 0'
+                       '\r\necho   (the build stopped - trying it once more: it continues where it stopped)\r\n'
+                       f'{cmdline(build)} || exit /b 4\r\n', encoding="utf-8")
+        env = vs_env(env)
+        if full:
+            say(f"  > {bat}   (Visual Studio's environment, then:)")
+            say("  > " + cmdline(conf))
+            say("  > " + cmdline(build))
+            rc = run(["cmd", "/c", str(bat)], env=env, check=False, echo=False).returncode
+            return None if rc == 0 else "compiling" if rc == 4 else "configuring"
+    if full:
         if run(conf, env=env, check=False).returncode != 0:
             return "configuring"
         if run(build, env=env, check=False).returncode != 0:
@@ -2971,18 +2992,24 @@ def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None) -> str 
             if run(build, env=env, check=False).returncode != 0:
                 return "compiling"
         return None
-    vcvars = vcvars or S.find_vcvars(nvcc=nvcc)
-    if vcvars is None:
-        return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
-    bat = ROOT / bat_name
-    bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{cmdline(conf)} || exit /b 3\r\n{cmdline(build)} && exit /b 0'
-                   '\r\necho   (the build stopped - trying it once more: it continues where it stopped)\r\n'
-                   f'{cmdline(build)} || exit /b 4\r\n', encoding="utf-8")
-    say(f"  > {bat}   (Visual Studio's environment, then:)")
-    say("  > " + cmdline(conf))
-    say("  > " + cmdline(build))
-    rc = run(["cmd", "/c", str(bat)], env=vs_env(env), check=False, echo=False).returncode
-    return None if rc == 0 else "compiling" if rc == 4 else "configuring"
+    steps = S.BuildLog(ROOT / log, what)
+    stopped = "compiling"
+    try:
+        if bat is not None:
+            steps.file.write(f"> {bat}   (Visual Studio's environment, then:)\n> {cmdline(conf)}\n> {cmdline(build)}\n")
+            rc = steps.run(["cmd", "/c", str(bat)], env=env)
+            stopped = None if rc == 0 else "compiling" if rc == 4 else "configuring"
+        elif steps.run(conf, env=env) != 0:
+            stopped = "configuring"
+        elif steps.run(build, env=env) == 0:
+            stopped = None
+        else:
+            steps.line("  (the build stopped - trying it once more: it continues where it stopped)")
+            if steps.run(build, env=env) == 0:
+                stopped = None
+    finally:
+        steps.close(stopped)
+    return stopped
 
 
 PROBE_CU ="""#include <cmath>
@@ -5235,12 +5262,21 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's " +
-        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: 10-20 minutes") +
+        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: a few minutes") +
         ", once) ...")
-    if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)],
-                   dict(os.environ) if metal else env, "" if metal else "build-maya-vision.bat", vcvars=vcvars,
-                   nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"]):
-        return False
+    def steps(more=()) -> bool:
+        return not cmake_steps(conf + list(more), [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j",
+                                                   str(jobs)],
+                               dict(os.environ) if metal else env, "" if metal else "build-maya-vision.bat",
+                               vcvars=vcvars, nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"],
+                               what="the picture reader", log="build-vision.log")
+
+    # only the towers and kernels Maya's pictures use are compiled (tools/vision/lean.cmake); should that stop on
+    # some toolchain, all of llama.cpp's image library is, as before v1.1.78 (the build folder then keeps that choice)
+    if not steps():
+        say("  (once more, with all of llama.cpp's image library: -DMAYA_VISION_FULL=ON)")
+        if not steps(["-DMAYA_VISION_FULL=ON"]):
+            return False
     if bindir is not None and VEXE.exists():
         copy_hip_dlls(bindir, VEXE.parent)
     VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
@@ -6290,6 +6326,35 @@ def ik2_draft_forget() -> None:
         warn(f"{path} could not be removed ({e}): delete it by hand to measure the drafting again")
 
 
+def glm_lane_timing_again(cfg: dict) -> int:
+    """--speed-calibration: the GLM engine's saved CPU lane timing (data/glm-cpu-cal.txt, or the config's own
+    MAYA_GLM_CPU_CAL) is marked "redo": the next start of each GPU times its lane again and keeps the saved values
+    unless a new one is clearly faster (more than 25%), so the same PC measured at another moment plans - and
+    answers - as before.  The lines marked."""
+    path = Path((cfg.get("env") or {}).get("MAYA_GLM_CPU_CAL") or ROOT / "data" / "glm-cpu-cal.txt")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return 0
+    out, n = [], 0
+    for line in lines:
+        key, tab, vals = line.rpartition("\t")
+        if tab and key.startswith("cal") and "redo" not in vals.split():
+            line, n = f"{key}\t{vals} redo", n + 1
+        out.append(line)
+    if n:
+        try:
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as e:
+            warn(f"{path} could not be written ({e}): the CPU lane's timing stays as saved")
+            return 0
+        ok("the CPU lane's timing is taken again at the next start (the saved one stays unless the new one is "
+           "more than 25% faster)")
+    return n
+
+
 def route_forget() -> None:
     """--speed-calibration: maya-hy4's prompt route rates measured on this PC are dropped (data/hy4-prompt-route.txt),
     so the engine measures them again - in the CPU lane check's run below, else at the next start (before it is
@@ -6528,6 +6593,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     if config_family(cfg) in ("deepseek", "minimax"):
         return speed_calibration_ds4(cfg_path, cfg, why)
+    if why == "asked for":                             # (--speed-calibration: the GLM CPU lane's timing again too)
+        glm_lane_timing_again(cfg)
     if g53_one_gpu_drafting(cfg):
         return speed_calibration_g53(cfg_path, cfg, why)
     if glm_draft_length_candidate(cfg):
@@ -7831,12 +7898,37 @@ def bench_config_text(cfg: dict, ctx: int, drafting: str) -> str:
     return " ".join(x for x in (f"{ctx // 1024}K", f"KV {kv}" if kv else "", drafting) if x)
 
 
-def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int = 2, wait_min: float = 10.0) -> int:
+def bench_prompt_text(ref: str | None = None) -> str:
+    """The text --bench cuts its 2K / 8K prompts from: the README, docs/*.md and bench/results/*.md of this folder -
+    or, with a git ref (--bench-text-ref), of that commit: the same prompts whatever the docs say today (what saved
+    answers and night-to-night speeds need)."""
+    if not ref:
+        return "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
+                           for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) +
+                           sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
+
+    def git(*a):
+        r = subprocess.run(["git", "-C", str(ROOT), *a], capture_output=True)
+        if r.returncode:
+            raise RuntimeError(f"--bench-text-ref {ref}: git {a[0]} failed: "
+                               f"{r.stderr.decode(errors='replace').strip()[-200:]}")
+        return r.stdout.decode("utf-8", errors="replace")
+    names = git("ls-tree", "-r", "--name-only", ref, "--", "README.md", "docs", "bench/results").splitlines()
+    return "\n\n".join(git("show", f"{ref}:{n}") for n in MB.prompt_text_files(names))
+
+
+def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int = 2, wait_min: float = 10.0,
+          lock_ok: bool = False, tokens_file: Path | None = None, text_ref: str | None = None,
+          smoke: bool = False) -> int:
     """--bench: the speed-test standard (tools/maya_bench.py) on the installed model - a quiet-machine check, one engine
     session with a warm-up answer, 3 answers of 256 tokens and the 2K / 8K prompts 3 times each; medians with min-max,
     what drafting chose, the wall time of each phase and one result line (maya-bench-results.txt).  --compare: the same
-    on this build and another, alternated, exactness first.  Writes maya-bench.txt (--report includes it)."""
+    on this build and another, alternated, exactness first.  Writes maya-bench.txt (--report includes it).
+    smoke (--bench-smoke): two short answers and no 2K / 8K prompts - does the model load and answer (the saved
+    answers and the nightly check use it for a model too large for its box); no result line, never a speed number."""
     import socket
+    if smoke and compare:
+        fail("--bench-smoke runs this build alone", "leave --compare out")
     import urllib.request
     cfg = read_json(cfg_path)
     select_build_backend(cfg.get("backend", "cuda"))
@@ -7861,21 +7953,28 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
     t_all = time.time()
     step(1, f"benchmark: {cfg_path.name}" + (f" against {compare}" if compare else ""))
     note = f"maya --bench pid {os.getpid()} on {socket.gethostname()} {time.strftime('%Y-%m-%d %H:%M')}"
-    why = MB.wait_quiet(backend, gpus, wait_min, say)
+    lock_ok = MB.lock_ok_asked(lock_ok)          # (--bench-lock-ok / MAYA_BENCH_LOCK_OK=1: a lock taken by hand)
+    if lock_ok:
+        for p, who in MB.held_locks(MB.lock_names(backend, gpus)):
+            say(f"  using the GPU lock already held ({p}: {who or 'no note'}); it stays as it is")
+    why = MB.wait_quiet(backend, gpus, wait_min, say, lock_ok=lock_ok)
     if why:
         fail("this machine is not quiet enough for a speed number: " + "; ".join(why),
              f"wait for it (or give it longer: {ME} --bench --bench-wait <minutes>), then run --bench again")
     t_quiet = time.time() - t_all
-    locks = MB.take_locks(backend, gpus, note)
+    try:
+        locks = MB.take_locks(backend, gpus, note, held_ok=lock_ok)
+    except RuntimeError as e:                    # (another run that found it quiet in the same second took one first)
+        fail(f"this machine is not quiet enough for a speed number: {e}", "run --bench again")
     try:
         tok = ST.Tokenizer.from_dir(tp)
         ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
-        text = "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
-                           for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) +
-                           sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
-        prompts, warm = MB.plan_prompts(tok.encode(text), ctx)
         fmt = bench_chat(config_family(cfg), tp)   # (each family's own chat format, thinking off - #416, #549)
         chats = [tok.encode(fmt(q), parse_special=True) for q in BENCH_TOPICS]
+        if smoke:                                # (the last topic warms up, the first ones are the answers)
+            prompts, warm, chats = {}, chats[-1], chats[:MB.SMOKE_ANSWERS]
+        else:
+            prompts, warm = MB.plan_prompts(tok.encode(bench_prompt_text(text_ref)), ctx)
         start = lambda c, cmd, env, tag: (cmd, env, c.get("cwd") or str(ROOT), ROOT / f"maya-bench{tag}.log")  # noqa
         here = start(cfg, [cfg["exe"], "--serve"] + SV.engine_args(cfg), SV.child_env(cfg), "")
         found = S.amd_gpus() if backend == "hip" else S.gpus()
@@ -7885,9 +7984,12 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
         gpu_text, driver = MB.gpu_summary(backend, found)
         base = {"machine": socket.gethostname().split(".")[0], "gpus": gpu_text, "driver": driver,
                 "model": bench_model_name(cfg), "date": time.strftime("%Y-%m-%d")}
+        choices = MB.choice_files(ROOT, cfg) if tokens_file else {}   # (the saved per-PC choices this run starts from)
         if not compare:
             before = MB.learned_listing(ROOT, cfg)
-            run = MB.run_session(here, chats, prompts, warm, "", say)
+            run = MB.run_session(here, chats, prompts, warm, "", say,
+                                 MB.SMOKE_TOKENS if smoke else MB.DECODE_TOKENS)
+            runs = {"this": [run]}
             res = MB.summarize([run], prompts)
             drafting = MB.drafting_choice(args, cfg.get("env") or {}, run["engine_lines"], res["answers"],
                                         config_family(cfg))
@@ -7901,9 +8003,28 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
                                                   "prompt reuse seen" if run["reused"] else "") if x))
             lines = bench_text(version, cfg_path, cfg, ctx, gpu_text, res, drafting, [run], t_quiet, t_all)
             records = [MB.record_line(rec)]
+            if smoke and any(a["produced"] == 0 for a in run["answers"]):
+                fail("the model answered nothing (0 tokens) in the smoke run",
+                     f"its log: {ROOT / 'maya-bench.log'}")
+            if smoke:                            # (not the standard: no result line, the answers are what it is for)
+                lines = [lines[0].replace(" benchmark, ", " smoke run, ")] + lines[1:3] + [
+                    f"{len(run['answers'])} answers of up to {MB.SMOKE_TOKENS} tokens (greedy, thinking off): " +
+                    ", ".join(f"{a['produced']} tokens" for a in run["answers"]) + " - not a speed number", lines[-1]]
+                records = []
         else:
-            lines, records = bench_compare(cfg, cfg_path, compare, rounds, here, start, chats, prompts, warm, base,
-                                           version, ctx, args, gpu_text, t_quiet, t_all, SV)
+            lines, records, runs = bench_compare(cfg, cfg_path, compare, rounds, here, start, chats, prompts, warm,
+                                                 base, version, ctx, args, gpu_text, t_quiet, t_all, SV)
+        if tokens_file:                          # (--bench-tokens: every request's greedy tokens, for saved answers)
+            first = runs["this"][0]["tokens"]
+            for k, v in MB.choice_files(ROOT, cfg).items():   # (a first start's measurements: part of the state too)
+                choices.setdefault(k, v)
+            Path(tokens_file).write_text(json.dumps(dict(
+                base, config=str(cfg_path), family=config_family(cfg), backend=backend, gpu_index=gpus or [],
+                context=ctx, commit=MB.commit_of(ROOT), version=version, text_ref=text_ref or "",
+                compare=compare or "", smoke=bool(smoke), inputs=MB.input_hashes(chats, prompts, warm),
+                choices=choices,
+                heads={k: tok.decode(v[:MB.HEAD_TOKENS]) for k, v in first.items()},
+                runs={k: [r["tokens"] for r in v] for k, v in runs.items()}, records=records)), encoding="utf-8")
     except RuntimeError as e:                    # (the engine stopped or refused, a build failed: said plainly)
         fail(str(e), "fix that, then run --bench again")
     finally:
@@ -7913,11 +8034,15 @@ def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int 
         if (ROOT / "maya-bench.log").exists() else []
     out.write_text("\n".join(lines + records + ["", "engine lines:"] +
                              [x.replace(str(Path.home()), "~") for x in stats[-40:]]) + "\n", encoding="utf-8")
-    with open(ROOT / MB.RESULTS_FILE, "a", encoding="utf-8") as f:
-        f.write("\n".join(records) + "\n")
+    if records:
+        with open(ROOT / MB.RESULTS_FILE, "a", encoding="utf-8") as f:
+            f.write("\n".join(records) + "\n")
     say()
     for x in lines + [""] + records:
         say("  " + x)
+    if smoke:
+        ok(f"written: {out} - the model loads and answers (a smoke run: no speed number, no result line)")
+        return 0
     ok(f"written: {out} (the result line also in {MB.RESULTS_FILE}) - attach it (with {ME} --report) to a speed "
        "report")
     return 0
@@ -7959,6 +8084,19 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
     learned = MB.LearnedState(ROOT, cfg, work / "learned-snapshot")
     runs = {"this": [], "other": []}
     try:
+        if "MAYA_GLM_CPU_CAL" in SV.child_env(cfg):
+            # GLM times its CPU lane on a build's first start and keeps it, each build under its own compile stamp: a
+            # first round that times it live (colder, noisier) differs from the rounds that read it back - and the two
+            # builds time apart.  One priming start a build, the other build then reading this one's values, and every
+            # round starts from that state (the timing is the same in all of them)
+            for side in ("this", "other"):
+                learned.restore(other if side == "other" else None)
+                MB.prime_session(here if side == "this" else there, warm, say, f"[{side}] ")
+                learned.prime_keep(other if side == "other" else ROOT)
+            n = MB.share_timing(ROOT / "data" / MB.CAL_FILE, other / "data" / MB.CAL_FILE)
+            if n:
+                say(f"  the other build's CPU-lane timing set to this build's ({n} line(s))")
+                learned.prime_keep(other)
         for r in range(rounds):
             for side in ("this", "other"):
                 learned.restore(other if side == "other" else None)
@@ -7993,7 +8131,7 @@ def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm
                      "start on this PC, so a difference between the builds is not proof of an answer change)")
     lines.append(f"wall time all: {time.time() - t_all:.0f} s (quiet check {t_quiet:.0f} s)")
     records.append(MB.compare_line(res["other"], res["this"], names["other"], names["this"], verdict))
-    return lines, records
+    return lines, records, runs
 
 
 # ------------------------------------------------------------------------------------------------ the setup
@@ -12939,6 +13077,9 @@ def main() -> int:
                                             "than your CUDA accepts)")
     ap.add_argument("--llama-dir", help="a llama.cpp checkout at the pinned commit, instead of downloading its source")
     ap.add_argument("--rebuild", action="store_true", help="compile the engine again")
+    ap.add_argument("--full-build-output", action="store_true",
+                    help="every line of the compilers on the screen (default: one progress line per compile step, "
+                         "the rest in build-engine.log / build-vision.log; MAYA_BUILD_OUTPUT=full does the same)")
     ap.add_argument("--repack", action="store_true", help="build the pack again")
     ap.add_argument("--report", action="store_true", help="write maya-report.txt - this PC, the setup and the engine's "
                                                           "speed lines - to attach when you report a problem or a "
@@ -12951,6 +13092,16 @@ def main() -> int:
                                                        "in .bench-builds) - on the same model files, config and "
                                                        "learned files, alternated; exactness first, then the speed")
     ap.add_argument("--bench-rounds", type=int, default=2, help="--bench --compare: rounds a build (default 2)")
+    ap.add_argument("--bench-lock-ok", action="store_true", help="--bench: accept a GPU lock that is already held "
+                    "(one you took by hand for this run; also MAYA_BENCH_LOCK_OK=1) - by default a held lock stops "
+                    "the benchmark")
+    ap.add_argument("--bench-tokens", type=Path, metavar="FILE", help="--bench: also write every request's greedy "
+                    "tokens to this JSON file (tools/maya_golden.py: saved answers)")
+    ap.add_argument("--bench-text-ref", metavar="REF", help="--bench: cut the 2K / 8K prompts from the docs of this "
+                    "git ref instead of today's (the same prompts on every build)")
+    ap.add_argument("--bench-smoke", action="store_true", help="--bench: the short run - two short answers and no "
+                                                               "2K / 8K prompts: does the model load and answer "
+                                                               "(not a speed number, no result line)")
     ap.add_argument("--bench-wait", type=float, default=10.0, help="--bench: minutes to wait for a quiet machine "
                                                                    "before refusing (default 10; 0 = refuse at once)")
     ap.add_argument("--calibrate", action="store_true",
@@ -12983,6 +13134,8 @@ def main() -> int:
                                               "--port, --host, --api-key, --gpus, and the few written into the config, "
                                               "such as --parallel); add --setup to set up again with them")
     a = ap.parse_args()
+    if a.full_build_output:
+        os.environ["MAYA_BUILD_OUTPUT"] = "full"
     why = model_option(a)
     if why:
         ap.error(why)
@@ -13013,7 +13166,9 @@ def main() -> int:
             have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
         if not have:
             fail("Maya is not set up here yet", f"run {ME} first")
-        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait))
+        more = {k: v for k, v in (("lock_ok", a.bench_lock_ok), ("tokens_file", a.bench_tokens),
+                                  ("text_ref", a.bench_text_ref), ("smoke", a.bench_smoke)) if v}
+        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait), **more)
 
     have = configs() if a.config is None else [a.config.resolve()]   # (--config: that one, no question)
     if a.backend:

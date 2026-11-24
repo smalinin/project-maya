@@ -4,6 +4,41 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.78 - 2026-11-24
+
+The full GLM-5.3 runs again, Inkling 2 Mini keeps its drafter with pictures on, and the setup is shorter and quieter.
+
+- **Fix: the full GLM-5.3 failed every request since v1.1.75 (#1200, #1191)** with "kernel launch(es) failed". It answers again. GLM-5.3-Flash was not affected. Maya now checks this at load, and every release is tested with the full model too.
+- **Fix: Inkling 2 Mini lost its drafter on 24 GB cards when pictures were on** (the setup's default), so it decoded at plain speed. The drafter now always loads; the picture reader uses the GPU when there is room at that moment and the CPU otherwise. Verified on a card limited to 24 GB - if you have a 24 GB RTX card, please report your `./maya.sh --bench` line.
+- **Fix: DeepSeek could end a turn empty after thinking (#1206, #1207).** The turn now gets its answer, and a tool call written inside the thinking is read out of it.
+- **Fix: stopping the server while a model was loading left the engine running (#1181).** The engine now ends with the server, on Linux and Windows.
+- **Fix: temporary picture folders piled up (#1180).** They are removed when the server ends, and old ones are cleaned at start.
+- **Fix: GLM on Linux kept several GB of file mappings in memory after loading (#1182).** They are released once the model is in VRAM: about 6.4 GB less on GLM-5.3-Flash, the same answers and speed.
+- **Fix: the DeepSeek speed calibration could be fooled by a kept conversation (#1203);** it now measures on a clean slot.
+- **DeepSeek across PCs on a slow link (#1143):** the choice near the 1 ms mark no longer flips between starts (`MAYA_DS4_RING_FAST_LINK=0` keeps the old mark).
+- **Setup: shorter and quieter.** The picture reader compiles only what Maya's models use (19-28% less time for that step, identical results), and each compile step shows one progress line; the full output goes to `build-engine.log` / `build-vision.log` (`--full-build-output` shows it as before). If the lean build fails, the setup falls back to the full one.
+- **A note at start** when NVIDIA-only DeepSeek switches are set on a single AMD GPU, where they do not apply (#1120).
+- **Benchmark:** `--bench` now starts the engine exactly as the server does, and `--bench --bench-smoke` gives a short check.
+- **Credits.** #1191 was contributed by @Cass67, and #1207 by @lmh555168. The rest of this release is by @mw00 (peasantsmith).
+
+## v1.1.77 - 2026-11-24
+
+Fixes for PCs that could not run Maya, steadier answers, and a batch of same-answer speed-ups from the community.
+
+- **Fix: DeepSeek could read out of range when a routing row had no valid score (#1114).** It now stays in range and drops that pick.
+- **Fix: DeepSeek packs without an expert profile (#1161)** start from the profile Maya ships, and the load says which profile it read.
+- **Fix: GLM-5.3-Flash with the DFlash drafter (#1137):** the first answer token after a forced end of thinking continued the thinking.
+- **Fix: pictures (#915):** picture data is kept while a request is being prepared.
+- **Fix: Windows setup (#1128)** also finds Visual Studio through a standalone `vswhere` on the PATH.
+- **Fix: Inkling 2 Mini's engine could hang on exit after a fatal error (#1136);** it now ends at once.
+- **Fix: building with plain `cmake`** (without Maya's setup) failed since v1.1.75.
+- **Inkling 2 Mini on small NVIDIA cards: the first start runs at full speed.** The one-time drafting measurement no longer borrows VRAM from the experts for the rest of that session, and it times plain decoding on the real layout.
+- **GLM-5.3-Flash: answers stay the same after an update.** The CPU timing Maya measures once is now kept per PC, not per version; `--speed-calibration` measures again. On Linux PCs with two CPU sockets and three or more GPUs, the CPU helper threads are pinned one per core (`MAYA_GLM_CPU_PIN=0` turns it off), so a fresh measurement is the same every time; a fresh install there may word answers differently from a fresh v1.1.76 install, an updated one keeps its answers.
+- **Same-answer speed-ups from the community:** Hy4-Flash on AMD with the CPU helping under tensor parallel (#1168, the author measured +53% on Maya-M), faster sums on Radeon RDNA cards (#1164), Hy4-Flash on Radeon RX 7900-class cards (#1150, #1151), and GLM-5.3-Flash decoding (#1138, #1139). #1168, #1150 and #1151 run on hardware we do not own - please report how they do.
+- **A malformed request now gets a clear "400 bad request"** on all three APIs instead of an internal error.
+- **Benchmark and release checks:** `--bench` fixes (the first-start label, the Windows log, `--bench-lock-ok`), and new tools that test only what a release changed and compare every night against the last release (docs/RELEASE-CHECKS.md).
+- **Credits.** #1168, #1164, #1161, #1151 and #1150 were contributed by @Antero128; #1139, #1138 and #1137 by @vdkcf; #1128 by @Thymos2027; #915 by @jorphex. The rest of this release is by @mw00 (peasantsmith).
+
 ## v1.1.76 - 2026-11-23
 
 A fix release: since v1.1.73 some PCs could no longer load a model when a VRAM reserve was set. That is fixed, and the VRAM Maya keeps free is now always shown.
