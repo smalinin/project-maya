@@ -12818,10 +12818,12 @@ def main() -> int:
     if have and not setting_up and (a.calibrate or a.speed_calibration or not a.no_start):
         pick = have[0]
         if len(have) > 1:
+            choices = sorted(have, key=lambda p: p.name.casefold())
+            default = str(choices.index(pick) + 1)
             say()
-            for i, c in enumerate(have, 1):
+            for i, c in enumerate(choices, 1):
                 say(f"  {i}) {c.name}")
-            pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+            pick = choices[int(ask("Which one?", [str(i) for i in range(1, len(choices) + 1)], default, a.yes)) - 1]
         check_parallel(a, config_family(read_json(pick)))
         if getattr(a, "fast_drafting", None):   # (a setup setting: the cache's rows are worked out with the context)
             warn(f"--fast-drafting is a setup setting of Hy4-Flash: {ME} --setup --fast-drafting {a.fast_drafting} "
