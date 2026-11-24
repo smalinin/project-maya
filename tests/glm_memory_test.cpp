@@ -78,6 +78,27 @@ static void check_ram_plan() {
     assert(balanced_resident_ram(true, true, false));
 }
 
+static void check_split_ram_plan() {
+    using maya::core::glmfast::split_ram_class_plan;
+    // Two equally sized layer ranges with very different VRAM coverage and a separate draft class.
+    const std::vector<size_t> stride{12, 12, 16};
+    const std::vector<int64_t> floor{16, 16, 16}, required{28, 100, 20}, preferred{50, 120, 40};
+    const uint64_t warm_bytes = 28 * 12 + 100 * 12 + 20 * 16;
+    std::vector<int64_t> slots;
+    assert(split_ram_class_plan(warm_bytes, stride, floor, required, preferred, slots));
+    assert(slots == required);   // budget can cover all experts, including those on the more loaded GPU
+    assert(split_ram_class_plan(warm_bytes + 1000, stride, floor, required, preferred, slots));
+    assert(slots == preferred);
+    assert(split_ram_class_plan(warm_bytes - 64, stride, floor, required, preferred, slots));
+    uint64_t used = 0;
+    for (size_t c = 0; c < slots.size(); ++c) {
+        assert(slots[c] >= floor[c] && slots[c] <= required[c]);
+        used += slots[c] * stride[c];
+    }
+    assert(used <= warm_bytes - 64);
+    assert(!split_ram_class_plan(1, stride, floor, required, preferred, slots));
+}
+
 // #860: a route's miss on an expert demoted at the last boundary finds its demotion by RAM slot and key, and reads the
 // bytes from the VRAM slot the copy reads while that slot is still draining - never by waiting for the copy
 static void check_drain_source() {
@@ -103,6 +124,7 @@ static void check_drain_source() {
 
 int main() {
     check_ram_plan();
+    check_split_ram_plan();
     check_drain_source();
     using maya::core::glmfast::expert_pool_budget;
     using maya::core::glmfast::minimal_ram_tier;

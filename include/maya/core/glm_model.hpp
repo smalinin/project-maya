@@ -418,14 +418,21 @@ public:
     void tp_all_reduce(float* buf, cudaStream_t s);
     bool fast_token_tp(int32_t token, std::string& err);
     void tp_destroy();
-    // parallel split load: parts take the RAM budget in part order, then pin their RAM tiers in part order too
-    // (wait_pin / pass_pin); CPU lane setup waits until all have loaded
+    // Parallel split load: parts prepare VRAM and RAM requirements in part order, then pin their tiers in part order.
+    // The CPU lane is set up after every part has loaded.
     struct SplitLoad {
+        struct RamRequest {
+            std::vector<size_t> stride;
+            std::vector<int64_t> floor, required, preferred, slots;
+            int64_t headroom = 0, staging = 0;
+        };
         std::mutex mu;
         std::condition_variable cv;
         std::vector<bool> passed, pinned;
+        std::vector<RamRequest> ram;
+        std::once_flag ram_once;
         int turn = 0, pin_turn = 0;
-        explicit SplitLoad(int n) : passed((size_t) n, false), pinned((size_t) n, false) {}
+        explicit SplitLoad(int n) : passed((size_t) n, false), pinned((size_t) n, false), ram((size_t) n) {}
         void wait(int part) {
             std::unique_lock<std::mutex> lk(mu);
             cv.wait(lk, [&] { return turn >= part; });

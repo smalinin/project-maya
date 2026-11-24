@@ -185,6 +185,9 @@ inline bool balanced_resident_ram(bool requested, bool resident, bool staging_on
     return requested && resident && !staging_only;
 }
 
+// Keep a few landing slots in each disk-backed RAM class when warming experts.
+constexpr int kRamWarmReserve = 4;
+
 // Reserve each class's mandatory slots before spending anything on optional slack.
 // Failure leaves slots untouched. Counts must fit RamClass::n (int), and every
 // multiplication is bounded by the remaining byte budget before it is performed.
@@ -221,6 +224,15 @@ inline bool ram_class_plan(uint64_t budget, const std::vector<size_t>& stride,
     }
     slots.swap(plan);
     return true;
+}
+
+// Share one budget across all classes of all parts. Try to keep every expert warm before filling extra slots.
+// When RAM is tight, preserve landing slots and divide the rest by the unmet resident capacity.
+inline bool split_ram_class_plan(uint64_t budget, const std::vector<size_t>& stride,
+                                 const std::vector<int64_t>& floor, const std::vector<int64_t>& required,
+                                 const std::vector<int64_t>& preferred, std::vector<int64_t>& slots) {
+    return ram_class_plan(budget, stride, required, preferred, slots) ||
+           ram_class_plan(budget, stride, floor, required, slots);
 }
 
 // The room a RAM tier keeps pinnable above it under a pinning cap (Windows).  `cap`: the bytes pinned under the cap

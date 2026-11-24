@@ -1896,7 +1896,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->left.assign((size_t) NL * g.n_expert, 0);
         std::vector<size_t> cls_stride;
         std::vector<double> cls_weight;
-        std::vector<int64_t> cls_required;
+        std::vector<int64_t> cls_required, cls_warm;
         for (int il = l0_; il < lt_; ++il) {
             if (!F->L[(size_t) il].moe) continue;
             const size_t st = (F->L[(size_t) il].blob + 4095u) & ~(size_t) 4095u;
@@ -1908,6 +1908,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 cls_stride.push_back(st);
                 cls_weight.push_back(0.0);
                 cls_required.push_back(0);
+                cls_warm.push_back(0);
             }
             F->layer_rc[(size_t) il] = c;
             // (the experts its main slots cannot hold: the pool's lendable tail counts as not held - a prompt
@@ -1919,6 +1920,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             const int held = glmfast::warm_pool_slots(F->unified_memory, F->lp[(size_t) il].n_main,
                                                        g.n_expert, gf::kSpares);
             cls_required[(size_t) c] += std::max<int64_t>(0, (int64_t) g.n_expert - held);
+            const int warm = glmfast::warm_pool_slots(F->unified_memory, F->lp[(size_t) il].n,
+                                                       g.n_expert, gf::kSpares);
+            cls_warm[(size_t) c] += g.n_expert - warm;
         }
         double wsum = 0;
         for (double w : cls_weight) wsum += w;
@@ -1929,6 +1933,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         const char* balanced_env = getenv("MAYA_GLM_RAM_BALANCED");
         const bool balanced_ram = glmfast::balanced_resident_ram(balanced_env && std::atoi(balanced_env) != 0,
                                                                   F->ram_resident, staging_only);
+#if defined(MAYA_USE_HIP) && defined(_WIN32)
+        // Keep the per-GPU WDDM shared-memory limits used by this backend.
+        const bool shared_ram = false;
+#else
+        const bool shared_ram = split_load_ != nullptr && g.arch == GlmArch::GlmDsa && ram_budget_ < 0;
+#endif
         if (balanced_ram && n_parts_ != 1) {
             err = "glm fast: MAYA_GLM_RAM_BALANCED currently requires one GPU";
             return false;
@@ -1951,14 +1961,15 @@ bool Glm5Model::fast_setup(std::string& err) {
         static int64_t total = -1, remaining = -1;
         static int remaining_layers = 0;
         static int64_t unpinned = 0;   // a parallel load: the earlier parts' planned tiers, none pinned yet
-        if (g_.arch == GlmArch::GlmDsa && glmtier::budget_reset_due(part_)) total = -1, remaining = -1, remaining_layers = 0, unpinned = 0;   // glm-dsa B8.2: a reload measures again
+        if (!shared_ram && g_.arch == GlmArch::GlmDsa && glmtier::budget_reset_due(part_))
+            total = -1, remaining = -1, remaining_layers = 0, unpinned = 0;   // a reload measures again
         const auto pinned_pf = prefill_pinned();
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
         const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
                                   (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
         const int64_t head_b = ram_headroom_b(F->unified_memory);
         const bool fixed_ram = getenv("MAYA_GLM_RAM_GB") != nullptr;
-        if (budget < 0) {
+        if (!shared_ram && budget < 0) {
             if (total < 0) {
                 if (const char* rg = getenv("MAYA_GLM_RAM_GB")) {
                     total = (int64_t) (std::atof(rg) * 1073741824.0);
@@ -2077,18 +2088,64 @@ bool Glm5Model::fast_setup(std::string& err) {
                 return false;
             }
         }
-        // parallel load: take the planned size from the budget and let the next part plan; every part pins once all
-        // have planned (a later part's measurement then sees no tier half pinned)
+        // Every part publishes its requirements before any pinned RAM tier is allocated.
         if (split_load_ != nullptr) {
-            int64_t planned = 0;
-            for (size_t c = 0; c < cls_n.size(); ++c) planned += cls_n[c] * (int64_t) cls_stride[c];
-            if (!staging_only && ram_budget_ < 0 && remaining >= 0) {
-                remaining = std::max<int64_t>(0, remaining - planned);
-                remaining_layers -= n_moe;
+            if (shared_ram) {
+                auto& request = split_load_->ram[(size_t) part_];
+                request.stride = cls_stride;
+                request.headroom = head_b;
+                request.staging = pre_small;
+                for (size_t c = 0; c < cls_n.size(); ++c) {
+                    const int64_t floor = std::min<int64_t>(16, cls_cap[c]);
+                    const int64_t preferred = staging_only ? floor : cls_cap[c];
+                    const int64_t warm = std::clamp(cls_warm[c] + glmfast::kRamWarmReserve, floor, preferred);
+                    request.floor.push_back(floor);
+                    request.required.push_back(F->ram_resident ? preferred : warm);
+                    request.preferred.push_back(preferred);
+                }
+            } else {
+                int64_t planned = 0;
+                for (size_t c = 0; c < cls_n.size(); ++c) planned += cls_n[c] * (int64_t) cls_stride[c];
+                if (!staging_only && ram_budget_ < 0 && remaining >= 0) {
+                    remaining = std::max<int64_t>(0, remaining - planned);
+                    remaining_layers -= n_moe;
+                }
+                unpinned += planned;
             }
-            unpinned += planned;
             split_load_->pass(part_);
             split_load_->wait(n_parts_);
+            if (shared_ram) {
+                std::call_once(split_load_->ram_once, [&] {
+                    std::vector<size_t> strides;
+                    std::vector<int64_t> floor, required, preferred, slots;
+                    int64_t headroom = 0, staging = 0;
+                    for (const auto& request : split_load_->ram) {
+                        strides.insert(strides.end(), request.stride.begin(), request.stride.end());
+                        floor.insert(floor.end(), request.floor.begin(), request.floor.end());
+                        required.insert(required.end(), request.required.begin(), request.required.end());
+                        preferred.insert(preferred.end(), request.preferred.begin(), request.preferred.end());
+                        headroom = std::max(headroom, request.headroom);
+                        staging += request.staging;
+                    }
+                    // Prompt buffers are already pinned. Keep space for the OS and the remaining small upload buffers.
+                    const int64_t available = fixed_ram ? (int64_t) (std::atof(getenv("MAYA_GLM_RAM_GB")) * 1073741824.0)
+                                                        : avail_ram_now() - headroom - staging;
+                    const uint64_t bytes = (uint64_t) std::max<int64_t>(0, available);
+                    if (!glmfast::split_ram_class_plan(bytes, strides, floor, required, preferred, slots)) slots = floor;
+                    size_t offset = 0;
+                    for (auto& request : split_load_->ram) {
+                        const size_t next = offset + request.stride.size();
+                        request.slots.assign(slots.begin() + offset, slots.begin() + next);
+                        offset = next;
+                    }
+                    std::fprintf(stderr, "glm split RAM: %.2f GiB budget shared by all parts; %s\n",
+                                 (double) bytes / 1073741824.0,
+                                 std::equal(required.begin(), required.end(), slots.begin(), std::less_equal<int64_t>{})
+                                     ? "every expert has a planned slot in VRAM or RAM"
+                                     : "some experts may need SSD reads");
+                });
+                cls_n = split_load_->ram[(size_t) part_].slots;
+            }
             // ... and then pin one after another, in part order: near a pinning cap (Windows) parts pinning at once
             // raced for the room under it - a 2x RTX 3080 box's first part shrank to 13.1 of its planned 21.5 GB while
             // the second pinned all of its 22.5 (#105).  In turn, only the part that reaches the cap gives way
@@ -4935,7 +4992,7 @@ bool Glm5Model::fast_warm(std::string& err) {
             if (!F->L[(size_t) il].moe || next[(size_t) il] >= g.n_expert) continue;
             const int c = F->layer_rc[(size_t) il];
             auto& R = F->rc[(size_t) c];
-            if (rfree[(size_t) c] <= (F->ram_resident ? 0 : 4)) continue;   // resident: no disk-read slots to keep
+            if (rfree[(size_t) c] <= (F->ram_resident ? 0 : glmfast::kRamWarmReserve)) continue;
             while (rcur[(size_t) c] < R.n && R.st[(size_t) rcur[(size_t) c]] != FastState::kRFree) ++rcur[(size_t) c];
             if (rcur[(size_t) c] >= R.n) continue;
             const int s = rcur[(size_t) c]++;
