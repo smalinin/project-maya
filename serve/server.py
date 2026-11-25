@@ -2606,8 +2606,7 @@ def child_env(cfg: dict) -> dict:
             ids = hy4_draft_ids(cfg)
             if ids is not None:
                 env["HY4_DRAFT_IDS"] = str(ids)
-        # (... and HY4_HOT's scores - which experts a start places in VRAM - learned by the first start, then kept as
-        #  they are until maya --speed-calibration: a file a model in the data folder, not in its download)
+        # HY4_HOT's scores for the next start live in a per-model file. HY4_HOT_LEARN refreshes them after an answer.
         env.setdefault("HY4_HOT_FILE", str(hy4_hot_file(cfg)))
         # (... and, where this PC has no such file yet, the scores Maya ships for the model - a first start places the
         #  experts as every start after it; a file of its own, learned or left by maya --speed-calibration, wins)

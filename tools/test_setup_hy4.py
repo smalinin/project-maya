@@ -1249,7 +1249,7 @@ class Config(unittest.TestCase):
         for absent in ("--parallel", "--vision", "--dspark", "--mtp", "--draft", "--gpus", "--chunk", "--reserve-gb"):
             self.assertNotIn(absent, c["args"])
         self.assertNotIn("vision", c)
-        self.assertNotIn("env", c)                                    # (nothing that loads the n-gram table into RAM)
+        self.assertEqual(c["env"], {"HY4_HOT_LEARN": "1"})
         self.assertNotIn("backend", c)
 
     def test_small_card_layout(self):
@@ -2378,18 +2378,21 @@ class Setup(unittest.TestCase):
                 self.assertEqual(p.name, "maya-hy4-flash.json")
                 c = json.loads(p.read_text())
                 self.assertEqual(c["args"], ["--pack", str(pack), "--max-context", "131072", "--mtp"])
+                self.assertEqual(c["env"]["HY4_HOT_LEARN"], "1")
                 self.assertEqual(Path(c["exe"]).stem, "maya-hy4")     # (maya-hy4.exe on Windows)
                 self.assertEqual((c["sampling"], c["reasoning_effort"], c["model_name"], c["gpu"]),
                                  ({"temperature": 0.9, "top_p": 1.0}, "high", "hy4-flash", [0, 3]))
                 self.assertEqual((c["installer"]["family"], c["installer"]["drafting"]), ("hy4", "on"))
                 self.assertEqual(Q.family_of(c), "hy4")
                 c["args"] += ["--chunk", "2048", "--reserve-gb", "0.6"]   # (set by hand: kept)
+                c["env"]["HY4_HOT_LEARN"] = "0"
                 c["port"], c["host"] = 8080, "0.0.0.0"
                 p.write_text(json.dumps(c))
                 p = maya.write_config_hy4(a, {"gpus": [{"index": 0}]}, {}, pack, 65536, t, pack.parent, False)
             c = json.loads(p.read_text())
             self.assertEqual(c["args"], ["--pack", str(pack), "--max-context", "65536", "--chunk", "2048",
                                          "--reserve-gb", "0.6"])
+            self.assertEqual(c["env"]["HY4_HOT_LEARN"], "0")
             self.assertEqual((c["host"], c["lib_dirs"], c["installer"]["drafting"]), ("0.0.0.0", ["/cuda"], "off"))
             # --no-vision with the tower in the pack: --vision off (the Models page's Images turns it on); a setup
             # again without it does not keep the off
