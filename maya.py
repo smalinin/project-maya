@@ -11508,8 +11508,7 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     local_name = d.name.lower() if quant == "local" else None
     stem = f"maya-{local_name}" if local_name else Q.config_stem("hy4", quant)
     cfg_path = ROOT / f"{stem}.json"
-    new_profile = not cfg_path.exists()
-    old = {} if new_profile else read_json(cfg_path)
+    old = read_json(cfg_path)
     # (--tp auto, the engine's default: tensor parallel over the largest group of equal GPUs, the fastest GPU holding
     #  the head and the drafts; the layers split where no group fits.  No --gpus: the server shows the engine only the
     #  config's "gpu" cards, and it takes all it sees)
@@ -11564,13 +11563,10 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
            **({"backend": "hip"} if pc.get("backend") == "hip" else {})}
     kept += keep_server_settings(cfg, old, a)
-    env = {**(old.get("env") or {}), **parse_env(a.env)}
-    if new_profile:
-        env.setdefault("HY4_HOT_LEARN", "1")
+    env = {**(old.get("env") or {}), "HY4_HOT_LEARN": "1", **parse_env(a.env)}
     if rmark is not None:
         rmark[0](env, *rmark[1:])
-    if env:
-        cfg["env"] = env
+    cfg["env"] = env
     if a.host:
         cfg["host"] = a.host
     if a.api_key:

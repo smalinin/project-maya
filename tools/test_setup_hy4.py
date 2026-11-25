@@ -1279,7 +1279,7 @@ class Config(unittest.TestCase):
         # (the standard layout: a prompt chunk and an expert share set by hand stay, as the VRAM kept free does)
         self.assertEqual((a[a.index("--chunk") + 1], a[a.index("--vram-experts") + 1]), ("128", "0.5"))
         self.assertEqual((c["host"], c["api_key"], c["cors_origins"], c["mcp_servers"]), ("0.0.0.0", "k", ["*"], {"a": 1}))
-        self.assertEqual(c["env"], {"MAYA_X": "1", "B": "2"})
+        self.assertEqual(c["env"], {"MAYA_X": "1", "B": "2", "HY4_HOT_LEARN": "1"})
         self.assertEqual((c["sampling"], c["reasoning_effort"]), ({"temperature": 0.9, "top_p": 1.0}, "high"))
         self.assertTrue(any("kept from the config before" in s and "--cpu-threads 12" in s for s in self.said))
 
@@ -2385,14 +2385,14 @@ class Setup(unittest.TestCase):
                 self.assertEqual((c["installer"]["family"], c["installer"]["drafting"]), ("hy4", "on"))
                 self.assertEqual(Q.family_of(c), "hy4")
                 c["args"] += ["--chunk", "2048", "--reserve-gb", "0.6"]   # (set by hand: kept)
-                c["env"]["HY4_HOT_LEARN"] = "0"
+                c["env"].update(HY4_HOT_LEARN="0", HY4_ROUTE="stream")
                 c["port"], c["host"] = 8080, "0.0.0.0"
                 p.write_text(json.dumps(c))
                 p = maya.write_config_hy4(a, {"gpus": [{"index": 0}]}, {}, pack, 65536, t, pack.parent, False)
             c = json.loads(p.read_text())
             self.assertEqual(c["args"], ["--pack", str(pack), "--max-context", "65536", "--chunk", "2048",
                                          "--reserve-gb", "0.6"])
-            self.assertEqual(c["env"]["HY4_HOT_LEARN"], "0")
+            self.assertEqual(c["env"], {"HY4_HOT_LEARN": "1", "HY4_ROUTE": "stream"})
             self.assertEqual((c["host"], c["lib_dirs"], c["installer"]["drafting"]), ("0.0.0.0", ["/cuda"], "off"))
             # --no-vision with the tower in the pack: --vision off (the Models page's Images turns it on); a setup
             # again without it does not keep the off
