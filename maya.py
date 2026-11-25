@@ -804,6 +804,10 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # folder>/<its full name> (a layout of it: <name>-8GB), its config maya-hy4-flash-maya-xs.json; the Q4_K_M in <models
 # folder>/Hy4-flash, its config maya-hy4-flash.json.
 HY4 = Q.MODEL["hy4"]                               # "Hy4-Flash" (its id: the installer record, --model)
+HY4_FULL = "Hy4"
+HY4_FULL_ARCH = "hy_v4"
+HY4_FULL_PROJECTOR = "hy_v4_vl"
+HY4_FULL_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 128000]
 HY4_SHOWN = Q.SHOWN["hy4"]
 HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
 HY4_MANIFEST = ROOT / "tools" / "hy4" / "download.json"
@@ -894,7 +898,7 @@ IK2_DIR = "maya-ik2"                               # (in the model's folder: tok
 IK2_MODEL_NAME = "inkling-2-mini"
 IK2_MIN_CC = IK2F.MIN_CC
 IK2_PROFILE = ROOT / "data" / "expert-profile-ik2mini.bin"   # (the offload path's starting VRAM tier: maya-ik2's IK2_WARM)
-FAMILIES = ("glm", "glm53", "deepseek", "minimax", "qwen", "hy4", "ik2")
+FAMILIES = ("glm", "glm53", "deepseek", "minimax", "qwen", "hy4", "hy4_full", "ik2")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf(?:_file)?$")
 
 
@@ -1771,7 +1775,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         why = IK2F.unsupported(a.backend, WIN, ik2_gpus_asked(a), [], layer_split=ik2_layer_split)
         if why:
             fail(why)
-    hy4 = family == "hy4"
+    hy4 = family in ("hy4", "hy4_full")
     if hy4 and a.backend == "hip" and WIN:
         # (maya-hy4's AMD build: built and run on Linux - a Gorgon Halo's Radeon 8065S, and RX 7900 XT cards by its
         #  contributor; under Windows it builds as the other engines' HIP builds do, with Windows' own waits and memory
@@ -1835,7 +1839,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     elif any(g.get("unified_memory") for g in chosen):
         say("  the GPU's memory is the system's RAM: the engine fills it with the most-used experts and leaves the "
             "rest to the RAM tier and the SSD, so the free RAM at the start is what the pool can take")
-    if vram < 23 and not ds4 and not mm3 and family not in ("qwen", "hy4", "ik2"):
+    if vram < 23 and not ds4 and not mm3 and not hy4 and family not in ("qwen", "ik2"):
         # one small card: can any GLM-5.3-Flash quant start on it at all (glm_fit_verdict)?  Where none can, say so
         # here - the model's choice (step 2) then stops before any download
         try:
@@ -2093,11 +2097,14 @@ def config_family(cfg: dict) -> str:
 def setup_family(cfg: dict) -> str:
     """Split the two GLM model choices in setup; both still use the engine's 'glm' config family."""
     inst = cfg.get("installer") or {}
+    if inst.get("hy4_arch") == HY4_FULL_ARCH:
+        return "hy4_full"
     return "glm53" if inst.get("quant") in G53_MODELS or G53.config_is_glm_dsa(cfg) else config_family(cfg)
 
 
 # each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
-FAMILY_TITLE = {**Q.MODEL, "glm53": G53.SHOWN, "qwen": "Qwen-3.8-Flash-Next", "ik2": "Inkling 2"}
+FAMILY_TITLE = {**Q.MODEL, "glm53": G53.SHOWN, "qwen": "Qwen-3.8-Flash-Next", "ik2": "Inkling 2",
+                "hy4_full": HY4_FULL}
 
 
 def setup_title(cfg: dict) -> str:
@@ -2114,7 +2121,7 @@ PARALLEL_FAMILIES = ("glm", "glm53", "deepseek", "minimax")
 def check_parallel(a, family: str) -> None:
     if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
         model = DS4 if family == "deepseek" else MM3 if family == "minimax" else HY4 if family == "hy4" else \
-            IK2_SHOWN if family == "ik2" else QWEN_SHOWN
+            HY4_FULL if family == "hy4_full" else IK2_SHOWN if family == "ik2" else QWEN_SHOWN
         fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash; {model} serves "
              "one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
@@ -2128,6 +2135,8 @@ def g53_offered() -> list:
 def choose_family(a, prev: dict) -> str:
     """The setup's model choice, or the model named by options; an earlier setup is the default."""
     if a.model:
+        if a.model == HY4_FULL:
+            return "hy4_full"
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else \
             "hy4" if a.model == HY4 else "ik2" if a.model == IK2 else "glm53" if a.model in G53_MODELS else "glm"
     if getattr(a, "qwen_quant", None):                 # (--qwen-quant alone: Qwen's files named)
@@ -2193,6 +2202,7 @@ def choose_family(a, prev: dict) -> str:
                   f"of VRAM and RAM together{here}): with MTP drafting, tensor parallel across equal GPUs (the "
                   "fastest one holds the head and the drafts), up to a 256K context - run on NVIDIA RTX 30 / A100 "
                   "and newer, Linux." if q4 else "")))
+    rows.append((HY4_FULL, None, "Tencent's full Hy4. Add local hy_v4 GGUFs and an optional hy_v4_vl image projector."))
     rows.append(("Inkling 2 (experimental)", None, ik2_about() +
                  " Add downloaded model accepts compatible Inkling-2-Mini and Inkling-2-Small GGUFs."))
     return FAMILIES[choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)]
@@ -3814,6 +3824,7 @@ def linked_model_type(path: Path) -> str | None:
         return ("glm" if arch in GLM_ARCHS else "glm53" if arch == G53.ARCH else
                 "deepseek" if arch == "deepseek41" else "minimax" if arch == "minimax-m3" else
                 "qwen" if arch == "qwen4exp" else "hy4" if arch == "hy_v4_flash" else
+                "hy4_full" if arch == HY4_FULL_ARCH else
                 "ik2" if arch in ("inkling2", "inkling2_loop") else None)
     if path.name == "config.json":
         conf = read_json(path)
@@ -3889,6 +3900,18 @@ def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
     for path, _ in listing:
         role = review_role(path, src)
         suffix = path.suffix.lower()
+        if family == "hy4_full" and suffix in (".gguf", ".gguf_file"):
+            from gguf_reader import GGUFFile
+            try:
+                meta = GGUFFile(path).metadata
+            except (OSError, TypeError, ValueError, KeyError, IndexError, struct.error):
+                continue
+            if meta.get("clip.projector_type") == HY4_FULL_PROJECTOR:
+                found["vision"].append(review_candidate(path, "vision", files))
+            elif meta.get("general.architecture") == HY4_FULL_ARCH and meta.get("general.type") in (None, "model") and \
+                    meta.get("split.no", 0) == 0 and shard_set(path)[0] == path:
+                found["model"].append(review_candidate(path, "model", files, family))
+            continue
         if role == "model" and (suffix == ".gguf" or (family == "hy4" and suffix == ".gguf_file")):
             shard = SHARD_RE.search(path.name)
             if (not shard or int(shard.group(1)) == 1) and linked_model_type(path) == family:
@@ -3979,7 +4002,7 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | di
             if model is None:
                 warn("select a model file before linking")
                 continue
-            if family in ("hy4", "ik2"):
+            if family in ("hy4", "hy4_full", "ik2"):
                 local = link_hy4_or_ik2(models, chosen, family)
                 if local is not None:
                     return local
@@ -4258,10 +4281,11 @@ def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
     first = model["anchor"]
     if linked_model_type(first) != family:
         arch = gguf_head(first)[0]
-        want = "Hy4-Flash (hy_v4_flash)" if family == "hy4" else "Inkling 2 (inkling2)"
+        want = {"hy4": "Hy4-Flash (hy_v4_flash)", "hy4_full": "Hy4 (hy_v4)", "ik2": "Inkling 2 (inkling2)"}[family]
         warn(f"{first.name}: select a {want} GGUF" + (f"; detected {arch}" if arch else ""))
         return None
     hy4 = family == "hy4"
+    full_hy4 = family == "hy4_full"
     shards = hy4_local_shards(first, sorted(model["files"])) if hy4 else shard_set(first)
     drafter, vision = (chosen[role]["path"] if chosen[role] else None for role in ("drafter", "vision"))
     try:
@@ -4287,6 +4311,11 @@ def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
                     raise ValueError(f"{drafter.name}: select a Hy4-Flash MTP or DFly2 GGUF")
                 if embedded_mtp and draft_kind == "mtp":
                     raise ValueError("this model has built-in MTP; choose None or a DFly2 drafter")
+        elif full_hy4:
+            if drafter:
+                raise ValueError("Hy4 currently runs without a draft model; choose None")
+            if any(g.metadata.get("split.no", i) != i for i, g in enumerate(ggufs)):
+                raise ValueError("the GGUF parts have inconsistent shard numbers")
         else:
             if arch == "inkling2_loop":
                 raise ValueError("this maya-ik2 uses the Unsloth inkling2 layout; choose the GGUF outside Mainline_Support")
@@ -4304,9 +4333,12 @@ def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
         if vision:
             meta = GGUFFile(vision).metadata
             projector = meta.get("clip.projector_type") or meta.get("clip.vision.projector_type")
-            if projector != ("hy_v4_flash" if hy4 else "inkling2v"):
+            want_projector = {"hy4": "hy_v4_flash", "hy4_full": HY4_FULL_PROJECTOR, "ik2": "inkling2v"}[family]
+            if projector != want_projector:
                 raise ValueError(f"{vision.name}: the vision projector does not match the selected model")
-            if not hy4 and meta.get("clip.vision.projection_dim", width) != width:
+            if full_hy4 and meta.get("clip.vision.projection_dim") != base.get("hy_v4.embedding_length"):
+                raise ValueError(f"{vision.name}: the projector's output width does not match the model")
+            if family == "ik2" and meta.get("clip.vision.projection_dim", width) != width:
                 raise ValueError(f"{vision.name}: select the vision projector for Inkling-2-{variant.title()}")
     except (OSError, TypeError, ValueError, KeyError, IndexError, struct.error) as exc:
         warn(f"{first.name}: {exc}")
@@ -4315,7 +4347,8 @@ def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
     if len({p.name.casefold() for p in files}) != len(files):
         warn("select model and companion files with distinct filenames")
         return None
-    d = local_model_folder(models, first, "Hy4-Flash" if hy4 else f"Inkling-2-{variant}", files)
+    prefix = HY4 if hy4 else HY4_FULL if full_hy4 else f"Inkling-2-{variant}"
+    d = local_model_folder(models, first, prefix, files)
     for p in files:
         _, why = MI.link_file(p, d / p.name)
         if why:
@@ -4324,7 +4357,7 @@ def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
     ok(f"{len(files)} local model and companion file(s) linked in {d}")
     return {"folder": d, "model": d / first.name, "files": [d / p.name for p in shards],
             "drafter": d / drafter.name if drafter else None, "vision": d / vision.name if vision else None,
-            "draft_kind": draft_kind, "embedded_mtp": embedded_mtp, "variant": variant}
+            "draft_kind": draft_kind, "embedded_mtp": embedded_mtp, "variant": variant, "arch": arch}
 
 
 def link_catalog_family(label: str, family: str) -> bool:
@@ -7463,10 +7496,11 @@ def server_command(cfg_path: Path, a) -> tuple:
         say("  the rest in pinned RAM for its CPU lane - the first answers are the slowest.")
     elif config_family(cfg) == "hy4":
         say("  Loading takes a minute or a few: the engine places what must sit in VRAM and as many of the most-routed")
-        say("  experts as fit beside it; the others are computed on the CPU from the model file (RAM as the page cache),")
-        say("  the n-gram table is read from the SSD - the first answers are the slowest.")
-        for line in hy4_first_start_said(cfg):
-            say("  " + line)
+        say("  experts as fit beside it. The CPU computes the rest from the model files, using RAM as the page cache.")
+        if setup_family(cfg) == "hy4":
+            say("  The n-gram table is read from the SSD. The first answers are the slowest.")
+            for line in hy4_first_start_said(cfg):
+                say("  " + line)
     elif config_family(cfg) == "ik2":
         if (cfg.get("env") or {}).get("IK2_HOST") == "mmap":
             say("  Experts are cached in VRAM and read from the GGUF on demand. The first answers can be slow.")
@@ -8287,6 +8321,8 @@ def _set_up(a, prev: dict) -> Path | None:
         return set_up_qwen(a, prev)
     if family == "hy4":
         return set_up_hy4(a, prev)
+    if family == "hy4_full":
+        return set_up_hy4_full(a, prev)
     if family == "ik2":
         return set_up_ik2(a, prev)
     inst = prev.get("installer") or {}
@@ -11410,7 +11446,9 @@ def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | 
     step(6, "the pack (the engine's index of the model files)")
     pack = d / HY4_PACK
     tools = S.source_hash(HY4_PACK_TOOLS)
-    need = ("hy4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
+    need = ("hy4.txt", "tensors.txt", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
+    if not (local and files and gguf_head(files[0])[0] == HY4_FULL_ARCH):
+        need += ("engram.bin",)
     every = list(files) + [f for f in (mtp, dfly, vis) if f is not None]
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
             all((pack / f).exists() for f in need) and pack_stale(pack, every) is None and (
@@ -11672,11 +11710,12 @@ def set_up_hy4_local(a, prev: dict, local: dict) -> Path:
     models = setup_models_dir(a, prev)
     same = (prev.get("installer") or {}).get("model_dir") == str(d)
     a.gpus_before = prev.get("gpu")
-    pc = check_pc(a, "hy4")
+    full = local.get("arch") == HY4_FULL_ARCH
+    pc = check_pc(a, "hy4_full" if full else "hy4")
     step(2, "your choices")
     ok(f"model: {model.name} (linked GGUF in {d})")
     old_ctx = flag_value(prev.get("args") or [], "--max-context") if same else None
-    contexts = sorted(set(HY4_CONTEXTS[:3]) | set(hy4_q4_contexts(pc["gpus"])))
+    contexts = HY4_FULL_CONTEXTS if full else sorted(set(HY4_CONTEXTS[:3]) | set(hy4_q4_contexts(pc["gpus"])))
     ctx = choose_context(a, int(old_ctx) if old_ctx else None, contexts, hy4_recommended_context(pc, contexts))
     llama = tools_step(a)
     meta = build_step(a, pc, llama, "maya-hy4")
@@ -11693,9 +11732,35 @@ def set_up_hy4_local(a, prev: dict, local: dict) -> Path:
     drafting = how != "off" and (can_dfly if drafter == "dfly2" else has_mtp and how != "dfly2")
     if dfly and not can_dfly:
         warn("the Hy4-Flash DFly2 drafter runs on one GPU")
-    return write_config_hy4(a, pc, meta, pack, ctx, models, d, drafting, "local", vision=pictures,
+    # The full model's larger prompt buffers compete with resident experts on every GPU.
+    fit = {"layout": HY4_STANDARD, "args": ["--chunk", "512"]} if full else None
+    return write_config_hy4(a, pc, meta, pack, ctx, models, d, drafting, "local", fit=fit, vision=pictures,
                             drafter=drafter, extra={"local_model": model.name, "draft_block": has_mtp,
-                                                    "dfly2": bool(dfly)})
+                                                    "dfly2": bool(dfly), **({"hy4_arch": HY4_FULL_ARCH} if full else {})})
+
+
+def set_up_hy4_full(a, prev: dict) -> Path | None:
+    models = setup_models_dir(a, prev)
+    if a.model_dir:
+        src = Path(a.model_dir).expanduser().resolve()
+        if not src.is_dir():
+            fail(f"{src} is not a directory with Hy4 GGUF files")
+        candidates = review_candidates(src, "hy4_full")
+        if len(candidates["model"]) != 1 or (len(candidates["vision"]) > 1 and not a.no_vision):
+            if a.yes:
+                fail(f"{src}: need one Hy4 GGUF set and at most one matching projector")
+            local = review_downloaded_model(a, src, models, "hy4_full")
+        else:
+            chosen = {role: options[0] if options else None for role, options in candidates.items()}
+            if a.no_vision:
+                chosen["vision"] = None
+            local = link_hy4_or_ik2(models, chosen, "hy4_full")
+    else:
+        if a.yes:
+            fail("Hy4 needs a downloaded GGUF set", "give its folder with --model-dir")
+        local = choose_with_add(a, "Which files of Hy4?", ["Choose files you already downloaded."], [], 0, False,
+                                models, "hy4_full")
+    return set_up_hy4_local(a, prev, local) if isinstance(local, dict) else None
 
 
 def set_up_hy4(a, prev: dict) -> Path | None:
@@ -12919,6 +12984,9 @@ def model_option(a) -> str | None:
         a.mm3_quant = Q.MM3_QUANT_ALIASES.get(a.mm3_quant, a.mm3_quant)
     if not a.model:
         return None
+    if a.model.casefold() == "hy4-full":
+        a.model = HY4_FULL
+        return None
     hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
     if hit is None:
         return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
@@ -12979,6 +13047,7 @@ def main() -> int:
                     help="which model and files (default: asked): a Maya quant - "
                          + ", ".join(i for _, _, _, i in Q.QUANTS) +
                          f" - or {DS4} / {MM3} / {HY4} (their files asked, or --ds4-quant / --mm3-quant / --hy4-quant), "
+                         "hy4-full (local Hy4 GGUF), "
                          f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (an experimental preview),"
                          " or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
@@ -13258,13 +13327,14 @@ def main() -> int:
         say("Nothing is set up yet: the setup runs first, then the tuning.")
     prev = read_json(have[0]) if have else {}
     if a.check:
-        hy4 = a.model == HY4 or bool(getattr(a, "hy4_quant", None))
+        hy4 = a.model in (HY4, HY4_FULL) or bool(getattr(a, "hy4_quant", None))
         ik2 = a.model == IK2                           # (Inkling-2-Mini's preview: its refusals, or this PC's card)
         ds4 = not hy4 and not ik2 and (a.model == DS4 or bool(a.model_dir) and exl3_folder_family(a.model_dir) is None)
         quant = choose_ds4_quant(a, prev) if ds4 else None
-        pc = check_pc(a, "hy4" if hy4 else "ik2" if ik2 else "deepseek" if ds4 else "glm",
+        pc = check_pc(a, "hy4_full" if a.model == HY4_FULL else "hy4" if hy4 else
+                      "ik2" if ik2 else "deepseek" if ds4 else "glm",
                       gguf=ds4 and quant != "exl3")
-        if hy4:                                        # (the layout and the context that fit this VRAM, or why none does)
+        if hy4 and a.model != HY4_FULL:                 # (the layout and the context that fit this VRAM, or why none does)
             quant = choose_hy4_quant(a, prev if config_family(prev) == "hy4" else {})
             if quant != HY4_Q4:                        # (Tencent's own Q4_K_M: the table has no VRAM plan for it)
                 hy4_fit_step(a, pc, quant)

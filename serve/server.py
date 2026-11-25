@@ -2616,7 +2616,8 @@ def child_env(cfg: dict) -> dict:
             env.setdefault("HY4_HOT_SEED", str(seed))
         # (... and both measured at the first start on this PC before the engine says READY, on this install's docs
         #  in the model's tokens - not while the first answers read their prompts, 2.5-3x slower then)
-        if "HY4_MEASURE_IDS" not in env:
+        # Full Hy4 can take several minutes to measure the prompt route. Learn it from real requests by default.
+        if "HY4_MEASURE_IDS" not in env and (not models.hy4_full(cfg) or env.get("HY4_MEASURE") == "1"):
             ids = hy4_measure_ids(cfg)
             if ids is not None:
                 env["HY4_MEASURE_IDS"] = str(ids)

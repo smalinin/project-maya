@@ -47,6 +47,7 @@ DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepS
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
 HY4_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]          # ... and Hy4-Flash (maya.py's HY4_CONTEXTS)
+HY4_FULL_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 128000]
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
@@ -1010,7 +1011,7 @@ def describe(path: Path, running: str | None) -> dict:
                          "hy4": "hy4-q4" if hy4_plain(cfg) else "hy4"}.get(family(cfg), ""))
     hy4_fits = hy4_contexts(cfg) if family(cfg) == "hy4" else []
     ik2 = family(cfg) == "ik2"
-    if family(cfg) == "hy4" and not hy4_plain(cfg):
+    if family(cfg) == "hy4" and (hy4_full(cfg) or not hy4_plain(cfg)):
         rng["max"] = min(rng["max"], max(hy4_fits + [CONTEXT_MIN, int(cur.get("context") or 0)]))
     setup = dict(inst.get("as_set_up") or cur)
     setup["env"] = shown_env(setup.get("env"))
@@ -1028,7 +1029,10 @@ def describe(path: Path, running: str | None) -> dict:
         own.update(kv_streamed={str(c): {"ram": HY4_STREAM_RAM_BYTES[v[0]], "win": v[1]}
                                 for c, v in st.items() if v} or None)
         own.update(kv_small_from=min(small) if small else None,
-                   context_more=bool(hy4_fits) and max(hy4_fits) < (HY4_Q4_LONG if hy4_plain(cfg) else HY4_CONTEXTS)[-1])
+                   context_more=not hy4_full(cfg) and bool(hy4_fits) and
+                   max(hy4_fits) < (HY4_Q4_LONG if hy4_plain(cfg) else HY4_CONTEXTS)[-1])
+        if hy4_full(cfg):
+            own["shown"] = "Hy4"
     if ik2:
         # (Inkling-2-Mini: whether each context keeps every expert in VRAM on its card, by the cache's format; the
         #  page says where the engine would run its slower path)
@@ -1056,7 +1060,11 @@ _gpu_cache: dict = {}
 def hy4_plain(cfg: dict) -> bool:
     """Hy4-flash in files the table has no VRAM plan for - AngelSlim's Q4_K_M: its contexts are the setup's own list
     for it (HY4_Q4_CONTEXTS; the cache by HY4_KV_BYTES), with no fit worked out."""
-    return maya_quants.config_key(cfg) == "q4_k_m"
+    return hy4_full(cfg) or maya_quants.config_key(cfg) == "q4_k_m"
+
+
+def hy4_full(cfg: dict) -> bool:
+    return (cfg.get("installer") or {}).get("hy4_arch") == "hy_v4"
 
 
 _HY4_BEFORE = {}                                    # {GPU index: MiB in use before this server started its engine}
@@ -1377,6 +1385,8 @@ def hy4_chunk_again(cfg: dict, new: dict) -> tuple:
 def hy4_contexts(cfg: dict) -> list:
     """The contexts the Models page offers for Hy4-Flash's config: those of HY4_CONTEXTS that fit its cards
     (hy4_room) and those up to the one it has (the setup worked that one out); no VRAM figure: only the latter."""
+    if hy4_full(cfg):
+        return sorted(set(HY4_FULL_CONTEXTS + [settings_of(cfg)["context"]]))
     if hy4_plain(cfg):
         # (no VRAM plan: the setup's own list, and up to the model's 1M where the smallest card is large enough for the
         #  cache - maya.py's hy4_q4_contexts; the one the config has stays offered)

@@ -70,6 +70,14 @@ void hc_post_norm(float* x, int T, int hc, int E, const float* y, const float* p
 /// RoPE (ggml's NORM: consecutive pairs) in place over dims [off, off + n_rot) of every head: x[t][h][ld], h < nh,
 /// theta = pos[t] base^(-i / n_rot)
 void rope(float* x, int T, int nh, size_t ld, size_t ldt, int off, int n_rot, const int* pos, float base, cudaStream_t s);
+struct RopeAxes {
+    const int* pos = nullptr;
+    int stride = 0, height = 0, width = 0;
+    bool split_pairs = false;
+};
+void imrope(float* x, int T, int nh, size_t ld, size_t ldt, int off, int n_rot, const int* pos, float base,
+            RopeAxes axes, cudaStream_t s);
+void indexer_norm(float* x, int T, int n, const float* weight, const float* bias, float eps, cudaStream_t s);
 /// A window's queries q [T][H][k] (k = nope + n_rot = 256) in one launch: rope over the last n_rot of each head, those
 /// rotated values into qcat [T H][ldq] at column kl (copy_cols), and the first nope values' int8 rows for k_b
 /// (q8_heads' layout).  false: not these shapes - nothing done (rope, q8_heads and copy_cols instead)
@@ -107,7 +115,7 @@ void kv_need(const int* keys, int ldk, const int* nk, int T, const int* list, in
 /// drop[2i + 1] (the slots given back); set and drop in host memory (mapped)
 void kv_hidx(const int* set, int n_set, const int* drop, int n_drop, int* hidx, cudaStream_t s);
 void kv_store(const float* kv, int T, int kv_lora, int n_rot, const float* w, float eps, const int* pos, float base,
-              uint16_t* cache, int ring, cudaStream_t s, bool q8 = false, const KvHost& hs = KvHost{});
+              uint16_t* cache, int ring, cudaStream_t s, bool q8 = false, const KvHost& hs = KvHost{}, RopeAxes axes = {});
 /// The picked rows of a sub-batch side by side: dst[t * ldk + j] = the cache row (row_bytes bytes, F16 or 8-bit: as
 /// stored) of position keys[t * ldk + j], j < nk[t] - the attention then reads dst as a cache of consecutive rows
 /// (lo[t] = t * ldk), each row fetched once whichever heads read it.
@@ -234,11 +242,11 @@ bool ix_score_wmma(const float* q, const float* wt, int T, int heads, int dim, c
 /// ... from the heads' dot products of a GEMM (the prompt path): S[(t heads + h) ldS + j] = q[t][h] . pk[g0 + j],
 /// j < n -> score[t][g0 + j] as ix_score's (the same sum over the heads; -inf from nv[t] on)
 void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, const int* pos, int kpool, int g0, int n,
-               float* score, size_t ld, cudaStream_t s);
+               float* score, size_t ld, cudaStream_t s, bool token_indexer = false);
 /// The attention keys of each token: the top min(nv, top) of its scores' pools (their kpool positions each), then its
 /// own group's positions up to itself -> keys[t][0 .. nk[t]), ldk apart
 void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
-               cudaStream_t s);
+               cudaStream_t s, bool token_indexer = false);
 /// Tensor parallel's exchange of those picks: ix_pack writes the min(nv, top) picked pools of T tokens as 16-bit
 /// numbers into wire (mapped host memory, rows ldw apart - a multiple of 8) and fences them for the host; ix_unpack
 /// makes keys[t][0 .. nk[t]) again from such rows (read past every cache) - ix_select's own keys, the tail its own

@@ -84,7 +84,7 @@ def gguf(path: pathlib.Path, kv: dict, tensors: list):
             f.write(d + b"\0" * ((32 - len(d) % 32) % 32))
 
 
-def model(root: pathlib.Path, **over) -> pathlib.Path:
+def model(root: pathlib.Path, *, full: bool = False, **over) -> pathlib.Path:
     """Two shards of a 3-layer (+1 MTP) Hy4-flash: layer 0 dense and indexed, 1 and 2 sliding-window, Engram at 1.
     over: kv entries replaced (a value None: the key left out)."""
     tokens = byte_alphabet() + SPECIAL + ["hi"]   # (one merge: h i)
@@ -136,6 +136,14 @@ def model(root: pathlib.Path, **over) -> pathlib.Path:
              ("output_hc_fn.weight", 0, [4 * D, 4]), ("blk.0.attn_q_a.weight", 12, [D, 128]),
              ("blk.1.attn_q_a.weight", 12, [D, 128])]
     second = [("blk.2.attn_q_a.weight", 12, [D, 128]), ("per_layer_token_embd.weight", 43, [HD, ROWS])]
+    if full:
+        kv = {k.replace(ARCH + ".", "hy_v4.", 1): v for k, v in kv.items()
+              if not any(tag in k for tag in ("ple.", "engram.", "sliding_window", "kpool", "nextn_", "freq_base_swa"))}
+        kv.update({"general.architecture": (8, "hy_v4"), "hy_v4.block_count": (4, NL),
+                   "hy_v4.attention.head_count": (4, 64), "hy_v4.attention.indexer.types": (9, (7, [True, False, True])),
+                   "hy_v4.rope.dimension_sections": (9, (5, [6, 5, 5, 0])), "hy_v4.swiglu_clamp_exp": (6, 0.0),
+                   "hy_v4.expert_latent_length": (4, D)})
+        second.pop()
     root.mkdir(parents=True, exist_ok=True)
     gguf(root / "Hy4-flash-Q4_K_M-00001-of-00002.gguf", kv, first)
     gguf(root / "Hy4-flash-Q4_K_M-00002-of-00002.gguf", {"split.count": (2, 2)}, second)
@@ -170,6 +178,19 @@ class PackTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_full_hy4_uses_its_own_geometry_and_projector(self):
+        root = model(pathlib.Path(self.tmp.name) / "full", full=True)
+        mmproj(root / "mmproj-hy4-vl.gguf", "hy_v4_vl")
+        mmproj(root / "mmproj-flash.gguf")
+        got = pack(root)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        out = root / "maya-hy4"
+        geo = dict(line.split(" ", 1) for line in (out / "hy4.txt").read_text().splitlines())
+        self.assertEqual((geo["arch"], geo["indexer"], geo["ix_top_k"], geo["ix_kpool"], geo["rope_sections"]),
+                         ("hy_v4", "1,0,1", "2048", "0", "6,5,5,0"))
+        self.assertIn("file 2 mmproj-hy4-vl.gguf", (out / "tensors.txt").read_text())
+        self.assertFalse((out / "engram.bin").exists())
 
     def test_other_files_in_the_folder(self):
         # a vision projector and a drafter beside the set: the pack is the set's alone

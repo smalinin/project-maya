@@ -75,8 +75,8 @@ void rope_ref(double& a, double& b, double p, int i, int n_rot, double base) {
 }
 float h2f(__half h) { return __half2float(h); }
 
-void test_hc() {
-    const int T = 3, hc = 4, E = 3072, HE = hc * E;
+void test_hc(int E) {
+    const int T = 3, hc = 4, HE = hc * E;
     auto x = randn((size_t) T * HE), fn = randn((size_t) 2 * hc * HE, 0.02f), base = randn(2 * hc, 0.5f),
          scale = randn(2, 0.5f), nw = randn(E, 0.3f), y = randn((size_t) T * E), pw = randn(E, 0.3f);
     for (float& v : nw) v += 1.0f;
@@ -115,7 +115,7 @@ void test_hc() {
         for (int d = 0; d < E; ++d) rcur[(size_t) t * E + d] = c[(size_t) d] * r2 * nw[(size_t) d];
     }
     const double e1 = rel(host(dcur, (size_t) T * E), rcur), e2 = rel(host(dpost, (size_t) T * hc), rpost);
-    std::printf("  hc_pre (+ norm): cur rel %.2e, post rel %.2e\n", e1, e2);
+    std::printf("  hc_pre (+ norm, %d columns): cur rel %.2e, post rel %.2e\n", E, e1, e2);
     CHECK(e1 < 1e-5 && e2 < 1e-6);
     // post-mix with the post norm
     dx2 = dev(x);
@@ -1001,13 +1001,14 @@ int main() {
         std::printf("hy4_kernels_test: no GPU, skipped\n");
         return 0;
     }
-    test_hc();
+    test_hc(3072);
     test_attention();
     test_kv_streaming();
     test_router();
     test_indexer();
     test_engram();
     test_row_top();
+    test_hc(6144);
     CHECK(hy4::k::errors() == 0);
     std::printf("hy4_kernels_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

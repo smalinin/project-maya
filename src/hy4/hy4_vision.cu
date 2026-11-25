@@ -669,7 +669,8 @@ struct Vision::Impl {
                 float* hr = h + (size_t) r0 * D;
                 layernorm_kernel<<<nr, 256, 0, s>>>(hr, lf(l.ln2w), lf(l.ln2b), D, g.eps, x16);
                 if (!gemm(sb + l.w1, F, D, x16, nr, big, F, err)) return false;
-                bias_act_kernel<<<blocks_for((size_t) nr * F), 256, 0, s>>>(big, lf(l.b1), (size_t) nr * F, F, 1, x16);
+                bias_act_kernel<<<blocks_for((size_t) nr * F), 256, 0, s>>>(big, lf(l.b1), (size_t) nr * F, F,
+                                                                            g.full ? 2 : 1, x16);
                 if (!gemm(sb + l.w2, D, F, x16, nr, att, D, err)) return false;
                 residual_kernel<<<blocks_for((size_t) nr * D), 256, 0, s>>>(hr, att, lf(l.b2), (size_t) nr * D, D);
             }
@@ -710,6 +711,7 @@ Vision::~Vision() = default;
 bool Vision::in_pack(const Pack& pk) { return pk.has("vision.dim") && pk.get("v.patch_embd.weight") != nullptr; }
 
 bool Vision::geometry(const Pack& pk, VisionGeo& g, std::string& err) {
+    g.full = pk.g.full;
     g.dim = (int) pk.num("vision.dim", 1152);
     g.heads = (int) pk.num("vision.heads", 16);
     g.hd = g.heads > 0 ? g.dim / g.heads : 0;

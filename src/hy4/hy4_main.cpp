@@ -568,12 +568,12 @@ bool picture_rows(hy4::Model& m, const std::vector<Pic>& pics, const std::vector
             }
             covered[(size_t) k] = 1;
         }
-        if (q.start + n > (long long) from) {
-            hy4::Model::Image im;
-            im.start = q.start;
-            if (!m.encode_image(q.rgb.data(), q.width, q.height, im.rows, err)) return false;
-            out.push_back(std::move(im));
-        }
+        hy4::Model::Image im;
+        im.start = q.start;
+        im.width = q.width / vg->factor() + 1;
+        im.height = q.height / vg->factor();
+        if (q.start + n > (long long) from && !m.encode_image(q.rgb.data(), q.width, q.height, im.rows, err)) return false;
+        out.push_back(std::move(im));
     }
     for (size_t k = 0; k < ids.size(); ++k)
         if (ids[k] == vg->image_token && !covered[k]) {
@@ -735,18 +735,18 @@ struct Extra {
 int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need) {
     for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
-    std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d experts=%d "
+    std::printf("INFO engine=hy4 engine_kind=hy4 model=%s ctx=%lld vram_gb=%.2f dspark=0 mtp=%d experts=%d "
                 "vram_slots=%d expert_slots=%d\n",
-                (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0, st0.experts_all,
+                m.name(), (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0, st0.experts_all,
                 st0.experts_vram, st0.experts_vram);
     for (const auto& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the web app's map of the GPUs)
     if (m.has_dfly2()) std::printf("INFO dfly2=%d draft=%d\n", n_draft > 0 ? 1 : 0, n_draft);
     if (!m.room_report().empty()) std::printf("INFO %s\n", m.room_report().c_str());   // (--room-report)
     if (const hy4::VisionGeo* vg = m.vision())   // (serve/hy4_vision.py's Geometry.from_info)
         std::printf("INFO vision=hy4 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
-                    "vision_max_pixels=%d vision_min_pixels=%d vision_room=%s vision_room_mib=%zu\n", vg->image_token,
+                    "vision_max_pixels=%d vision_min_pixels=%d vision_bicubic=%d vision_room=%s vision_room_mib=%zu\n", vg->image_token,
                     vg->image_start, vg->image_end, vg->patch, vg->merge, vg->max_pixels, vg->min_pixels,
-                    m.vision_room(), m.vision_room_bytes() >> 20);
+                    (int) vg->full, m.vision_room(), m.vision_room_bytes() >> 20);
     else
         for (const auto& l : m.info_lines())
             if (l.rfind("NOTE vision off", 0) == 0) {   // (a tower that did not load: the dashboard says why)

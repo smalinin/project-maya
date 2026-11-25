@@ -21,6 +21,7 @@ namespace hy4 {
 struct Pack;
 
 struct VisionGeo {
+    bool full = false;
     int dim = 1152, heads = 16, hd = 72, ff = 4304, layers = 27;
     int patch = 16, merge = 2, grid = 128, out_dim = 3072;
     float eps = 1e-5f;

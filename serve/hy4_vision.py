@@ -27,6 +27,7 @@ class Geometry(mm3_vision.Geometry):
     image_token: int = 120120
     image_start: int = 120118
     image_end: int = 120119
+    bicubic: bool = False
 
     @classmethod
     def from_info(cls, info: dict) -> "Geometry":
@@ -38,7 +39,7 @@ class Geometry(mm3_vision.Geometry):
         return cls(patch=num("vision_patch", d.patch), merge=num("vision_merge", d.merge),
                    min_pixels=num("vision_min_pixels", d.min_pixels), max_pixels=num("vision_max_pixels", d.max_pixels),
                    image_token=num("image_token", d.image_token), image_start=num("image_start", d.image_start),
-                   image_end=num("image_end", d.image_end))
+                   image_end=num("image_end", d.image_end), bicubic=bool(num("vision_bicubic", 0)))
 
     def rows(self, height: int, width: int) -> int:
         """A picture's image tokens: its blocks and a newline a row of them."""
@@ -61,7 +62,7 @@ class Picture(mm3_vision.Picture):
 
 
 def prepare(data: bytes, g: Geometry) -> Picture:
-    """A picture's bytes (any format Pillow reads) -> its resized pixels (Lanczos, the processor's resample)."""
+    """Decode and resize the picture to the projector's input grid."""
     try:
         from PIL import Image
         import numpy as np
@@ -70,7 +71,7 @@ def prepare(data: bytes, g: Geometry) -> Picture:
     im = mm3_vision.rgb_image(data)
     h, w = mm3_vision.smart_resize(im.height, im.width, g)
     if (w, h) != im.size:
-        im = im.resize((w, h), Image.LANCZOS)
+        im = im.resize((w, h), Image.BICUBIC if g.bicubic else Image.LANCZOS)
     a = np.ascontiguousarray(np.asarray(im, dtype=np.uint8))
     assert a.shape == (h, w, 3), a.shape
     return Picture(a.tobytes(), w, h, g.rows(h, w))

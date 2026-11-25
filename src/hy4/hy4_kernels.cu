@@ -642,14 +642,14 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
         }
     }
 }
-template <bool HEAD>
+template <bool HEAD, int KPER = 8>
 __global__ void __launch_bounds__(512) hc_fin_kernel(const float* __restrict__ x, int hc, int E,
                                                      const float* __restrict__ part, const float* __restrict__ scale,
                                                      const float* __restrict__ base, float eps, float hc_eps, float mag,
                                                      float* __restrict__ cur, float* __restrict__ post,
                                                      float* __restrict__ mix_out, const float* __restrict__ nw,
                                                      float neps, const Q8Out q8) {
-    hc_fin_body<HEAD, 8>(blockIdx.x, x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, mix_out, nw, neps, q8);
+    hc_fin_body<HEAD, KPER>(blockIdx.x, x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, mix_out, nw, neps, q8);
 }
 // ... in one launch: the slices' blocks as hc_part, the last of a token's to finish its hc_fin (a counter a token)
 __global__ void __launch_bounds__(256) hc_pre1_kernel(const float* __restrict__ x, int hc, int E,
@@ -788,6 +788,37 @@ __device__ __forceinline__ void rope_pair(float& a, float& b, float pos, int i, 
     a = x0 * c - x1 * s;
     b = x0 * s + x1 * c;
 }
+__device__ __forceinline__ int rope_position(RopeAxes axes, int t, int pair, int pos) {
+    if (axes.pos == nullptr) return pos;
+    const int axis = pair % 3;
+    if ((axis == 1 && pair < 3 * axes.height) || (axis == 2 && pair < 3 * axes.width))
+        return axes.pos[axis * axes.stride + t];
+    return axes.pos[t];
+}
+
+__global__ void imrope_kernel(float* x, int nh, size_t ld, size_t ldt, int off, int n_rot, const int* pos,
+                              float base, RopeAxes axes) {
+    const int t = blockIdx.y, half = n_rot / 2;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nh * half) return;
+    const int pair = i % half;
+    float* row = x + (size_t) t * ldt + (size_t) (i / half) * ld + off;
+    rope_pair(row[pair], row[pair + half], (float) rope_position(axes, t, pair, pos[t]), pair, n_rot, base);
+}
+
+__global__ void indexer_norm_kernel(float* x, int n, const float* w, const float* b, float eps) {
+    float* row = x + (size_t) blockIdx.x * n;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) sum += row[i];
+    const float mean = block_sum(sum) / n;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float d = row[i] - mean;
+        ss += d * d;
+    }
+    const float inv = rsqrtf(block_sum(ss) / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) row[i] = (row[i] - mean) * inv * w[i] + b[i];
+}
 __global__ void rope_kernel(float* __restrict__ x, int nh, size_t ld, size_t ldt, int off, int n_rot,
                             const int* __restrict__ pos, float base) {
     const int t = blockIdx.y, half = n_rot / 2;
@@ -848,7 +879,7 @@ __device__ __forceinline__ size_t kv_src(int p, int ring, const int* tag, const 
 __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n_rot, const float* __restrict__ w,
                                 float eps, const int* __restrict__ pos, float base, __half* __restrict__ cache,
                                 int ring, int* __restrict__ tag, uint32_t* __restrict__ host, int* htag, int* hidx,
-                                int hres) {
+                                int hres, RopeAxes axes) {
     const int t = blockIdx.x, row = kv_lora + n_rot;
     const float* x = kv + (size_t) t * row;
     const int p = pos[t];
@@ -860,10 +891,12 @@ __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n
     const float r = 1.0f / sqrtf(ss / (float) kv_lora + eps);
     for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) dst[i] = __float2half_rn(x[i] * r * w[i]);
     for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) {
-        float a = x[kv_lora + 2 * i], b = x[kv_lora + 2 * i + 1];
-        rope_pair(a, b, (float) p, i, n_rot, base);
-        dst[kv_lora + 2 * i] = __float2half_rn(a);
-        dst[kv_lora + 2 * i + 1] = __float2half_rn(b);
+        const int ai = kv_lora + (axes.split_pairs ? i : 2 * i);
+        const int bi = ai + (axes.split_pairs ? n_rot / 2 : 1);
+        float a = x[ai], b = x[bi];
+        rope_pair(a, b, (float) rope_position(axes, t, i, p), i, n_rot, base);
+        dst[ai] = __float2half_rn(a);
+        dst[bi] = __float2half_rn(b);
     }
     if (tag) kv_mirror(dst, host, row / 2, tag, slot, p, htag, hidx, hres);
 }
@@ -874,7 +907,7 @@ __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n
 __global__ void kv_store_q8_kernel(const float* __restrict__ kv, int kv_lora, int n_rot, const float* __restrict__ w,
                                    float eps, const int* __restrict__ pos, float base, uint8_t* __restrict__ cache,
                                    int ring, int rb, int* __restrict__ tag, uint32_t* __restrict__ host,
-                                   int* htag, int* hidx, int hres) {
+                                   int* htag, int* hidx, int hres, RopeAxes axes) {
     __shared__ float v[1024];
     const int t = blockIdx.x, row = kv_lora + n_rot;
     const float* x = kv + (size_t) t * row;
@@ -887,10 +920,12 @@ __global__ void kv_store_q8_kernel(const float* __restrict__ kv, int kv_lora, in
     const float r = 1.0f / sqrtf(ss / (float) kv_lora + eps);
     for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) v[i] = x[i] * r * w[i];
     for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) {
-        float a = x[kv_lora + 2 * i], b = x[kv_lora + 2 * i + 1];
-        rope_pair(a, b, (float) p, i, n_rot, base);
-        v[kv_lora + 2 * i] = a;
-        v[kv_lora + 2 * i + 1] = b;
+        const int ai = kv_lora + (axes.split_pairs ? i : 2 * i);
+        const int bi = ai + (axes.split_pairs ? n_rot / 2 : 1);
+        float a = x[ai], b = x[bi];
+        rope_pair(a, b, (float) rope_position(axes, t, i, p), i, n_rot, base);
+        v[ai] = a;
+        v[bi] = b;
     }
     __syncthreads();
     const int wp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
@@ -2353,10 +2388,10 @@ __global__ void __launch_bounds__(256) ix_score_wmma_kernel(const float* __restr
 // (ceil(n / 256), T), a thread a pool - the heads summed in ix_score_kernel's order
 __global__ void ix_reduce_kernel(const float* __restrict__ S, size_t ldS, const float* __restrict__ wt, int heads,
                                  const int* __restrict__ pos, int kpool, int g0, int n, float* __restrict__ score,
-                                 size_t ld) {
+                                 size_t ld, bool token_indexer) {
     const int t = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
-    const int g = g0 + j, nv = pos[t] / kpool;
+    const int g = g0 + j, nv = pos[t] / kpool + (token_indexer ? 1 : 0);
     float out = -INFINITY;
     if (g < nv) {
         out = 0.0f;
@@ -2373,13 +2408,14 @@ __device__ __forceinline__ uint32_t ord_key(float f) {
 // picks in index order - the ties at the threshold the lowest indices), their kpool positions each, then the tail
 __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict__ score, size_t ld,
                                                          const int* __restrict__ pos, int kpool, int top,
-                                                         int* __restrict__ keys, int ldk, int* __restrict__ nk) {
+                                                         int* __restrict__ keys, int ldk, int* __restrict__ nk,
+                                                         bool token_indexer) {
     __shared__ int hist[256];
     __shared__ uint32_t s_prefix, s_mask;
     __shared__ int s_need;
     __shared__ int s_gt[32], s_eq[32];   // (the warps' totals, then their offsets)
     const int t = blockIdx.x, nth = blockDim.x, tid = threadIdx.x;
-    const int p = pos[t], nv = p / kpool;
+    const int p = pos[t], nv = p / kpool + (token_indexer ? 1 : 0);
     const float* sc = score + (size_t) t * ld;
     int* kt = keys + (size_t) t * ldk;
     const int nsel = min(nv, top);
@@ -2482,7 +2518,7 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
         for (int k = 0; k < kpool; ++k) kt[slot * kpool + k] = g * kpool + k;
     }
     __syncthreads();
-    const int ntail = p % kpool + 1;
+    const int ntail = token_indexer ? 0 : p % kpool + 1;
     for (int k = tid; k < ntail; k += nth) kt[nsel * kpool + k] = nv * kpool + k;
     if (tid == 0) nk[t] = nsel * kpool + ntail;
 }
@@ -2567,7 +2603,7 @@ bool hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* 
             float hc_eps, float mag, float* cur, float* post, cudaStream_t s, const float* norm_w, float norm_eps,
             bool fn_by_element, Q8Out q8) {
     float* part = hc_part_buf(T);
-    if (part == nullptr || 2 * hc > kMaxM || hc > 8 || E > 512 * 8) {
+    if (part == nullptr || 2 * hc > kMaxM || hc > 8 || E > 512 * 12) {
         std::fprintf(stderr, "maya-hy4 hc_pre: no room for its sums (%d streams)\n", hc);
         g_err.fetch_add(1);
         return false;
@@ -2582,8 +2618,12 @@ bool hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* 
     } else {
         if (fn_by_element) hc_part_kernel<true><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, 2 * hc, fn, part);
         else hc_part_kernel<false><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, 2 * hc, fn, part);
-        hc_fin_kernel<false><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, g_mix_out,
-                                               norm_w, norm_eps, q8);
+        if (E > 512 * 8)
+            hc_fin_kernel<false, 12><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post,
+                                                       g_mix_out, norm_w, norm_eps, q8);
+        else
+            hc_fin_kernel<false><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post,
+                                                   g_mix_out, norm_w, norm_eps, q8);
         check("hc_pre");
         return q8.q != nullptr;
     }
@@ -2593,15 +2633,19 @@ bool hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* 
 void hc_head(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
              float hc_eps, float* cur, cudaStream_t s, bool fn_by_element) {
     float* part = hc_part_buf(T);
-    if (part == nullptr || hc > kMaxM) {
+    if (part == nullptr || hc > kMaxM || E > 512 * 12) {
         std::fprintf(stderr, "maya-hy4 hc_head: no room for its sums\n");
         g_err.fetch_add(1);
         return;
     }
     if (fn_by_element) hc_part_kernel<true><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, hc, fn, part);
     else hc_part_kernel<false><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, hc, fn, part);
-    hc_fin_kernel<true><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, 1.0f, cur, nullptr, nullptr, nullptr,
-                                          0.0f, Q8Out{});
+    if (E > 512 * 8)
+        hc_fin_kernel<true, 12><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, 1.0f, cur, nullptr, nullptr,
+                                                  nullptr, 0.0f, Q8Out{});
+    else
+        hc_fin_kernel<true><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, 1.0f, cur, nullptr, nullptr,
+                                              nullptr, 0.0f, Q8Out{});
     check("hc_head");
 }
 void hc_post(float* x, int T, int hc, int E, const float* y, const float* post, cudaStream_t s) {
@@ -2632,11 +2676,21 @@ void rope(float* x, int T, int nh, size_t ld, size_t ldt, int off, int n_rot, co
     rope_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(x, nh, ld, ldt, off, n_rot, pos, base);
     check("rope");
 }
+void imrope(float* x, int T, int nh, size_t ld, size_t ldt, int off, int n_rot, const int* pos, float base,
+            RopeAxes axes, cudaStream_t s) {
+    const int n = nh * n_rot / 2;
+    imrope_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(x, nh, ld, ldt, off, n_rot, pos, base, axes);
+    check("imrope");
+}
+void indexer_norm(float* x, int T, int n, const float* weight, const float* bias, float eps, cudaStream_t s) {
+    indexer_norm_kernel<<<T, 256, 0, s>>>(x, n, weight, bias, eps);
+    check("indexer_norm");
+}
 size_t kv_q8_row_bytes(int kv_lora, int n_rot) {
     return ((size_t) kv_lora + (size_t) kv_lora / 16 + 2 * (size_t) n_rot + 15) / 16 * 16;
 }
 void kv_store(const float* kv, int T, int kv_lora, int n_rot, const float* w, float eps, const int* pos, float base,
-              uint16_t* cache, int ring, cudaStream_t s, bool q8, const KvHost& hs) {
+              uint16_t* cache, int ring, cudaStream_t s, bool q8, const KvHost& hs, RopeAxes axes) {
     const int row = kv_lora + n_rot;
     if (q8 && (kv_lora % 32 || n_rot % 2 || row > 1024)) {
         std::fprintf(stderr, "maya-hy4 kv_store: a Q8_0 row of %d + %d values (whole blocks of 32, at most 1024)\n",
@@ -2647,10 +2701,10 @@ void kv_store(const float* kv, int T, int kv_lora, int n_rot, const float* w, fl
     if (q8)
         kv_store_q8_kernel<<<T, 256, 0, s>>>(kv, kv_lora, n_rot, w, eps, pos, base, (uint8_t*) cache, ring,
                                              (int) kv_q8_row_bytes(kv_lora, n_rot), hs.tag, (uint32_t*) hs.rows,
-                                             hs.htag, hs.hidx, hs.hres);
+                                             hs.htag, hs.hidx, hs.hres, axes);
     else
         kv_store_kernel<<<T, 256, 0, s>>>(kv, kv_lora, n_rot, w, eps, pos, base, (__half*) cache, ring, hs.tag,
-                                          (uint32_t*) hs.rows, hs.htag, hs.hidx, hs.hres);
+                                          (uint32_t*) hs.rows, hs.htag, hs.hidx, hs.hres, axes);
     check("kv_store");
 }
 size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys) {
@@ -3004,15 +3058,15 @@ bool ix_score_wmma(const float* q, const float* wt, int T, int heads, int dim, c
     return true;
 }
 void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, const int* pos, int kpool, int g0, int n,
-               float* score, size_t ld, cudaStream_t s) {
+               float* score, size_t ld, cudaStream_t s, bool token_indexer) {
     if (n <= 0 || T <= 0) return;
     ix_reduce_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(S, ldS, wt, heads, pos, kpool, g0,
-                                                                                    n, score, ld);
+                                                                                    n, score, ld, token_indexer);
     check("ix_reduce");
 }
 void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
-               cudaStream_t s) {
-    ix_select_kernel<<<T, 1024, 0, s>>>(score, ld, pos, kpool, top, keys, ldk, nk);
+               cudaStream_t s, bool token_indexer) {
+    ix_select_kernel<<<T, 1024, 0, s>>>(score, ld, pos, kpool, top, keys, ldk, nk, token_indexer);
     check("ix_select");
 }
 void ix_pack(const int* keys, int ldk, int T, const int* pos, int kpool, int top, uint16_t* wire, int ldw,

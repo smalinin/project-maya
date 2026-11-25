@@ -1,11 +1,10 @@
-"""tools/hy4/pack_gguf.py - maya-hy4's pack for a Hy4-flash GGUF set (Tencent's Hy4-flash, the GGUF's `hy_v4_flash`
-layout: AngelSlim's Q4_K_M / Q3_K / IQ2 builds), beside the model's files (no weights copied).
+"""Index a Hy4-Flash (`hy_v4_flash`) or Hy4 (`hy_v4`) GGUF set for maya-hy4.
 
     python tools/hy4/pack_gguf.py --model ~/models/Hy4-flash-GGUF [--mmproj FILE|none] [--mtp FILE|none]
                                   [--drafter FILE|none]
 
 writes <model>/maya-hy4/:
-  hy4.txt       the geometry, one `key value` a line (lists comma-separated), from the GGUF's hy_v4_flash.* keys; with
+  hy4.txt       the geometry, one `key value` a line (lists comma-separated), from the GGUF's architecture keys; with
                 the vision tower, its vision.* keys (from the mmproj file's clip.* keys, and the vocabulary's image
                 start / end / pad tokens)
   tensors.txt   `file <i> <path>` lines (relative to the model's folder, model_dir in hy4.txt), then `t <name> <type> <file> <offset> <bytes> <ne0> <ne1> ...` a tensor: the
@@ -19,8 +18,8 @@ writes <model>/maya-hy4/:
   tokenizer/    the server's tokenizer from the GGUF's vocabulary and merges (pre "hy_v4") and the model's own chat
                 template (tokenizer.chat_template)
 
-The vision tower: AngelSlim's mmproj-Hy4-flash-*.gguf (clip.projector_type hy_v4_flash) in the model's folder, found
-there unless --mmproj names one (or `none`: text only).  The model's shards are the folder's other .gguf files.
+The vision tower has clip.projector_type hy_v4_flash for Flash, or hy_v4_vl for full Hy4. Use --mmproj to select a
+file or pass `none` for text only. The full model uses a token-level indexer and may carry IMRoPE sections.
 
 The MTP draft block (maya-hy4's --mtp): in the set itself (AngelSlim's builds: hy_v4_flash.nextn_predict_layers 1), or -
 for a set made from the public release, which has none - in a file of its own in the model's folder (general.type
@@ -47,6 +46,8 @@ import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 ARCH = "hy_v4_flash"
+FULL_ARCH = "hy_v4"
+PROJECTORS = {ARCH: ARCH, FULL_ARCH: "hy_v4_vl"}
 
 _spec = importlib.util.spec_from_file_location("ds4_pack_gguf", HERE.parent / "ds4" / "pack_gguf.py")
 _ds4 = importlib.util.module_from_spec(_spec)
@@ -110,16 +111,17 @@ def find_shards(model: pathlib.Path, names: list | None) -> list:
                 print("%s: not read (%s), left out of the set" % (p.name, e))
                 continue
             arch, kind = g.kv.get("general.architecture"), g.kv.get("general.type")
-            if (arch is None or arch == ARCH) and kind in (None, "model"):
+            if (arch is None or arch in PROJECTORS) and kind in (None, "model"):
                 gs.append(g)
             elif not is_mtp(g) and not is_drafter(g):   # (the MTP block's own file, the drafter's: find_mtp's, find_drafter's)
                 print("%s: %s / %s, not a shard of the model, left out" % (p.name, arch, kind))
         if not gs:
-            raise SystemExit("%s: no %s model .gguf files" % (model, ARCH))
+            raise SystemExit("%s: no Hy4 or Hy4-Flash model .gguf files" % model)
     first = [g for g in gs if g.kv.get("general.architecture")]
-    if not first or first[0].kv["general.architecture"] != ARCH:
-        raise SystemExit("%s: not a %s GGUF (general.architecture %r)" %
-                         (model, ARCH, first[0].kv.get("general.architecture") if first else None))
+    arches = {g.kv["general.architecture"] for g in first}
+    if len(arches) != 1 or not arches <= PROJECTORS.keys():
+        raise SystemExit("%s: expected one Hy4 or Hy4-Flash GGUF set (general.architecture %r)" %
+                         (model, [g.kv["general.architecture"] for g in first]))
     # one quant a folder: a set's shards all name the same count
     want = int(first[0].kv.get("split.count", 1))
     if len(gs) != want:
@@ -142,15 +144,19 @@ def short(g: Gguf):
 
 
 def geometry(kv: dict) -> dict:
-    g = lambda k, d=None: kv.get("%s.%s" % (ARCH, k), d)  # noqa: E731
+    arch = kv.get("general.architecture", ARCH)
+    full = arch == FULL_ARCH
+    g = lambda k, d=None: kv.get("%s.%s" % (arch, k), d)  # noqa: E731
     n_all = int(g("block_count"))
     mtp = int(g("nextn_predict_layers", 0))
     heads = g("attention.head_count")
     heads = list(heads) if isinstance(heads, list) else [int(heads)] * n_all
-    swa = [int(bool(x)) for x in g("attention.sliding_window_pattern")]
+    swa = [int(bool(x)) for x in g("attention.sliding_window_pattern", [0] * n_all if full else None)]
     swa += [0] * (n_all - len(swa))
     idx = [int(bool(x)) for x in (g("attention.indexer.types") or [])]
     n_layer = n_all - mtp
+    if full and (mtp or len(idx) != n_all or not idx[0]):
+        raise SystemExit("hy_v4: expected a full/share indexer schedule beginning at layer 0 and no MTP blocks")
     idx += [1] * (n_all - len(idx))            # (the MTP block always owns an indexer: the hy_v4_flash layout)
     clamp = g("swiglu_clamp_exp", 0.0)
     clamp = list(clamp) if isinstance(clamp, list) else [float(clamp)] * n_all
@@ -163,7 +169,7 @@ def geometry(kv: dict) -> dict:
         if idx[il] and swa[il]:
             raise SystemExit("layer %d is a sliding-window layer with an indexer" % il)
     geo = {
-        "arch": ARCH,
+        "arch": arch,
         "n_layer": n_layer, "n_mtp": mtp, "n_embd": int(g("embedding_length")),
         "n_vocab": int(g("vocab_size", len(kv["tokenizer.ggml.tokens"]))),
         "context_length": int(g("context_length")),
@@ -179,8 +185,8 @@ def geometry(kv: dict) -> dict:
         "q_lora": int(g("attention.q_lora_rank")), "kv_lora": int(g("attention.kv_lora_rank")),
         "k_mla": int(g("attention.key_length_mla")), "v_mla": int(g("attention.value_length_mla")),
         "rope_dim": int(g("rope.dimension_count")),
-        "rope_base": float(g("rope.freq_base")), "rope_base_swa": float(g("rope.freq_base_swa")),
-        "n_swa": int(g("attention.sliding_window")),
+        "rope_base": float(g("rope.freq_base")), "rope_base_swa": float(g("rope.freq_base_swa", g("rope.freq_base"))),
+        "n_swa": int(g("attention.sliding_window", 0)),
         "heads": [int(x) for x in heads], "swa": swa, "indexer": idx,
         "ix_heads": int(g("attention.indexer.head_count", 0)), "ix_dim": int(g("attention.indexer.key_length", 0)),
         "ix_top_k": int(g("attention.indexer.top_k", 0)), "ix_kpool": int(g("attention.indexer.kpool", 0)),
@@ -191,8 +197,17 @@ def geometry(kv: dict) -> dict:
     }
     if geo["expert_gating_func"] != 2:
         raise SystemExit("expert_gating_func %d: maya-hy4 runs the sigmoid router (2)" % geo["expert_gating_func"])
-    if geo["k_mla"] - geo["rope_dim"] < 1 or geo["kv_lora"] % 32 or geo["ix_kpool"] < 2 or \
-            geo["ix_top_k"] % geo["ix_kpool"]:
+    if full:
+        sections = [int(x) for x in g("rope.dimension_sections", [0] * 4)]
+        if len(sections) != 4 or min(sections) < 0 or sum(sections) not in (0, geo["rope_dim"] // 2):
+            raise SystemExit("hy_v4: invalid RoPE sections")
+        geo["rope_sections"] = sections
+        if any(swa) or geo["ix_kpool"] or geo["ix_top_k"] <= 0 or geo["ix_heads"] <= 0:
+            raise SystemExit("hy_v4: expected a token-level sparse indexer")
+        if geo["n_expert_latent"] != geo["n_embd"]:
+            raise SystemExit("hy_v4: expected routed experts at the model's embedding width")
+    if geo["k_mla"] - geo["rope_dim"] < 1 or geo["kv_lora"] % 32 or \
+            (not full and (geo["ix_kpool"] < 2 or geo["ix_top_k"] % geo["ix_kpool"])):
         raise SystemExit("an attention geometry maya-hy4 does not run: %s" %
                          {k: geo[k] for k in ("k_mla", "rope_dim", "kv_lora", "ix_top_k", "ix_kpool")})
     return geo
@@ -257,7 +272,7 @@ def engram_bytes(kv: dict, tensors: dict, vocab: int) -> tuple:
     return nm, b
 
 
-def find_mmproj(model: pathlib.Path, arg: str | None) -> Gguf | None:
+def find_mmproj(model: pathlib.Path, arg: str | None, projector: str = ARCH) -> Gguf | None:
     """The vision tower's file: --mmproj's, else the folder's one mmproj GGUF of this projector (None: text only)."""
     if arg == "none":
         return None
@@ -271,11 +286,11 @@ def find_mmproj(model: pathlib.Path, arg: str | None) -> Gguf | None:
     cands = [g for g in cands if is_mmproj(g)]
     if arg and not cands:
         raise SystemExit("%s: not an mmproj GGUF" % arg)
-    mine = [g for g in cands if g.kv.get("clip.projector_type") == ARCH]
+    mine = [g for g in cands if g.kv.get("clip.projector_type") == projector]
     if arg and not mine:
-        raise SystemExit("%s: clip.projector_type %r, not %s" % (arg, cands[0].kv.get("clip.projector_type"), ARCH))
+        raise SystemExit("%s: clip.projector_type %r, not %s" % (arg, cands[0].kv.get("clip.projector_type"), projector))
     if len(mine) > 1:
-        raise SystemExit("%s: %d mmproj files of %s (name one with --mmproj)" % (model, len(mine), ARCH))
+        raise SystemExit("%s: %d mmproj files of %s (name one with --mmproj)" % (model, len(mine), projector))
     if not mine:
         return None
     why = short(mine[0])
@@ -451,7 +466,7 @@ def vision_geometry(g: Gguf, tokens: list, n_embd: int) -> dict:
     t = {name: (typ, dims) for name, typ, dims, _ in g.tensors}
     pos = t.get("v.position_embd.weight")
     if pos is None or "v.patch_embd.weight" not in t or "mm.0.weight" not in t or "v.image_newline" not in t:
-        raise SystemExit("%s: not the hy_v4_flash vision tower's tensors" % g.path.name)
+        raise SystemExit("%s: missing tensors for the Hy4 vision tower" % g.path.name)
     grid = int(round(pos[1][1] ** 0.5))
     if grid * grid != pos[1][1]:
         raise SystemExit("%s: a position grid of %d rows is not square" % (g.path.name, pos[1][1]))
@@ -532,13 +547,17 @@ def main() -> int:
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser().resolve() if a.out else model / "maya-hy4"
     gs = find_shards(model, a.files)
-    vis = find_mmproj(model, a.mmproj)
     kv = {}
     for g in gs:
         for k, v in g.kv.items():
             kv.setdefault(k, v)
+    arch = kv["general.architecture"]
+    vis = find_mmproj(model, a.mmproj, PROJECTORS[arch])
     mtp = None
-    if int(kv.get("%s.nextn_predict_layers" % ARCH, 0)) == 0:
+    if arch == FULL_ARCH:
+        if any(x not in (None, "none") for x in (a.mtp, a.drafter)):
+            raise SystemExit("hy_v4: external drafting is not supported")
+    elif int(kv.get("%s.nextn_predict_layers" % ARCH, 0)) == 0:
         mtp = find_mtp(model, a.mtp)
         if mtp is not None:
             kv = with_mtp(kv, mtp)
@@ -546,8 +565,10 @@ def main() -> int:
         raise SystemExit("--mtp %s: the set has its own MTP block" % a.mtp)
     geo = geometry(kv)
     if vis is not None:
+        if arch == FULL_ARCH and not any(geo["rope_sections"]):
+            raise SystemExit("hy_v4_vl needs a text GGUF with IMRoPE sections")
         geo.update(vision_geometry(vis, kv["tokenizer.ggml.tokens"], geo["n_embd"]))
-    dfly = find_drafter(model, a.drafter)
+    dfly = find_drafter(model, a.drafter) if arch == ARCH else None
     if dfly is not None:
         geo.update(drafter_geometry(dfly, geo))
     tensors, lines = {}, []

@@ -181,9 +181,11 @@ public:
     /// Kept until set_images({}) at the request's end (the drafts' first step may read rows of the prompt).
     struct Image {
         int64_t start = 0;
+        int width = 0, height = 0;  // token grid, including the newline column
         std::vector<float> rows;
     };
     const VisionGeo* vision() const;
+    const char* name() const;
     /// Where a picture's room comes from: "chunk" - lent by the head GPU's prompt buffers (idle while a picture is
     /// read; no VRAM kept for pictures), "free" - kept free between pictures (HY4_VISION_LEND=0);
     /// nullptr: no tower.  Its bytes for the largest picture this start reads; the pictures read so far each way.

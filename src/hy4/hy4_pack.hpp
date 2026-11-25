@@ -32,6 +32,7 @@ struct Tensor {
 
 // The model's shape, from hy4.txt
 struct Geo {
+    bool full = false;
     int n_layer = 0, n_mtp = 0, n_embd = 0, n_vocab = 0, n_ff = 0, n_dense_lead = 0;
     int64_t context = 0;
     int n_expert = 0, n_used = 0, n_ff_exp = 0, n_lat = 0, n_shared = 1;
@@ -41,6 +42,9 @@ struct Geo {
     float eps = 1e-5f;
     int q_lora = 0, kv_lora = 0, k_mla = 0, v_mla = 0, rope = 0;
     float rope_base = 1e4f, rope_base_swa = 1e4f;
+    std::vector<int> rope_sections;
+    bool imrope() const { return rope_sections.size() == 4 && rope_sections[0] + rope_sections[1] +
+                                rope_sections[2] + rope_sections[3] > 0; }
     int n_swa = 0;
     std::vector<int> heads, swa, indexer;
     int ix_heads = 0, ix_dim = 0, ix_top_k = 0, ix_kpool = 0;
@@ -88,8 +92,9 @@ struct Pack {
             const size_t sp = line.find(' ');
             if (sp != std::string::npos) kv[line.substr(0, sp)] = line.substr(sp + 1);
         }
-        if (str("arch") != "hy_v4_flash") {
-            err = dir + "/hy4.txt: arch " + str("arch") + ", not hy_v4_flash";
+        g.full = str("arch") == "hy_v4";
+        if (!g.full && str("arch") != "hy_v4_flash") {
+            err = dir + "/hy4.txt: expected hy_v4 or hy_v4_flash, found " + str("arch");
             return false;
         }
         model_dir = str("model_dir");
@@ -106,7 +111,8 @@ struct Pack {
             if (tag == "file") {
                 int i;
                 std::string p;
-                is >> i >> p;
+                is >> i >> std::ws;
+                std::getline(is, p);
                 if (i != (int) files.size()) {
                     err = "tensors.txt: files out of order";
                     return false;
@@ -164,6 +170,7 @@ struct Pack {
         g.rope = (int) num("rope_dim");
         g.rope_base = (float) num("rope_base");
         g.rope_base_swa = (float) num("rope_base_swa");
+        g.rope_sections = ints("rope_sections");
         g.n_swa = (int) num("n_swa");
         g.heads = ints("heads");
         g.swa = ints("swa");
@@ -181,11 +188,13 @@ struct Pack {
         const size_t all = (size_t) (g.n_layer + g.n_mtp);
         if (g.n_layer < 1 || g.n_embd < 1 || g.heads.size() != all || g.swa.size() != all || g.indexer.size() != all ||
             g.limit.size() != all || g.hc < 1 || g.rope < 2 || g.rope % 2 || g.k_mla <= g.rope || g.kv_lora % 32 ||
-            g.n_lat % 256 || g.n_ff_exp % 256 || g.n_embd % 256 || g.n_used > 16 || g.ix_kpool < 2 || !g.ix_tail ||
-            g.ix_dim <= g.rope || g.ix_top_k % g.ix_kpool) {
+            g.n_lat % 256 || g.n_ff_exp % 256 || g.n_embd % 256 || g.n_used > 16 || g.ix_dim <= g.rope ||
+            (g.full ? (g.n_mtp || !g.indexer[0] || g.ix_kpool || !g.ix_top_k || g.ix_heads < 1)
+                    : (g.ix_kpool < 2 || !g.ix_tail || g.ix_top_k % g.ix_kpool))) {
             err = dir + "/hy4.txt: a geometry maya-hy4 does not run";
             return false;
         }
+        if (g.full) g.ix_kpool = 1;   // an indexer row represents one token
         return true;
     }
 
