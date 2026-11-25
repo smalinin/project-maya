@@ -28,9 +28,9 @@
 // profile (uint32 [layers][experts] routings) - each layer's most routed experts are the ones kept in VRAM;
 // --profile-out: where the routings this run counts (with the profile's) are written, after each request when serving
 // and at the end otherwise.  HY4_HOT (on; HY4_HOT=0 off - the text differs from without it): where a layer's experts
-// are partly in VRAM, the ones there follow the answers' kept tokens' routing - between requests only (an answer runs
-// on one placement, so drafting on or off gives the same answers) cold ones trade places with hotter CPU-lane ones
-// (HY4_HOT_SWAPS: at most that many a time; all by default); a start places each
+// are partly in VRAM, the ones there follow the answers' kept tokens' routing. HY4_HOT_EVERY (32, 0 for between-request
+// swaps only) controls how often decode swaps cold experts for hotter CPU-lane ones. Decode batches hold up to 32 swaps
+// and HY4_HOT_SWAPS caps all batches. A start places each
 // layer's highest scored experts in VRAM by HY4_HOT_FILE (<pack>/expert-hot.bin; the server's: its data folder),
 // written only by a start that found none (or HY4_HOT_LEARN=1), so every start begins the same; HY4_HOT_LOG=1 logs.
 //
@@ -951,6 +951,12 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             if (in_think && (produced >= r.think_budget || in.wrap.load()) && tok != r.think_end) tok = r.think_end;
             if (!emit(tok)) break;
             const int64_t pos = (int64_t) state.size();
+            if (!m.adapt_decode(pos, err)) {
+                std::printf("ERR HY4_HOT: %s\n", err.c_str());
+                std::fflush(stdout);
+                std::fprintf(stderr, "maya-hy4: HY4_HOT: %s\n", err.c_str());
+                return 1;
+            }
             // the drafts that can still be answer tokens (max_new, the context, the thinking budget)
             long long room = std::min<long long>(r.max_new - produced, m.max_ctx() - pos - 2);
             if (in_think) room = std::min<long long>(room, r.think_budget - produced);
@@ -1060,8 +1066,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                     finish, d_acc, d_off, from, std::max(0LL, d_ex - d_cpu), std::max(0LL, d_ex));
         std::fflush(stdout);
         {
-            // (HY4_HOT: the routes of the rows a plain decode reads - the prompt's and the answer's tokens but its
-            //  last - drafting on or off the same; then the experts it moves, while the answer is read)
+            // Settle the last window's committed routes and move the remaining hot experts before the next request.
             m.answered(std::max<int64_t>(0, (int64_t) r.ids.size() + produced - 1));
             std::string perr;
             if (!m.save_profile(perr)) std::fprintf(stderr, "hy4: the expert profile: %s\n", perr.c_str());
@@ -1895,6 +1900,10 @@ int main(int argc, char** argv) {
         while ((int) out.size() < gen) {
             out.push_back(tok);
             if (tok == m.eos() || (int) out.size() >= gen) break;
+            if (!m.adapt_decode(pos, err)) {
+                std::fprintf(stderr, "maya-hy4: HY4_HOT: %s\n", err.c_str());
+                return 1;
+            }
             const double ta = now();
             if (!m.draft(tok, pos, std::min(n_draft + extra.now(), gen - (int) out.size()), floor,
                          drafts, confs, err, n_draft, sure)) {
@@ -1930,7 +1939,7 @@ int main(int argc, char** argv) {
         const double t2 = now();
         for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
         std::printf("\n");
-        {   // (HY4_HOT: the rows a plain decode reads counted, as there - its learning start's file the same)
+        {
             m.answered((int64_t) (ids.size() + out.size()) - 1);
             std::string perr;
             if (!m.save_profile(perr)) std::fprintf(stderr, "maya-hy4: the expert profile: %s\n", perr.c_str());
@@ -1954,6 +1963,10 @@ int main(int argc, char** argv) {
         }
         out.push_back(next);
         if (next == m.eos()) break;
+        if (i + 1 < gen && !m.adapt_decode(pos, err)) {
+            std::fprintf(stderr, "maya-hy4: HY4_HOT: %s\n", err.c_str());
+            return 1;
+        }
         if (!m.forward(&next, 1, pos, 1, logits.data(), err)) {
             std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
             return 1;

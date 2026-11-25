@@ -136,12 +136,12 @@ public:
     /// The routings counted (with the profile read at the load) to Options::profile_out; no file named: nothing.
     /// HY4_HOT, in a start that learns (its file missing, or HY4_HOT_LEARN=1): its experts' scores to its file as well
     bool save_profile(std::string& err) const;
-    /// An answer's end: HY4_HOT counts the routes of its tokens fed before position `end` (the prompt and the answer's
-    /// tokens but its last - the rows drafting and a plain decode both read; a token window's rows count once kept),
-    /// so the next placement is the same with drafting on or off; -1: every row fed.  Before save_profile and idle()
+    /// Before the next decode step, settle routes before the committed position and periodically swap hot experts.
+    /// A failed swap leaves the model unusable. The caller must end the run.
+    bool adapt_decode(int64_t end, std::string& err);
+    /// At an answer's end, count routes before `end` once. -1 means every row fed. Before save_profile and idle().
     void answered(int64_t end);
-    /// Between requests: HY4_HOT moves the experts in VRAM to what the scores call for (the answers' routing) - the
-    /// only place it moves them, so an answer runs on one placement; nothing where it is off
+    /// Between requests, HY4_HOT applies the remaining expert swaps.
     void idle();
     /// Page-lock a host buffer the logits go to (the copies then run at the link's speed, not through the driver's
     /// staging); unpin it before it is freed.  false: left as it was
