@@ -253,6 +253,8 @@ int main() {
         // otherwise; a member of three's 11 heads count as 11, a card's 32 (and more) as 32
         CHECK(hy4::dense_att_values(sub, 32, 128, 8192) == sub * 32 * 8192);
         CHECK(hy4::dense_att_values(sub, 64, 128, 8192) == sub * 32 * 8192);
+        CHECK(hy4::dense_att_values(sub, 64, 0, 8192, true) == sub * 64 * 8192);
+        CHECK(hy4::dense_att_values(sub, 64, 0, 8193, true) == sub * 64 * 8200);
         CHECK(hy4::dense_att_values(sub, 64, 8192, 8192) == sub * 64 * (8192 + 64 + 8));
         CHECK(hy4::dense_att_values(sub, 11, 128, 24576) == sub * 11 * 24576);
         CHECK(hy4::dense_kbuf_rows(128, 4096, 8192, sub) == 8192 + 64);

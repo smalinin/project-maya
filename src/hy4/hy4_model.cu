@@ -1796,7 +1796,7 @@ struct Model::Impl {
     size_t scratch_bytes(size_t H = 64, size_t ff = 0) const {
         size_t f16 = 0, ints = 0;
         const size_t f = scratch_floats(f16, ints, H, ff);
-        const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max);
+        const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max, g.full);
         return f * 4 + f16 * 2 + ints * 4 + att * 6 + (size_t) kSub * dense_max * 4 + deq_rows() * g.kv_row() * 2 +
                pick_bytes() + (96u << 20);
     }
@@ -3736,7 +3736,7 @@ struct Model::Impl {
         const size_t egc = (size_t) std::max(1, pk.eg.cols()) * std::max(1, pk.eg.head_dim);
         const size_t qk = std::max({H * (size_t) g.v_mla, ff, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc, E});
         const size_t npool = (size_t) (o.max_ctx / g.ix_kpool + 1);
-        const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max);
+        const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max, g.full);
         if (!only_bytes && (cublasCreate(&gp.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(gp.blas, gp.s) != CUBLAS_STATUS_SUCCESS)) {
             err = "GPU " + std::to_string(gp.dev) + ": cuBLAS did not start";
             return false;
@@ -5008,7 +5008,9 @@ struct Model::Impl {
         const int64_t P0 = p0 + t0, k1 = P0 + ts;
         const int64_t k0 = l.swa ? std::max<int64_t>(0, P0 - g.n_swa + 1) : 0;
         const int nkr = (int) (k1 - k0);
+        const int ldS = (nkr + 7) / 8 * 8;
         if (!l.swa && !all && nkr > dense_max) return false;
+        if ((size_t) ts * H * ldS > gp.sS_n) return false;
         const int window = l.swa ? g.n_swa : all ? (1 << 30) : 0;
         const uint16_t* K = l.kv + (size_t) (l.ring > 0 ? k0 % l.ring : k0) * KR;
         // (KV streaming, once the layer's ring has wrapped: the span's rows from the ring or the host, in order, each
@@ -5033,7 +5035,6 @@ struct Model::Impl {
             K = gp.kbuf;
         }
         k::to_f16(gp.qcat + (size_t) t0 * H * KR, KR, ts * H, KR, gp.xh16, KR, gp.s);
-        const int ldS = (nkr + 7) / 8 * 8;
         const float one = 1.0f, zero = 0.0f;
         const int Tp = W + 1;   // (the profile's names: a prompt step)
         part(gp, "attn: the keys and queries as FP16", Tp);

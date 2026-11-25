@@ -117,10 +117,11 @@ inline double mtp_rows_bytes(long long chunk, long long n_embd) { return (double
 /// cores, the indexer's picks kept by a mask): what its buffers come to for a span of `dense` key positions at most.
 /// The engine's plan counts them and its scratch allocates them from these same three, so a span the plan took is a
 /// span the GPUs hold.
-/// - the scores and the probabilities (an F32 and an F16 value each): the sub-batch's rows (a token's `H` heads, 32
-///   counted at most as before) times the keys - a window layer's (`n_swa` + the sub-batch) or the span's;
-inline size_t dense_att_values(size_t sub, size_t H, size_t n_swa, size_t dense) {
-    return std::max(sub * H * (n_swa + sub + 8), sub * std::min<size_t>(H, 32) * dense);
+/// Scores and probabilities for a sub-batch. Hy4-Flash's indexed layers have at most 32 heads. Hy4 uses all `H`.
+inline size_t dense_att_values(size_t sub, size_t H, size_t n_swa, size_t dense, bool full = false) {
+    const size_t indexed_heads = full ? H : std::min<size_t>(H, 32);
+    const size_t stride = (dense + 7) / 8 * 8;
+    return std::max(sub * H * (n_swa + sub + 8), sub * indexed_heads * stride);
 }
 /// - the cache's F16 rows a layer's sub-batches read in order (an 8-bit cache's dequantized there): a window's and a
 ///   chunk's, or the span's and a sub-batch's;
