@@ -281,8 +281,10 @@ void ix_union(const int* keys, int ldk, const int* nk, int T, int kpool, int n_p
 /// dsa_mask over the columns of such a list (pool g's kpool positions at columns col[g] kpool ..): ncol columns
 void dsa_mask_list(const int* keys, int ldk, const int* nk, int T, const int* col, int kpool, int ncol, float* mask,
                    size_t ldm, cudaStream_t s);
-/// The prompt path.  dst[r][i] = F16(src[r * lds + i]), i < n
-void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s);
+/// Convert rows to F16. If scale is supplied, downscale rows outside the F16 range by a power of two.
+void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s,
+            float* scale = nullptr);
+void restore_scale(float* rows, size_t ld, int n_rows, int n, const float* scale, cudaStream_t s);
 /// dst[i] = the F32 of BF16 src[i] (exact), n values
 void bf16_to_f32(const uint16_t* src, float* dst, size_t n, cudaStream_t s);
 /// A chunk's expert entries sorted by expert for ds4_iq's sets: entry e = t n_used + j of ids; bounds[x .. x + 1] the

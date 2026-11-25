@@ -995,6 +995,31 @@ void test_kv_streaming() {
         cudaFree(d);
 }
 
+static void test_f16_range() {
+    constexpr int width = 3, stride = 4, rows = 2;
+    const std::vector<float> values = {2.0f, -0.5f, 65504.0f, 17.0f, 131072.0f, -65536.0f, 0.25f, 19.0f};
+    float* input = dev(values);
+    float* scales = dev(std::vector<float>(rows));
+    __half* converted = dev(std::vector<__half>(values.size()));
+    hy4::k::to_f16(input, stride, rows, width, reinterpret_cast<uint16_t*>(converted), stride, nullptr, scales);
+    CHECK(host(scales, rows) == std::vector<float>({1.0f, 8.0f}));
+    const auto half_values = host(converted, values.size());
+    std::vector<float> output = values;
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < width; ++c) {
+            const size_t i = (size_t) r * stride + c;
+            output[i] = h2f(half_values[i]);
+            CHECK(std::isfinite(output[i]));
+        }
+    float* projected = dev(output);
+    hy4::k::restore_scale(projected, stride, rows, width, scales, nullptr);
+    CHECK(host(projected, values.size()) == values);
+    cudaFree(projected);
+    cudaFree(converted);
+    cudaFree(scales);
+    cudaFree(input);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -1009,6 +1034,7 @@ int main() {
     test_engram();
     test_row_top();
     test_hc(6144);
+    test_f16_range();
     CHECK(hy4::k::errors() == 0);
     std::printf("hy4_kernels_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

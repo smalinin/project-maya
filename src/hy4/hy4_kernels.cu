@@ -1931,6 +1931,36 @@ __global__ void to_f16_kernel(const float* __restrict__ src, size_t lds, int n, 
     const size_t r = i / n, c = i % n;
     dst[r * ldd + c] = __float2half_rn(src[r * lds + c]);
 }
+__global__ void to_f16_scaled_kernel(const float* __restrict__ src, size_t lds, int n, __half* __restrict__ dst,
+                                     size_t ldd, float* __restrict__ scales) {
+    __shared__ float maxima[8], scale;
+    const size_t r = blockIdx.x;
+    src += r * lds;
+    dst += r * ldd;
+    float m = 0.0f;
+    for (int c = threadIdx.x; c < n; c += blockDim.x) m = fmaxf(m, fabsf(src[c]));
+    m = warp_max(m);
+    if ((threadIdx.x & 31) == 0) maxima[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) m = warp_max(threadIdx.x < 8 ? maxima[threadIdx.x] : 0.0f);
+    if (threadIdx.x == 0) {
+        scale = 1.0f;
+        if (m > 65504.0f && isfinite(m)) {
+            int exponent;
+            frexpf(m, &exponent);
+            scale = ldexpf(1.0f, exponent - 15);
+        }
+        scales[r] = scale;
+    }
+    __syncthreads();
+    const float inv = 1.0f / scale;
+    for (int c = threadIdx.x; c < n; c += blockDim.x) dst[c] = __float2half_rn(src[c] * inv);
+}
+__global__ void restore_scale_kernel(float* __restrict__ rows, size_t ld, int n, size_t total,
+                                      const float* __restrict__ scale) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) rows[(i / n) * ld + i % n] *= scale[i / n];
+}
 // The same conversions a row at a time (grid y: the rows, a stride gridDim.y), 4 values a thread - for AMD, where the
 // one-value kernel's 64-bit division a value made it slower than the memory (the prompt's queries a sub-batch, the
 // GEMMs' inputs).  Rows 16-byte aligned in src, 8 in dst; the same values written.
@@ -3260,9 +3290,14 @@ void bf16_to_f32(const uint16_t* src, float* dst, size_t n, cudaStream_t s) {
     bf16_f32_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(src, dst, n);
     check("bf16_to_f32");
 }
-void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s) {
+void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s, float* scale) {
     const size_t total = (size_t) rows * n;
     if (total == 0) return;
+    if (scale) {
+        to_f16_scaled_kernel<<<rows, 256, 0, s>>>(src, lds, n, (__half*) dst, ldd, scale);
+        check("to_f16_scaled");
+        return;
+    }
     if (f16_rows_form(src, lds, dst, ldd)) {
         const int b = rows_threads(n);
         const dim3 g((unsigned) (((n + 3) / 4 + b - 1) / b), (unsigned) std::min(rows, 65535));
@@ -3272,6 +3307,12 @@ void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t
     }
     to_f16_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(src, lds, n, (__half*) dst, ldd, total);
     check("to_f16");
+}
+void restore_scale(float* rows, size_t ld, int n_rows, int n, const float* scale, cudaStream_t s) {
+    const size_t total = (size_t) n_rows * n;
+    if (total == 0) return;
+    restore_scale_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(rows, ld, n, total, scale);
+    check("restore_scale");
 }
 void moe_sort(const int* ids, int T, int n_used, int n_exp, int* bounds, int* tok, int* row_of, cudaStream_t s,
               const int* slot, float* w, int n_slots) {

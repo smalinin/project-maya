@@ -87,10 +87,14 @@ def is_mtp(g: Gguf) -> bool:
 
 
 DFLY_ARCH = ARCH + "_dfly"
+FULL_DFLY_ARCH = FULL_ARCH + "_dfly2"
 DFLY_PREFIX = "model.dfly_layers."
 
 
-def is_drafter(g: Gguf) -> bool:
+def is_drafter(g: Gguf, target: str = ARCH) -> bool:
+    if target == FULL_ARCH:
+        return g.kv.get("general.architecture") == FULL_DFLY_ARCH and \
+            g.kv.get(FULL_DFLY_ARCH + ".target_architecture") == FULL_ARCH
     return g.kv.get("general.type") == "drafter" and g.kv.get("general.architecture") == DFLY_ARCH
 
 
@@ -113,7 +117,7 @@ def find_shards(model: pathlib.Path, names: list | None) -> list:
             arch, kind = g.kv.get("general.architecture"), g.kv.get("general.type")
             if (arch is None or arch in PROJECTORS) and kind in (None, "model"):
                 gs.append(g)
-            elif not is_mtp(g) and not is_drafter(g):   # (the MTP block's own file, the drafter's: find_mtp's, find_drafter's)
+            elif not is_mtp(g) and not is_drafter(g) and not is_drafter(g, FULL_ARCH):
                 print("%s: %s / %s, not a shard of the model, left out" % (p.name, arch, kind))
         if not gs:
             raise SystemExit("%s: no Hy4 or Hy4-Flash model .gguf files" % model)
@@ -329,17 +333,17 @@ def find_mtp(model: pathlib.Path, arg: str | None) -> Gguf | None:
     return cands[0]
 
 
-def find_drafter(model: pathlib.Path, arg: str | None) -> Gguf | None:
-    """The DFly2 drafter's file: --drafter's, else the folder's one GGUF of general.type "drafter" (None: none)."""
+def find_drafter(model: pathlib.Path, arg: str | None, target: str = ARCH) -> Gguf | None:
+    """Read the selected DFly2 file, or discover a single compatible drafter beside the model."""
     if arg == "none":
         return None
     if arg:
         p = pathlib.Path(arg).expanduser()
         p = p if p.is_absolute() else (model / p if (model / p).exists() else p.resolve())
         cands = [Gguf(p)]
-        if not is_drafter(cands[0]):
+        if not is_drafter(cands[0], target):
             raise SystemExit("%s: not a %s drafter's file (general.type %r, general.architecture %r)" %
-                             (arg, ARCH, cands[0].kv.get("general.type"), cands[0].kv.get("general.architecture")))
+                             (arg, target, cands[0].kv.get("general.type"), cands[0].kv.get("general.architecture")))
     else:
         cands = []
         for p in sorted(list(model.glob("*.gguf")) + list(model.glob("*.dfly2"))):   # (the Hub's name: .dfly2)
@@ -347,7 +351,7 @@ def find_drafter(model: pathlib.Path, arg: str | None) -> Gguf | None:
                 g = Gguf(p)
             except (Exception, SystemExit):  # noqa: BLE001 - not a GGUF this reader takes: not the drafter's file
                 continue
-            if is_drafter(g):
+            if is_drafter(g, target):
                 cands.append(g)
     if len(cands) > 1:
         raise SystemExit("%s: %d drafter files (name one with --drafter)" % (model, len(cands)))
@@ -362,7 +366,8 @@ def find_drafter(model: pathlib.Path, arg: str | None) -> Gguf | None:
 def drafter_geometry(d: Gguf, geo: dict) -> dict:
     """hy4.txt's dfly_* lines from the drafter's keys and tensors.  Refused: a drafter of another model's shapes, one
     whose layers do not each read an indexed trunk layer's cache and picks, or of a layout maya-hy4 does not run."""
-    a, name = DFLY_ARCH + ".", d.path.name
+    full = geo.get("arch") == FULL_ARCH
+    a, name = (FULL_DFLY_ARCH if full else DFLY_ARCH) + ".", d.path.name
     kv = d.kv
     t = {n: (typ, dims) for n, typ, dims, _ in d.tensors}
     odd = [n for n in t if not n.startswith(DFLY_PREFIX)]
@@ -371,7 +376,10 @@ def drafter_geometry(d: Gguf, geo: dict) -> dict:
     n = int(kv.get(a + "block_count", 0))
     targets = [int(x) for x in (kv.get(a + "target_kv_layers") or [])]
     index = [int(x) for x in (kv.get(a + "target_index_layers") or targets)]
-    heads = int(kv.get(a + "attention.head_count", 0))
+    heads = int(kv.get(a + "attention.head_count", geo["heads"][0] if full else 0))
+    tokens = int(kv.get(a + "block_size", 0)) - 1 if full else int(kv.get(a + "num_speculative_tokens", 5))
+    if full and (int(kv.get(a + "target_index_top_k", 0)) != geo["ix_top_k"] or not 1 <= tokens <= 15):
+        raise SystemExit("%s: DFly2 block size or indexer top-k does not match this Hy4 runtime" % name)
     for k, want in (("embedding_length", geo["n_embd"]), ("attention.kv_lora_rank", geo["kv_lora"]),
                     ("attention.q_lora_rank", geo["q_lora"])):
         if int(kv.get(a + k, want)) != want:
@@ -413,7 +421,7 @@ def drafter_geometry(d: Gguf, geo: dict) -> dict:
     if not 0 <= mask < geo["n_vocab"] or heads < 1 or ff % 256:
         raise SystemExit("%s: mask token %d, %d heads, an FFN of %d - not a drafter maya-hy4 runs" % (name, mask, heads, ff))
     return {"dfly_layers": n, "dfly_heads": heads, "dfly_ff": ff, "dfly_targets": targets, "dfly_mask": mask,
-            "dfly_tokens": int(kv.get(a + "num_speculative_tokens", 5))}
+            "dfly_tokens": tokens}
 
 
 # the keys a trunk and its MTP block must agree on (the block's matrices have the trunk's shapes), and the per-block ones
@@ -539,7 +547,7 @@ def main() -> int:
                                      "none: text only)")
     ap.add_argument("--mtp", help="the MTP draft block's own GGUF, for a set without the block (default: the folder's "
                                   "file of general.type mtp; none: no drafts)")
-    ap.add_argument("--drafter", help="the DFly2 drafter's GGUF (default: the folder's file of general.type drafter; "
+    ap.add_argument("--drafter", help="the DFly2 drafter's GGUF (default: the folder's compatible DFly2 file; "
                                       "none: left out)")
     ap.add_argument("--engram-eps", type=float, help="the Engram norms' eps (default: the engine's, FP32's machine "
                     "epsilon; 0.0078125: the release run in BF16)")
@@ -555,8 +563,8 @@ def main() -> int:
     vis = find_mmproj(model, a.mmproj, PROJECTORS[arch])
     mtp = None
     if arch == FULL_ARCH:
-        if any(x not in (None, "none") for x in (a.mtp, a.drafter)):
-            raise SystemExit("hy_v4: external drafting is not supported")
+        if a.mtp not in (None, "none"):
+            raise SystemExit("hy_v4: use a compatible DFly2 drafter instead of an MTP block")
     elif int(kv.get("%s.nextn_predict_layers" % ARCH, 0)) == 0:
         mtp = find_mtp(model, a.mtp)
         if mtp is not None:
@@ -568,7 +576,7 @@ def main() -> int:
         if arch == FULL_ARCH and not any(geo["rope_sections"]):
             raise SystemExit("hy_v4_vl needs a text GGUF with IMRoPE sections")
         geo.update(vision_geometry(vis, kv["tokenizer.ggml.tokens"], geo["n_embd"]))
-    dfly = find_drafter(model, a.drafter) if arch == ARCH else None
+    dfly = find_drafter(model, a.drafter, arch)
     if dfly is not None:
         geo.update(drafter_geometry(dfly, geo))
     tensors, lines = {}, []

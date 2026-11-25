@@ -806,6 +806,7 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 HY4 = Q.MODEL["hy4"]                               # "Hy4-Flash" (its id: the installer record, --model)
 HY4_FULL = "Hy4"
 HY4_FULL_ARCH = "hy_v4"
+HY4_FULL_DFLY_ARCH = "hy_v4_dfly2"
 HY4_FULL_PROJECTOR = "hy_v4_vl"
 HY4_FULL_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 128000]
 HY4_SHOWN = Q.SHOWN["hy4"]
@@ -3892,6 +3893,11 @@ def review_candidate(path: Path, role: str, files: list[Path], family: str = "")
     return {"path": path, "anchor": anchor, "files": set(group) or {path}}
 
 
+def hy4_full_drafter(meta: dict) -> bool:
+    return meta.get("general.architecture") == HY4_FULL_DFLY_ARCH and \
+        meta.get(HY4_FULL_DFLY_ARCH + ".target_architecture") == HY4_FULL_ARCH
+
+
 def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
     """Quickly inspect filenames and GGUF/EXL3 type metadata; do not read sizes or SHA-256."""
     listing = [(path, real) for path, real, _ in MI.files_under(src)]
@@ -3900,7 +3906,7 @@ def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
     for path, _ in listing:
         role = review_role(path, src)
         suffix = path.suffix.lower()
-        if family == "hy4_full" and suffix in (".gguf", ".gguf_file"):
+        if family == "hy4_full" and suffix in (".gguf", ".gguf_file", ".dfly2"):
             from gguf_reader import GGUFFile
             try:
                 meta = GGUFFile(path).metadata
@@ -3908,6 +3914,8 @@ def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
                 continue
             if meta.get("clip.projector_type") == HY4_FULL_PROJECTOR:
                 found["vision"].append(review_candidate(path, "vision", files))
+            elif hy4_full_drafter(meta):
+                found["drafter"].append(review_candidate(path, "drafter", files))
             elif meta.get("general.architecture") == HY4_FULL_ARCH and meta.get("general.type") in (None, "model") and \
                     meta.get("split.no", 0) == 0 and shard_set(path)[0] == path:
                 found["model"].append(review_candidate(path, "model", files, family))
@@ -4312,10 +4320,14 @@ def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
                 if embedded_mtp and draft_kind == "mtp":
                     raise ValueError("this model has built-in MTP; choose None or a DFly2 drafter")
         elif full_hy4:
-            if drafter:
-                raise ValueError("Hy4 currently runs without a draft model; choose None")
             if any(g.metadata.get("split.no", i) != i for i, g in enumerate(ggufs)):
                 raise ValueError("the GGUF parts have inconsistent shard numbers")
+            if drafter:
+                meta = GGUFFile(drafter).metadata
+                if not hy4_full_drafter(meta) or \
+                        meta.get(HY4_FULL_DFLY_ARCH + ".embedding_length") != base.get(HY4_FULL_ARCH + ".embedding_length"):
+                    raise ValueError(f"{drafter.name}: select the matching Hy4 DFly2 GGUF")
+                draft_kind = "dfly2"
         else:
             if arch == "inkling2_loop":
                 raise ValueError("this maya-ik2 uses the Unsloth inkling2 layout; choose the GGUF outside Mainline_Support")
@@ -11404,13 +11416,18 @@ def hy4_pack_dfly2_file(pack: Path) -> str | None:
     try:
         if not any(ln.split()[:1] == ["dfly_layers"] for ln in (pack / "hy4.txt").read_text(encoding="utf-8").splitlines()):
             return None
+        files = {}
+        fallback = None
         with (pack / "tensors.txt").open(encoding="utf-8") as f:
             for ln in f:
-                if not ln.startswith("file "):
-                    break
-                n = Path(ln.split(None, 2)[2].strip()).name
-                if n.endswith(".dfly2") or "drafter" in n.lower():
-                    return n
+                if ln.startswith("file "):
+                    _, index, name = ln.split(None, 2)
+                    files[index] = Path(name.strip()).name
+                    if files[index].endswith(".dfly2") or "drafter" in files[index].lower():
+                        fallback = files[index]
+                elif ln.startswith("t model.dfly_layers."):
+                    return files.get(ln.split()[3])
+        return fallback
     except (OSError, IndexError):
         pass
     return None
@@ -11727,7 +11744,7 @@ def set_up_hy4_local(a, prev: dict, local: dict) -> Path:
     step(7, "images and drafting")
     pictures = local["vision"] is not None and not a.no_vision
     how = getattr(a, "drafting", None)
-    can_dfly = dfly is not None and len(pc["gpus"]) == 1
+    can_dfly = dfly is not None and (full or len(pc["gpus"]) == 1)
     drafter = "dfly2" if can_dfly and how != "mtp" else "mtp"
     drafting = how != "off" and (can_dfly if drafter == "dfly2" else has_mtp and how != "dfly2")
     if dfly and not can_dfly:
@@ -11746,9 +11763,10 @@ def set_up_hy4_full(a, prev: dict) -> Path | None:
         if not src.is_dir():
             fail(f"{src} is not a directory with Hy4 GGUF files")
         candidates = review_candidates(src, "hy4_full")
-        if len(candidates["model"]) != 1 or (len(candidates["vision"]) > 1 and not a.no_vision):
+        if len(candidates["model"]) != 1 or len(candidates["drafter"]) > 1 or \
+                (len(candidates["vision"]) > 1 and not a.no_vision):
             if a.yes:
-                fail(f"{src}: need one Hy4 GGUF set and at most one matching projector")
+                fail(f"{src}: need one Hy4 GGUF set and at most one matching drafter and projector")
             local = review_downloaded_model(a, src, models, "hy4_full")
         else:
             chosen = {role: options[0] if options else None for role, options in candidates.items()}

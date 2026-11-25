@@ -108,9 +108,24 @@ struct CpuExperts {
     // (0: g_stride / d_stride) the step from one expert's matrix to the next's - the GPU fetch's RAM store, where an
     // expert's three matrices lie side by side in one blob (gate, up, down at its offsets): the blob's bytes
     size_t step = 0;
-    const uint8_t* G(size_t e) const { return gate + e * (step ? step : g_stride); }
-    const uint8_t* U(size_t e) const { return up + e * (step ? step : g_stride); }
-    const uint8_t* D(size_t e) const { return down + e * (step ? step : d_stride); }
+    const uint8_t* packed = nullptr;
+    const int* packed_slots = nullptr;
+    size_t packed_stride = 0, packed_up = 0, packed_down = 0;
+    const uint8_t* packed_expert(size_t e) const {
+        return packed && packed_slots[e] >= 0 ? packed + (size_t) packed_slots[e] * packed_stride : nullptr;
+    }
+    const uint8_t* G(size_t e) const {
+        const uint8_t* p = packed_expert(e);
+        return p ? p : gate + e * (step ? step : g_stride);
+    }
+    const uint8_t* U(size_t e) const {
+        const uint8_t* p = packed_expert(e);
+        return p ? p + packed_up : up + e * (step ? step : g_stride);
+    }
+    const uint8_t* D(size_t e) const {
+        const uint8_t* p = packed_expert(e);
+        return p ? p + packed_down : down + e * (step ? step : d_stride);
+    }
     float limit = 0.0f;
     std::shared_ptr<Q4xSet> q4x;         // (null: no copies for this layer)
     size_t q4x_gu = 0, q4x_d = 0;        // the form's bytes of an expert's gate (= up) matrix, its down matrix

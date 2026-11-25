@@ -859,8 +859,11 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         }();
         const bool alone = r.ids.size() - from > 1 && last_alone;
         const size_t body = alone ? r.ids.size() - 1 : r.ids.size();
+        const int batch = m.prompt_batch() / C;
         for (size_t a = from; a < r.ids.size();) {
-            const int T = (int) std::min<size_t>((size_t) C, (a < body ? body : r.ids.size()) - a);
+            const size_t pending = (a < body ? body : r.ids.size()) - a;
+            const size_t blocks = std::min((size_t) batch, pending / C);
+            const int T = blocks > 1 ? (int) blocks * C : (int) std::min<size_t>((size_t) C, pending);
             const bool last = a + (size_t) T == r.ids.size();
             if (!m.forward(r.ids.data() + a, T, (int64_t) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
                 ok = false;
@@ -1254,7 +1257,7 @@ int encode_alone(const hy4::Options& o, const std::string& rgb_path, const std::
 }
 
 // ---- --drafting auto / on: the drafting this PC runs fastest, measured once and remembered -------------------------
-// Each choice - no drafting (auto only), the MTP block, the DFly2 drafter (one GPU; on more only by hand, --dfly2) -
+// Each choice - no drafting (auto only), the MTP block, or DFly2 (Hy4 split across GPUs, Hy4-Flash on one GPU) -
 // is loaded on its own with its own plan (only the drafter it runs has room: without one the routed experts get all
 // of it) and times a greedy decode: HY4_DRAFT_ROUNDS (3) prompts of HY4_DRAFT_PROMPT (512) tokens from the measured
 // text (HY4_MEASURE_IDS - the server's: this install's docs in the model's tokens), each answered for HY4_DRAFT_TOKENS
@@ -1374,13 +1377,14 @@ bool line_put(const std::string& file, const std::string& key, const std::string
     return std::rename(tmp.c_str(), file.c_str()) == 0;
 }
 
-// the drafters a pack names in its hy4.txt (1 the MTP block, 2 the DFly2 drafter) - before any load
+// The drafters and layout in hy4.txt. Bit 4 marks Hy4, which can split DFly2 over GPUs.
 int pack_has_drafters(const std::string& pack) {
     std::ifstream f(pack + "/hy4.txt");
     int bits = 0;
     for (std::string line; f && std::getline(f, line);) {
         if (line.rfind("n_mtp ", 0) == 0 && std::atoi(line.c_str() + 6) > 0) bits |= 1;
         if (line.rfind("dfly_layers ", 0) == 0 && std::atoi(line.c_str() + 12) > 0) bits |= 2;
+        if (line == "arch hy_v4") bits |= 4;
     }
     return bits;
 }
@@ -1559,9 +1563,8 @@ bool pick_drafting(hy4::Options& o, const std::string& how, const std::string& a
         o.mtp = c == 1;
         o.dfly2 = c == 2;
     };
-    // (the choices: no drafting - not with --drafting on -, the MTP block, the DFly2 drafter on one GPU)
     const int bits0 = pack_has_drafters(o.pack), ngpu0 = hy4::gpus_of(o);
-    bool cand[3] = {!on, (bits0 & 1) != 0, (bits0 & 2) != 0 && ngpu0 <= 1};
+    bool cand[3] = {!on, (bits0 & 1) != 0, (bits0 & 2) != 0 && ((bits0 & 4) != 0 || ngpu0 <= 1)};
     const int n_cand = (int) cand[0] + (int) cand[1] + (int) cand[2];
     if (n_cand <= 1) {   // (nothing to choose between: the one there is)
         const int c = cand[1] ? 1 : cand[2] ? 2 : 0;

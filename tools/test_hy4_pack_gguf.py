@@ -561,17 +561,24 @@ def indexed(root: pathlib.Path) -> pathlib.Path:
                           a("attention.indexer.types"): (9, (7, [True, False, True, True]))})
 
 
-def drafter(path: pathlib.Path, targets=(0, 2), kv_over: dict | None = None, t_over: dict | None = None) -> pathlib.Path:
+def drafter(path: pathlib.Path, targets=(0, 2), kv_over: dict | None = None, t_over: dict | None = None,
+            *, full: bool = False) -> pathlib.Path:
     """A drafter's file for model()'s shapes (q_lora 128, kv_lora 64, keys of 96 = 64 + 32 rope, values of 64): a draft
     layer a target.  kv_over: keys replaced (None: left out); t_over: a tensor's dims replaced (None: left out)."""
-    a = lambda k: DFLY + "." + k  # noqa: E731
+    arch, heads = ("hy_v4_dfly2", 64) if full else (DFLY, DH)
+    a = lambda k: arch + "." + k  # noqa: E731
     n = len(targets)
-    kv = {"general.architecture": (8, DFLY), "general.type": (8, "drafter"),
+    kv = {"general.architecture": (8, arch), "general.type": (8, "drafter"),
           a("block_count"): (4, n), a("embedding_length"): (4, D), a("mask_token_id"): (4, MASK),
           a("num_speculative_tokens"): (4, 5), a("mtp_fusion"): (8, "slot0"), a("hidden_correction"): (7, True),
           a("target_index_layers"): (9, (5, list(targets))), a("target_kv_layers"): (9, (5, list(targets))),
           a("attention.head_count"): (4, DH), a("attention.kv_lora_rank"): (4, 64),
           a("attention.q_lora_rank"): (4, 128)}
+    if full:
+        for k in ("general.type", a("attention.head_count"), a("num_speculative_tokens")):
+            del kv[k]
+        kv.update({a("target_architecture"): (8, "hy_v4"), a("block_size"): (4, 7),
+                   a("target_index_top_k"): (4, 2048)})
     for k, v in (kv_over or {}).items():
         if v is None:
             kv.pop(a(k), None)
@@ -581,10 +588,10 @@ def drafter(path: pathlib.Path, targets=(0, 2), kv_over: dict | None = None, t_o
     t = []
     for i in range(n):
         q = "%s%d.self_attn." % (p, i)
-        t += [(q + "q_a_proj.weight", 30, [D, 128]), (q + "q_b_proj.weight", 30, [128, DH * 96]),
-              (q + "kv_a_proj_with_mqa.weight", 8, [D, 64 + 32]), (q + "kv_b_proj.weight", 30, [64, DH * (64 + 64)]),
-              (q + "linear_gate.weight", 30, [D, DH * 64]), (q + "o_proj.weight", 12, [DH * 64, D]),
-              (q + "learnable_sink_param", 0, [DH]), ("%s%d.mlp.up_proj.weight" % (p, i), 12, [D, DFF])]
+        t += [(q + "q_a_proj.weight", 30, [D, 128]), (q + "q_b_proj.weight", 30, [128, heads * 96]),
+              (q + "kv_a_proj_with_mqa.weight", 8, [D, 64 + 32]), (q + "kv_b_proj.weight", 30, [64, heads * (64 + 64)]),
+              (q + "linear_gate.weight", 30, [D, heads * 64]), (q + "o_proj.weight", 12, [heads * 64, D]),
+              (q + "learnable_sink_param", 0, [heads]), ("%s%d.mlp.up_proj.weight" % (p, i), 12, [D, DFF])]
     t += [(p + "mtp_fusion.eh_proj.weight", 30, [2 * D, D]), (p + "mtp_fusion.gate", 0, [D]),
           (p + "final_norm.weight", 0, [D]), (p + "hidden_correction.gate_proj.weight", 30, [2 * D, D]),
           (p + "hidden_correction.down_proj.weight", 30, [D, D])]
@@ -649,6 +656,19 @@ class DrafterFileTest(unittest.TestCase):
                  "--drafter", self.NAME)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.read()[0]["dfly_targets"], "0,2")
+
+    def test_full_model_drafter_block_metadata(self):
+        self.root = model(self.root.parent / "full", full=True)
+        name = "Hy4-DFly2-BF16.gguf"
+        drafter(self.root / name, full=True)
+        got = pack(self.root)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        geo, files, _ = self.read()
+        self.assertEqual((geo["dfly_tokens"], geo["dfly_heads"], geo["dfly_targets"], files[2]), ("6", "64", "0,2", name))
+        drafter(self.root / name, full=True, kv_over={"target_index_top_k": (4, 4096)})
+        self.refused("indexer top-k does not match")
+        drafter(self.root / name, targets=(0, 1), full=True)
+        self.refused("target layer 1 is no indexed layer")
 
     def test_left_out(self):
         """A set without a drafter's file, and --drafter none beside one: the same pack, no dfly_ line."""
