@@ -34,7 +34,7 @@ Adds interactive setup for downloaded GGUF models, including directory/file brow
 
 - [unsloth/Inkling-2-Mini -- Q8_0](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
 
-- [unsloth/Inkling-2-Small -- IQ3_XXS](https://huggingface.co/unsloth/Inkling-2-Small-GGUF)
+- [unsloth/Inkling-2-Small -- IQ3_XXS](https://huggingface.co/unsloth/Inkling-2-Small-GGUF) - drafter >> [DSpark -- Q5_K-Mixed](https://huggingface.co/smalinin/Inkling-2-Small-dspark-GGUF)
 
 
 - [Xylolabs/Hy4 -- IQ3_S](https://huggingface.co/Xylolabs/Hy4-GGUF) - drafter >> [Dfly2 -- Q5_K-Mixed](https://huggingface.co/smalinin/Hy4-DFly2-GGUF)
