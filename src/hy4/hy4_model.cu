@@ -753,8 +753,9 @@ struct Model::Impl {
     // 1.5 used, a third more VRAM and work; over 5 units: two thirds).  HY4_TP_EXPERTS=slices|unsplit: one way.
     std::vector<char> tp_unsplit;
     std::vector<int> tp_own;
-    // Each unit's capacity when the plan assigns whole experts by free VRAM, most routed first. Member 0's CPU lane
-    // computes the remaining experts during decode. For a prompt the members stream their shares over PCIe.
+    // ... and where the members do not hold every expert: tp_cap[member] of each layer's experts each (the plan's, by
+    // its VRAM), the most routed first; the others no member's (tp_own below 0): member 0's CPU lane computes them for
+    // a token, and a prompt chunk's go over PCIe as on the layer split, a share of them to each member's GPU
     std::vector<int> tp_cap;
     const std::vector<Layer>& lane_layers() const { return tp > 1 ? TL[0] : L; }
     std::vector<Layer>& lane_layers() { return tp > 1 ? TL[0] : L; }
@@ -812,11 +813,11 @@ struct Model::Impl {
                 for (int c : left) open += c > 0;
                 for (int r = 0; r < g.n_expert; ++r) {
                     int u = -1;
-                    for (int t = 0; t < U && open > 0 && u < 0; ++t, m = (m + 1) % U)
+                    for (int t = 0; t < tp && open > 0 && u < 0; ++t, m = (m + 1) % tp)
                         if (left[(size_t) m] > 0) u = m;
                     if (u >= 0) {
                         if (--left[(size_t) u] == 0) --open;
-                        m = (u + 1) % U;
+                        m = (u + 1) % tp;
                     }
                     // (no member's: -1 - the member that sends it to its GPU for a prompt chunk, in turn)
                     tp_own[(size_t) il * g.n_expert + (size_t) order[(size_t) r]] = u >= 0 ? u : -1 - (none++ % tp);
@@ -1925,13 +1926,9 @@ struct Model::Impl {
             *bucket += bytes;
         }
     }
-    double dfly_plan_bytes(bool tensor_parallel = false) const {
+    double dfly_plan_bytes() const {
         if (!df_room || pk.num("dfly_layers") < 1) return 0;
-        if (g.full) {
-            // With TP the head reads its own copy of every target cache. For a layer split, dense_bytes counts those layers.
-            return (double) (tensor_parallel ? std::accumulate(df.layer_plan.begin(), df.layer_plan.end(), df.head_plan)
-                                             : df.head_plan);
-        }
+        if (g.full) return (double) df.head_plan;   // the other devices' shares are in dense_bytes
         double file = 0;
         const std::string pre = "model.dfly_layers.";
         for (const auto& [n, t] : pk.t)
@@ -1952,9 +1949,7 @@ struct Model::Impl {
     }
     // the drafters' room on the head's GPU: one drafter at a time (--mtp or --dfly2), so the larger of the two the plan
     // counts - with either of them on, or none, the plan is the same
-    double draft_plan_bytes(bool tensor_parallel = false) const {
-        return std::max(mtp_plan_bytes(), dfly_plan_bytes(tensor_parallel));
-    }
+    double draft_plan_bytes() const { return std::max(mtp_plan_bytes(), dfly_plan_bytes()); }
     bool plan(std::string& err) {
         int ndev = 0;
         CK(cudaGetDeviceCount(&ndev));
@@ -2612,21 +2607,11 @@ struct Model::Impl {
             cand.clear();
             for (size_t i = 0; i < devs.size(); ++i) cand.push_back((int) i);
         }
-        // Full Hy4's head and DFly2 use the first member's complete KV cache and scratch.
-        std::stable_partition(cand.begin(), cand.end(), [&](int i) { return g.full ? i == main_gi : i != main_gi; });
+        std::stable_partition(cand.begin(), cand.end(), [&](int i) { return i != main_gi; });
         mem.assign(cand.begin(), cand.begin() + N);
         head_gpu = main_gi;
         if (std::find(mem.begin(), mem.end(), main_gi) != mem.end()) {
             std::stable_partition(mem.begin(), mem.end(), [&](int i) { return i == main_gi; });
-        }
-        if (g.full && head_gpu != mem[0]) {
-            if (o.main_gpu >= 0) {
-                err = "Hy4 tensor parallel: --main-gpu must be a member of the group";
-                return false;
-            }
-            head_gpu = mem[0];
-            free_b[(size_t) main_gi] += vis_keep;
-            free_b[(size_t) head_gpu] -= vis_keep;
         }
         cudaDeviceProp p0{};
         CK(cudaGetDeviceProperties(&p0, devs[(size_t) mem[0]]));
@@ -2658,7 +2643,7 @@ struct Model::Impl {
         const Tensor* ot0 = pk.get("output.weight");
         double head_b0 = (ot0 ? (double) ot0->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                          (double) ring * g.n_embd * 4;
-        head_b0 += draft_plan_bytes(true);
+        head_b0 += draft_plan_bytes();
         if (own) head_b0 += (double) scratch_bytes();   // (the MTP pass's own scratch: a whole chunk's buffers)
         double exp_all = 0;   // (every routed expert's bytes)
         for (const auto& [n, t] : pk.t)
@@ -2675,13 +2660,6 @@ struct Model::Impl {
             h.gi = (int) i;
             h.w = he ? std::atoi(he) : std::max(1, (int) std::lround(G[i].bw / std::max(1.0, bw_mem)));
             hel.push_back(h);
-        }
-        const auto helper_candidates = g.full && lane ? hel : std::vector<Helper>{};
-        if (g.full) {
-            const double sum_b = f16_sums ? (double) Tc * (4.0 * g.n_embd + 8) : 0;
-            const double route_b = hel.empty() ? 0 : (double) Tc * 2 * (g.n_lat + 32) * sizeof(float);
-            for (int i : mem) free_b[(size_t) i] -= sum_b + route_b;
-            for (const Helper& h : hel) free_b[(size_t) h.gi] -= sum_b + route_b;
         }
         for (;;) {   // (the units, and each helper's VRAM for its share)
             U = N;
@@ -2710,18 +2688,6 @@ struct Model::Impl {
                                           "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
                                           "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
             const std::string pre = "blk." + std::to_string(il) + ".";
-            const bool dense = il < g.n_dense_lead;
-            const int heads = g.heads[(size_t) il], width = dense ? g.n_ff : g.n_ff_exp * g.n_shared;
-            double head_share = 1.0 / N, ff_share = head_share;
-            if (g.full) {
-                if (heads > 0) head_share = (double) ((heads + N - 1) / N) / heads;
-                const Tensor* down = pk.get(pre + (dense ? "ffn_down.weight" : "ffn_down_shexp.weight"));
-                if (width > 0 && down && iq::block_values(type_id(down->type)) > 0) {
-                    int first, last;
-                    width_part(width, type_id(down->type), N - 1, N, first, last);
-                    ff_share = (double) (last - first) / width;
-                }
-            }
             double b = 0;
             for (const auto& [n, t] : pk.t) {
                 if (n.compare(0, pre.size(), pre) != 0) continue;
@@ -2730,15 +2696,10 @@ struct Model::Impl {
                 bool sp = false;
                 for (const char* x : split) sp |= rest == x;
                 const bool half = rest == "ffn_gate_inp.weight" && narrowable(n);   // (kept as BF16: mat_narrow)
-                double weight = (double) t.bytes;
-                if (half) weight *= 0.5;
-                else if (g.full && t.type == "BF16") weight *= 2;
-                const double share = rest.compare(0, 5, "attn_") == 0 ? head_share : ff_share;
                 b += ex ? (experts ? (double) t.bytes * expert_share(il, 1) * 1.02 + 4096 : 0.0)
-                        : sp ? weight * share * 1.02 + 4096 : weight + 256;
+                        : sp ? (double) t.bytes / N * 1.02 + 4096 : (double) t.bytes * (half ? 0.5 : 1.0) + 256;
             }
-            if (g.full) b += (double) o.max_ctx * kv_rb() + full_index_bytes(il);
-            else if (g.swa[(size_t) il]) b += (double) ring * kv_rb();
+            if (g.swa[(size_t) il]) b += (double) ring * kv_rb();
             else
                 b += (double) ix_rows_bytes() + (double) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
                      (double) ring * 2 * g.ix_dim * pool_b();
@@ -2749,7 +2710,7 @@ struct Model::Impl {
         const Tensor* ot = pk.get("output.weight");
         double head_b = (ot ? (double) ot->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                         (double) ring * g.n_embd * 4;
-        head_b += draft_plan_bytes(true);
+        head_b += draft_plan_bytes();
         if (own) head_b += (double) scratch_bytes();
         head_tp = false;
         {   // (the head's rows over the members too, where their VRAM holds a share: HY4_TP_HEAD=0: the head's GPU alone)
@@ -2777,7 +2738,7 @@ struct Model::Impl {
         bool fits = true;
         for (int i : mem) fits = fits && need <= free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0);
         const char* ee = std::getenv("HY4_TP_EXPERTS");
-        if (!fits && lane && (hel.empty() || g.full) && !(ee && !std::strcmp(ee, "slices"))) {
+        if (!fits && lane && hel.empty() && !(ee && !std::strcmp(ee, "slices"))) {
             // every member's own parts, one expert of every layer, the prompts' staging slots
             double fixed = 0, one = 0, stage = 0;
             for (int il = 0; il < g.n_layer; ++il) {
@@ -2803,20 +2764,6 @@ struct Model::Impl {
                 cap[(size_t) j] = std::min(g.n_expert, (int) std::floor(room / std::max(1.0, one)));
                 total += cap[(size_t) j];
             }
-            if (g.full) {
-                hel.clear();
-                U = N;
-                for (Helper h : helper_candidates) {
-                    const double room = std::max(0.0, free_b[(size_t) h.gi]);
-                    const int n = std::min(g.n_expert, (int) std::floor(room / std::max(1.0, one)));
-                    if (n == 0) continue;
-                    h.w = 1;
-                    h.unit0 = U++;
-                    hel.push_back(h);
-                    cap.push_back(n);
-                    total += n;
-                }
-            }
             // (--tp auto: where the members hold less than half of the experts the layer split is taken as before)
             if (total * 2 < g.n_expert && o.tp < 0) {
                 char buf[320];
@@ -2827,6 +2774,7 @@ struct Model::Impl {
             }
             tp_cap = cap;
             fits = true;
+            need = fixed + one * *std::max_element(cap.begin(), cap.end());
         }
         for (int i : mem) {
             const double have = free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0);
@@ -3043,14 +2991,9 @@ struct Model::Impl {
                       node >= 0 ? (" (NUMA node " + std::to_string(node) + ")").c_str() : "");
         info.push_back(buf);
         for (const Helper& h : hel) {
-            if (!tp_cap.empty()) {
-                std::snprintf(buf, sizeof buf, "INFO tensor parallel: GPU %d holds %d routed experts per MoE layer",
-                              G[(size_t) h.gi].dev, tp_cap[(size_t) h.unit0]);
-            } else {
-                std::snprintf(buf, sizeof buf, "INFO tensor parallel: GPU %d computes %d of every %d slices of the routed "
-                              "experts (its memory %.0f GB/s, a member's %.0f)", G[(size_t) h.gi].dev, h.w, U,
-                              G[(size_t) h.gi].bw, G[(size_t) mem[0]].bw);
-            }
+            std::snprintf(buf, sizeof buf, "INFO tensor parallel: GPU %d computes %d of every %d slices of the routed "
+                          "experts (its memory %.0f GB/s, a member's %.0f)", G[(size_t) h.gi].dev, h.w, U,
+                          G[(size_t) h.gi].bw, G[(size_t) mem[0]].bw);
             info.push_back(buf);
         }
         return true;
@@ -3370,8 +3313,8 @@ struct Model::Impl {
     // bits.  (With q8f: the side chain reads xf's rows from the mix's second copy.)  HY4_FFN_FORK=0: one chain, as before
     const bool ffn_fork_on = !(std::getenv("HY4_FFN_FORK") && std::getenv("HY4_FFN_FORK")[0] == '0');
     bool ffn_forks(const Layer& l, const Gpu& gp, int T) const {
-        return !g.full && ffn_fork_on && q8f(T) && l.tpm >= 0 && !l.dense && model_sum && gp.s4 != nullptr &&
-               gp.evf != nullptr && !l.partial() && fx.mode == 0 && o.profile_out.empty() && !check_tp;
+        return ffn_fork_on && q8f(T) && l.tpm >= 0 && !l.dense && model_sum && gp.s4 != nullptr && gp.evf != nullptr &&
+               !l.partial() && fx.mode == 0 && o.profile_out.empty() && !check_tp;
     }
     const bool logit_hash = std::getenv("HY4_LOGIT_HASH") != nullptr;
     uint64_t lh_sum = 1469598103934665603ull;
@@ -3691,7 +3634,7 @@ struct Model::Impl {
             err = p + ": routed experts the helper's kernels do not take";
             return false;
         }
-        if (model_sum && !g.full && !mat(gp, p + "ffn_routed_up.weight", l.rup, err, g.n_lat, g.n_embd)) return false;
+        if (model_sum && !mat(gp, p + "ffn_routed_up.weight", l.rup, err, g.n_lat, g.n_embd)) return false;
         return expert_slices(l, gp, err, unit, U, pk.data(*tg), pk.data(*tu), pk.data(*td), w);
     }
     // A tensor-parallel member's slices of the layer's routed experts: block j of expert e's width (a block of the down
@@ -3948,12 +3891,11 @@ struct Model::Impl {
         }
         g = pk.g;
         if (g.full) {
-            if (o.kv_streaming > 0 || o.mtp) {
-                err = "Hy4 requires resident KV and uses DFly2 for drafting.";
+            if (o.tp > 1 || o.kv_streaming > 0 || o.mtp) {
+                err = "Hy4 uses a layer split and resident KV. Use DFly2 for drafting.";
                 return false;
             }
-            if (o.tp < 0) o.tp = 0;
-            model_sum = true;
+            o.tp = 0;
             o.kv_streaming = 0;
             if (o.dfly2) dfly_full_plan();
         }
@@ -4134,8 +4076,7 @@ struct Model::Impl {
             // pictures' size, the dense prompt span, KV streaming, the GPUs' layout, or whether the start fits - its
             // room is not counted and it is not loaded: with its drafts the answers would differ from without (an 8 GB
             // card at 8K: the DFly2 drafter's 0.7 GB put the cache in 8-bit rows; the MTP block's 3.95 GB did so on
-            // larger cards). Hy4 DFly2 uses the target layers' caches, on the layer split or the first TP member.
-            // Hy4-Flash DFly2 needs the head and its target layers together in a layer split.
+            // larger cards). Hy4 DFly2 follows the layer split; Hy4-Flash DFly2 needs the head and its target layers together.
             struct Sum {
                 bool ok;
                 int tp, chunk, span;
@@ -4645,7 +4586,7 @@ struct Model::Impl {
         // (Model::load starts them then)
         //  (a drafting trial: the lane as a start finds it before its copies are made - neither, and no files)
         if (lane && !o.trial && !fetch_setup(err)) return false;
-        if (g.full && tp <= 1 && lane && !o.trial && !fx.layers && !prompt_ram_setup(err)) return false;
+        if (g.full && lane && !o.trial && !fx.layers && !prompt_ram_setup(err)) return false;
         if (lane && !o.trial && fx.mode != 1 && !fetch_pending()) q4x_start();
         if (lane && !fetch_pending()) route_start();
         st.experts_vram = n_res;
@@ -5364,8 +5305,7 @@ struct Model::Impl {
                     err = "Hy4: sparse indexer failed at layer " + std::to_string(l.il);
                     return false;
                 }
-                // The first TP member owns the draft lists. A staggered prompt keeps the last row of its second half.
-                const int target = df.on && tpm <= 0 && (!gp.defer || gp.half == 1) ? df.slot(l.il) : -1;
+                const int target = df.on ? df.slot(l.il) : -1;
                 if (target >= 0 && !dfly_snap(target, gp, T, err)) return false;
                 part(gp, "attn: Hy4 indexer", T);
             }
@@ -7462,12 +7402,11 @@ struct Model::Impl {
             dbg("ffn_moe_out", l.il, gp, gp.latout, T, lat);
             if (inject) ref_cmp("ffn_moe_out", l.il, gp, gp.latout, (size_t) T * lat, T);
             if (l.tpm >= 0 && model_sum) {   // (HY4_TP_MODEL_SUM=1: each member's own up-projection, summed after)
-                if (g.full) CK(cudaMemcpyAsync(gp.y, gp.latout, sizeof(float) * T * E, cudaMemcpyDeviceToDevice, s));
-                else ok = ok && mm(gp, l.rup, gp.latout, lat, T, gp.y, E, 1.0f, lat_pre && T <= W);
+                ok = ok && mm(gp, l.rup, gp.latout, lat, T, gp.y, E, 1.0f, lat_pre && T <= W);
                 if (!forked) {   // (forked: the shared expert is the side chain's, done before the experts)
                     const bool hd_pre = k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s,
                                                   q8o(f8 && l.sh_down.k == sf, gp.xq, gp.xd));
-                    ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E, 1.0f, hd_pre, g.full);
+                    ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E, 1.0f, hd_pre);
                 }
                 // (the token path, q8f: the shared expert's part goes out added to the routed one's - the sum that
                 //  comes back replaces gp.y, so the add needs no launch of its own)
@@ -7989,19 +7928,15 @@ struct Model::Impl {
         }
         // (a layout the drafter does not run in yet: no drafts, said so - the model itself is unchanged)
         std::string why;
-        if (tp > 1 && !g.full) {
-            info.push_back("INFO the Hy4-Flash DFly2 drafter is off with tensor parallel: decoding without drafts");
-            return true;
-        }
-        const auto& trunk = tp > 1 ? TL[0] : L;
+        if (tp > 1) why = "tensor parallel";
         for (int i = 0; i < df.n; ++i) {
             const int il = df.tgt[(size_t) i];
-            if (il < 0 || il >= g.n_layer || !trunk[(size_t) il].ix || trunk[(size_t) il].ring != 0 || df.slot(il) != i) {
+            if (il < 0 || il >= g.n_layer || !L[(size_t) il].ix || L[(size_t) il].ring != 0 || df.slot(il) != i) {
                 err = "--dfly2: the drafter reads layer " + std::to_string(il) + ", which is no indexed layer of this model";
                 return false;
             }
-            if (!g.full && why.empty() && trunk[(size_t) il].gpu != head_gpu)
-                why = "layer " + std::to_string(il) + " on GPU " + std::to_string(G[(size_t) trunk[(size_t) il].gpu].dev) +
+            if (!g.full && why.empty() && L[(size_t) il].gpu != head_gpu)
+                why = "layer " + std::to_string(il) + " on GPU " + std::to_string(G[(size_t) L[(size_t) il].gpu].dev) +
                       ", the head on GPU " + std::to_string(hg.dev);
         }
         if (!why.empty()) {
@@ -8019,7 +7954,7 @@ struct Model::Impl {
         df.lists.resize((size_t) df.n);
         for (int i = 0; i < df.n; ++i) {
             Layer& l = df.L[(size_t) i];
-            const Layer& target = trunk[(size_t) df.tgt[(size_t) i]];
+            const Layer& target = L[(size_t) df.tgt[(size_t) i]];
             Gpu& gp = G[(size_t) target.gpu];
             CK(cudaSetDevice(gp.dev));
             const std::string p = top + std::to_string(i) + ".", a = p + "self_attn.";
@@ -9059,7 +8994,7 @@ struct Model::Impl {
     // the FFN's partials summed in the model's space - each member's (and helper's) routed sum projected up by
     // ffn_routed_up first: a third less to send than [the latent sum | the shared expert's], the same projections
     // (HY4_TP_LATENT_SUM=1: the latent sum, projected after)
-    bool model_sum = std::getenv("HY4_TP_LATENT_SUM") == nullptr;
+    const bool model_sum = std::getenv("HY4_TP_LATENT_SUM") == nullptr;
     const bool check_tp = std::getenv("HY4_TP_CHECK") != nullptr;
     // (debugging only - the answers are no longer the model's: HY4_TP_SKIP_SUM the host adds nothing, HY4_TP_SKIP_COPY
     //  a chunk's partials and sums are not copied, only their counters - each bounds what that part costs)
@@ -9170,8 +9105,7 @@ struct Model::Impl {
     }
     void attn_in(Layer& l, Gpu& gv, int T, unsigned v, int m = -1) {
         stg_pull(m, gv, T, v);
-        if (g.full) k::hc_post(gv.x, T, g.hc, g.n_embd, gv.y, gv.post, gv.s);
-        else k::hc_post_norm(gv.x, T, g.hc, g.n_embd, gv.y, gv.post, l.post_attn, g.eps, gv.s);
+        k::hc_post_norm(gv.x, T, g.hc, g.n_embd, gv.y, gv.post, l.post_attn, g.eps, gv.s);
     }
     bool ffn_out(Layer& l, Gpu& gv, int T, unsigned v, std::string& err) {
         k::hc_pre(gv.x, T, g.hc, g.n_embd, l.hcf_fn, l.hcf_scale, l.hcf_base, g.eps, g.hc_eps, g.hc_mag, gv.xf, gv.post,
@@ -9180,8 +9114,7 @@ struct Model::Impl {
     }
     void ffn_in(Layer& l, Gpu& gv, int T, unsigned v, int m = -1) {
         stg_pull(m, gv, T, v);
-        if (g.full) k::hc_post(gv.x, T, g.hc, g.n_embd, gv.y, gv.post, gv.s);
-        else k::hc_post_norm(gv.x, T, g.hc, g.n_embd, gv.y, gv.post, l.post_ffn, g.eps, gv.s);
+        k::hc_post_norm(gv.x, T, g.hc, g.n_embd, gv.y, gv.post, l.post_ffn, g.eps, gv.s);
     }
     // member m's layers for a staggered chunk: syncs v0 + 4 il + {1: A's attention, 2: B's, 3: A's FFN, 4: B's}
     bool member_layers_staggered(int m, Gpu& gp, int T, int64_t p0, unsigned v0, std::string& err) {
@@ -9244,7 +9177,7 @@ struct Model::Impl {
         Gpu& gp = G[(size_t) mem[(size_t) m]];
         CK(cudaSetDevice(gp.dev));
         const size_t nx = (size_t) T * g.hc * g.n_embd;
-        CK(cudaMemcpyAsync(gp.pos, h_pos, sizeof(int) * position_planes() * Tc, cudaMemcpyHostToDevice, gp.s));
+        CK(cudaMemcpyAsync(gp.pos, h_pos, sizeof(int) * 3 * Tc, cudaMemcpyHostToDevice, gp.s));
         CK(cudaMemcpyAsync(gp.cur, h_x, sizeof(float) * T * g.n_embd, cudaMemcpyHostToDevice, gp.s));
         k::expand_streams(gp.cur, T, g.hc, g.n_embd, gp.x, gp.s);
         unsigned v = v0;
@@ -9312,11 +9245,11 @@ struct Model::Impl {
                     k::split3(rt, gv.lat, (size_t) Th * lat, gv.ids, nrh, gv.rw, nrh, gp.s);
                     Layer& l = hp.L[0][(size_t) il];
                     if (!experts_sets(l, gv, Th, err, l.slot_d)) return false;
-                    if (!g.full && !mm(gv, l.rup, gv.latout, lat, Th, gv.y, g.n_embd)) {
+                    if (!mm(gv, l.rup, gv.latout, lat, Th, gv.y, g.n_embd)) {
                         err = "the helper's ffn_routed_up did not take its shapes";
                         return false;
                     }
-                    publish_blocks(N + h, gv, g.full ? gv.latout : gv.y, Th, v);
+                    publish_blocks(N + h, gv, gv.y, Th, v);
                 }
             return true;
         }
@@ -9338,14 +9271,13 @@ struct Model::Impl {
                 return false;
             }
             if (model_sum) {
-                if (!g.full && !mm(gp, l.rup, gp.latout, lat, T, gp.y, g.n_embd, 1.0f, lat_pre && T <= W)) {
+                if (!mm(gp, l.rup, gp.latout, lat, T, gp.y, g.n_embd, 1.0f, lat_pre && T <= W)) {
                     err = "the helper's ffn_routed_up did not take its shapes";
                     return false;
                 }
-                float* part = g.full ? gp.latout : gp.y;
-                if (T > W && blocked && gp.s2) publish_blocks(N + h, gp, part, T, v);
+                if (T > W && blocked && gp.s2) publish_blocks(N + h, gp, gp.y, T, v);
                 else
-                    k::publish(part, tp_part + (size_t) (N + h) * tp_stride(), (size_t) T * g.n_embd, hp.cnt,
+                    k::publish(gp.y, tp_part + (size_t) (N + h) * tp_stride(), (size_t) T * g.n_embd, hp.cnt,
                                tp_fout + (size_t) (N + h) * kLine, v, gp.s);
             } else {
                 k::publish(gp.latout, tp_part + (size_t) (N + h) * tp_stride(), (size_t) T * lat, hp.cnt,
@@ -9536,7 +9468,7 @@ struct Model::Impl {
         if (ok && !head_member()) {
             Gpu& hg = G[(size_t) head_gpu];
             CK(cudaSetDevice(hg.dev));
-            CK(cudaMemcpyAsync(hg.pos, h_pos, sizeof(int) * position_planes() * Tc, cudaMemcpyHostToDevice, hg.s));
+            CK(cudaMemcpyAsync(hg.pos, h_pos, sizeof(int) * 3 * Tc, cudaMemcpyHostToDevice, hg.s));
             k::wait_pull(tp_fx, xv, hg.x, tp_xo, (size_t) T * g.hc * E, hg.s);
             if (!head_tail(ids, T, p0, want, logits_out, err)) ok = false;
         }
