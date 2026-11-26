@@ -472,12 +472,36 @@ class Steps(unittest.TestCase):
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(cfg["gpu"], list(range(6)))
         self.assertEqual(cfg["args"][4:], ["--gpus", "6", "--draft", str(d / "dspark.gguf"), "--drafting", "on"])
+        profile = str(d / "maya-ik2" / "expert-profile.bin")
+        self.assertEqual(cfg["env"], {"IK2_KV": "fp8", "IK2_WARM": profile, "IK2_POP_OUT": profile})
         with patch.object(maya, "ROOT", self.root):
             path = maya.write_config_ik2(args(drafting="off"), {"gpus": gpus, "backend": "cuda"}, {}, gguf,
                                          d / "tokenizer", 32768, self.root, d, drafter=d / "dspark.gguf",
                                          local={"variant": "small"})
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(cfg["args"][4:], ["--gpus", "6", "--drafting", "off"])
+        self.assertEqual(cfg["env"], {"IK2_KV": "fp8", "IK2_WARM": profile, "IK2_POP_OUT": profile})
+
+    def test_small_setup_reuses_an_existing_expert_profile_path(self):
+        d = self.root / "Inkling-2-Small-local-UD-IQ3_XXS"
+        gguf = d / "Inkling-2-Small-UD-IQ3_XXS.gguf"
+        pc = {"gpus": [card(48, i) for i in range(3)], "backend": "cuda"}
+        cfg_path = self.root / f"maya-{d.name.lower()}.json"
+        profile = self.root / "learned-profile.bin"
+        profile.write_bytes(b"existing profile")
+        choices = ("IK2_WARM", "IK2_POP_OUT")
+        for key in choices:
+            for from_cli in (False, True):
+                with self.subTest(key=key, from_cli=from_cli):
+                    old = {} if from_cli else {key: str(profile)}
+                    options = [f"{key}={profile}"] if from_cli else []
+                    cfg_path.write_text(json.dumps({"env": old}), encoding="utf-8")
+                    with patch.object(maya, "ROOT", self.root):
+                        path = maya.write_config_ik2(args(env=options), pc, {}, gguf, d / "tokenizer",
+                                                     32768, self.root, d, local={"variant": "small"})
+                    self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["env"],
+                                     {"IK2_KV": "fp8", "IK2_WARM": str(profile), "IK2_POP_OUT": str(profile)})
+                    self.assertEqual(profile.read_bytes(), b"existing profile")
 
     def test_drafter_step(self):
         """Drafting on by default: the drafter beside the GGUF, sha256-checked; none with --drafting off or a declined

@@ -12824,6 +12824,11 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     elif env.get("IK2_WARM") == seed:
         env.pop("IK2_WARM")
     env.update(parse_env(a.env))
+    if local and local["variant"] == "small":
+        default_profile = str(d / "maya-ik2" / "expert-profile.bin")
+        profile = env.get("IK2_WARM", env.get("IK2_POP_OUT", default_profile))
+        env.setdefault("IK2_WARM", profile)
+        env.setdefault("IK2_POP_OUT", profile)
     cfg["env"] = env
     if a.host:
         cfg["host"] = a.host

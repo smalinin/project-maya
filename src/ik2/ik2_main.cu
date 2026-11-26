@@ -65,6 +65,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #define SIGUSR1 30
 #endif
 #else
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -316,24 +317,79 @@ void lazy_poll() {
 // IK2_PROF=1: the stream waited for at each phase's end, its time added to the phase (slower, but where it goes)
 bool g_prof = false;
 bool g_mv = true;   // IK2_MV=0: a few tokens' experts through the FP16 GEMMs too
-// How often each expert is picked by a token (prefill and decode), [n_layer * E]: IK2_POP_OUT=FILE writes it at
-// the end (int32 n_layer, int32 E, then uint64 counts); IK2_WARM=FILE fills the expert cache with the most picked
-// experts at load, so the first requests do not start from an empty cache.
+// How often each expert is picked (int32 n_layer, int32 E, then uint64 counts). When IK2_WARM and IK2_POP_OUT
+// name the same file, keep only the unsaved picks here and merge them into that file after each request.
 std::vector<uint64_t> g_pop;
 int g_pop_E = 0;
+bool g_pop_autosave = false, g_pop_dirty = false;
+
+std::vector<uint64_t> pop_load(const char* path, int layers, int experts) {
+    FILE* in = path && *path ? std::fopen(path, "rb") : nullptr;
+    if (!in) return {};
+    std::vector<uint64_t> counts;
+    int32_t hdr[2] = {};
+    if (std::fread(hdr, sizeof hdr, 1, in) == 1 && hdr[0] == layers && hdr[1] == experts) {
+        counts.resize((size_t) layers * experts);
+        if (std::fread(counts.data(), sizeof(uint64_t), counts.size(), in) != counts.size()) counts.clear();
+    }
+    std::fclose(in);
+    return counts;
+}
+
 void pop_count(int l, const int* top, int S) {
     if (g_pop.empty()) return;
     for (int i = 0; i < S; ++i) ++g_pop[(size_t) l * g_pop_E + top[i]];
+    g_pop_dirty = true;
 }
+
+bool pop_write(const char* path, const std::vector<uint64_t>& counts) {
+    const int32_t hdr[2] = {(int32_t) (counts.size() / g_pop_E), (int32_t) g_pop_E};
+    const std::filesystem::path tmp = std::string(path) + ".tmp";
+    FILE* out = std::fopen(tmp.string().c_str(), "wb");
+    if (!out) return false;
+    const bool wrote = std::fwrite(hdr, sizeof hdr, 1, out) == 1 &&
+                       std::fwrite(counts.data(), sizeof(uint64_t), counts.size(), out) == counts.size();
+    const bool closed = std::fclose(out) == 0;
+    std::error_code ec;
+    if (wrote && closed) {
+        std::filesystem::rename(tmp, path, ec);
+        if (!ec) return true;
+    }
+    std::filesystem::remove(tmp, ec);
+    return false;
+}
+
 void pop_dump() {
-    const char* f = getenv("IK2_POP_OUT");
-    if (!f || g_pop.empty()) return;
-    FILE* o = std::fopen(f, "wb");
-    if (!o) return;
-    const int32_t hdr[2] = {(int32_t) (g_pop.size() / g_pop_E), (int32_t) g_pop_E};
-    std::fwrite(hdr, 4, 2, o);
-    std::fwrite(g_pop.data(), 8, g_pop.size(), o);
-    std::fclose(o);
+    if (g_pop.empty() || (g_pop_autosave && !g_pop_dirty)) return;
+    const char* path = getenv("IK2_POP_OUT");
+    // Lock a separate file so replacing the profile leaves concurrent writers serialized.
+    const std::string lock_path = std::string(path) + ".lock";
+#ifdef _WIN32
+    const HANDLE file = CreateFileW(std::filesystem::path(lock_path).c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool locked = file != INVALID_HANDLE_VALUE;
+#else
+    const int file = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
+    const bool locked = file >= 0 && flock(file, LOCK_EX) == 0;
+#endif
+    bool saved = false;
+    if (locked) {
+        auto counts = g_pop_autosave ? pop_load(path, (int) (g_pop.size() / g_pop_E), g_pop_E) : std::vector<uint64_t>{};
+        if (!counts.empty())
+            for (size_t i = 0; i < g_pop.size(); ++i) counts[i] += std::min(g_pop[i], UINT64_MAX - counts[i]);
+        saved = pop_write(path, counts.empty() ? g_pop : counts);
+    }
+#ifdef _WIN32
+    if (locked) CloseHandle(file);
+#else
+    if (file >= 0) ::close(file);
+#endif
+    if (!saved) {
+        std::fprintf(stderr, "maya-ik2: could not save expert profile %s\n", path);
+    } else if (g_pop_autosave) {
+        std::fill(g_pop.begin(), g_pop.end(), 0);
+        g_pop_dirty = false;
+    }
 }
 int g_pop_E_ep = 0;
 // IK2_EP=1 with --gpus 2: expert parallel. Every layer's attention and dense weights (and the KV cache) on GPU 0;
@@ -6271,22 +6327,19 @@ int main(int argc, char** argv) {
         // if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
         if (!draft_path.empty() && (c.C != 2304 || c.n_visit != 48)) die("--draft: a looped model other than Inkling-2-Mini");
     }
-    if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
+    const char* warm_path = getenv("IK2_WARM");
+    const auto warm_counts = pop_load(warm_path, c.n_layer, c.E);
+    if (const char* path = getenv("IK2_POP_OUT"); path && *path) {
+        g_pop.assign((size_t) c.n_layer * c.E, 0);
+        g_pop_E = c.E;
+        g_pop_autosave = warm_path && std::strcmp(path, warm_path) == 0;
+    }
     g_tp_F = c.F, g_tp_C = c.C;
     if (n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) {
         const double share = getenv("IK2_EP_SPLIT") ? std::atof(getenv("IK2_EP_SPLIT")) : 0.5;
         g_pop_E_ep = c.E;
         g_ep_own.assign((size_t) c.n_layer * c.E, 0);
-        std::vector<uint64_t> cnt;
-        if (const char* wf = getenv("IK2_WARM"); wf && *wf) {
-            FILE* in = std::fopen(wf, "rb");
-            int32_t hdr[2] = {0, 0};
-            if (in && std::fread(hdr, 4, 2, in) == 2 && hdr[0] == c.n_layer && hdr[1] == c.E) {
-                cnt.resize((size_t) c.n_layer * c.E);
-                if (std::fread(cnt.data(), 8, cnt.size(), in) != cnt.size()) cnt.clear();
-            }
-            if (in) std::fclose(in);
-        }
+        const auto& cnt = warm_counts;
         for (int l = 0; l < c.n_layer; ++l) {
             if (cnt.empty()) {
                 for (int e = 0; e < c.E; ++e)
@@ -7601,16 +7654,7 @@ int main(int argc, char** argv) {
     EC.tp = g_tp ? d : -1;
     EC.tier_only = g_off_want && d == 0 && !(getenv("IK2_TIER_MIN") && std::atoi(getenv("IK2_TIER_MIN")));
     std::vector<double> off_value;   // (the offload path: the profile's picks an expert, the tier's pools sized by them)
-    if (g_off_want && d == 0)
-        if (const char* wf = getenv("IK2_WARM"); wf && *wf)
-            if (FILE* in = std::fopen(wf, "rb")) {
-                int32_t hdr[2] = {0, 0};
-                std::vector<uint64_t> cnt((size_t) c.n_layer * c.E);
-                if (std::fread(hdr, 4, 2, in) == 2 && hdr[0] == c.n_layer && hdr[1] == c.E &&
-                    std::fread(cnt.data(), 8, cnt.size(), in) == cnt.size())
-                    off_value.assign(cnt.begin(), cnt.end());
-                std::fclose(in);
-            }
+    if (g_off_want && d == 0) off_value.assign(warm_counts.begin(), warm_counts.end());
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, off_value.empty() ? nullptr : &off_value);
     if (g_off_want && d == 0) g_lend.value = off_value;
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
@@ -7619,16 +7663,8 @@ int main(int argc, char** argv) {
         std::printf("  pool %zu: %d slots of %.1f MiB (%.1f GiB, %d layers)\n", p, EC.pools[p].n_slots,
                     EC.pools[p].slot_bytes / 1048576.0,
                     (double) EC.pools[p].n_slots * EC.pools[p].slot_bytes / 1073741824.0, EC.pools[p].n_layers);
-    const char* wf = getenv("IK2_WARM");
-    if ((wf && *wf) || g_ep) {   // the cache filled with the most picked experts (IK2_POP_OUT's file or all owned for EP)
-        FILE* in = (wf && *wf) ? std::fopen(wf, "rb") : nullptr;
-        int32_t hdr[2] = {0, 0};
-        std::vector<uint64_t> cnt;
-        if (in && std::fread(hdr, 4, 2, in) == 2 && hdr[0] == c.n_layer && hdr[1] == c.E) {
-            cnt.resize((size_t) c.n_layer * c.E);
-            if (std::fread(cnt.data(), 8, cnt.size(), in) != cnt.size()) cnt.clear();
-        }
-        if (in) std::fclose(in);
+    if ((warm_path && *warm_path) || g_ep) {  // prefill the cache with the most picked experts (or all owned for EP)
+        auto cnt = warm_counts;
         if (cnt.empty() && g_ep) cnt.assign((size_t) c.n_layer * c.E, 1);
         if (cnt.empty()) {
             std::printf("warm: the cache starts empty\n");
@@ -7640,8 +7676,10 @@ int main(int argc, char** argv) {
                 std::vector<int> idx;
                 for (int l = 0; l < c.n_layer; ++l)
                     if (EC.layer_pool[l] == (int) p)
-                        for (int e = 0; e < c.E; ++e)
-                            if (!g_ep || ep_owner(l, e) == d) idx.push_back(l * c.E + e);
+                        for (int e = 0; e < c.E; ++e) {
+                            const int i = l * c.E + e;
+                            if ((!g_ep || ep_owner(l, e) == d) && (!g_pop_autosave || cnt[i] > 0)) idx.push_back(i);
+                        }
                 // the most picked first; the chosen ones then go in least picked first, so that the evictions that
                 // start from the oldest take the least picked
                 std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
@@ -8812,6 +8850,7 @@ int main(int argc, char** argv) {
             }
             if (cancelled) {
                 reset();
+                if (g_pop_autosave) pop_dump();
                 if (serve_maya) std::printf("DONE 0 %zu %.1f 0 cancel 0 0 %d 0 0\n", ids.size(), (now() - t0) * 1e3, cached);
                 else std::printf("@END cancelled %zu %d %.3f %.3f\n", ids.size(), cached, now() - t0, 0.0);
                 std::fflush(stdout);
@@ -8990,6 +9029,7 @@ int main(int argc, char** argv) {
             if (serve_maya) stat_line(n_out, now());
             unsigned long long ph1 = 0, pn1 = 0;
             pick_counts(n_out, ph1, pn1);
+            if (g_pop_autosave) pop_dump();
             if (serve_maya)   // (DONE's 6th and 7th fields: this answer's drafts kept and offered; 9th, 10th its picks
                               //  found in VRAM and all its picks)
                 std::printf("DONE %d %zu %.1f %.1f %s %llu %llu %d %llu %llu\n", n_out, ids.size(), (t1 - t0) * 1e3,
@@ -9002,6 +9042,7 @@ int main(int argc, char** argv) {
             busy = false;
             g_wd_busy = false;
         }
+        if (g_pop_autosave) pop_dump();
         g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
         std::fflush(stdout);
         std::_Exit(0);   // (QUIT / end of input: out at once, as maya-hy4 - the OS frees the pinned runs and the driver's state)

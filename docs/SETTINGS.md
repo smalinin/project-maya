@@ -2817,7 +2817,9 @@ external DSpark drafter on the final GPU, which also holds the output head. That
 target verifies the drafts across all selected GPUs. `--drafting auto` measures drafting and plain decoding at
 startup and keeps the faster mode. `--drafting on` enables drafting and `--drafting off` disables it. While the
 drafter is active, appending to a cached prefix reuses it. A request that diverges from the cached prefix replays
-its prompt to rebuild the drafter context. Environment:
+its prompt to rebuild the drafter context. Setup gives each local Inkling-2-Small model an expert profile at
+`<model_dir>/maya-ik2/expert-profile.bin`. With `IK2_WARM` and `IK2_POP_OUT` set to this path, the engine merges pick
+counts into it after each request and preloads the most frequently selected experts at the next start. Environment:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
