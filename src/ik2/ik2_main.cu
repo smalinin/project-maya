@@ -4504,20 +4504,18 @@ inline bool spec_path() {
 
 // VRAM drafting takes beside the model (the plan's check that it changes nothing): the window's records (every
 // visit's four convs, for rollback_block) and buffers, whichever drafts; with the drafter (path) its weights (the
-// file's: BF16 in mtp.safetensors, the layers' matrices Q8_0 in a GGUF), its fold through the head (FP16 [256][n_rows]
+// file's: BF16 in mtp.safetensors, native Q8_0 or expanded BF16 in a GGUF), its fold through the head (FP16 [256][n_rows]
 // and a bias), its layer without a window's context (FP16 K and V, 8 heads of 128: 4 KiB a position, IK2_DRAFT_CTX's
 // positions), its windowed layers' rings (F32, 2048 positions: Inkling-2-Mini's drafter 2, Small's 4), its
 // attention's partials (not a context's size: its logits stay in shared memory) and the target's taps (4 rows of a
 // chunk, F32).  (The fold reads a Q8_0 head a chunk at a time - no FP16 copy of it; an FP16 head is the model's
 // own.)  tools/ik2_fit.py's draft_gib has the same figures.
-size_t draft_room(const std::string& path, int ctx, int chunk, const Config& c, int n_rows, bool kv8 = false) {
+size_t draft_room(size_t weights, int ctx, int chunk, const Config& c, int n_rows, bool kv8 = false) {
     const size_t C = c.C, KD = (size_t) c.KV * c.D;
     size_t b = (size_t) c.n_visit * (2 * KD + 2 * C) * (3 + 8) * 4 + ((size_t) 16 << 20);
-    if (path.empty()) return b;
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    const size_t file = f ? (size_t) f.tellg() : ((size_t) 640 << 20);
+    if (weights == 0) return b;
     const size_t rings = c.C == 2304 ? 2 : 4, heads = c.C == 2304 ? 24 : 48;
-    b += file + (size_t) n_rows * 258 * 2 + (size_t) ik2::draft::context_rows(ctx) * (kv8 ? 2048 : 4096) +
+    b += weights + (size_t) n_rows * 258 * 2 + (size_t) ik2::draft::context_rows(ctx) * (kv8 ? 2048 : 4096) +
          rings * 2048 * 8 * 128 * 8 + k::draft_attn_scratch((int) heads) * 4 +
          (size_t) 4 * std::max(chunk, 8) * C * 4 + ((size_t) 32 << 20);
     return b;
@@ -6592,6 +6590,7 @@ int main(int argc, char** argv) {
             else if (used + need > fr0) why = "its room does not fit beside the model at this context";
             return why.empty();
         };
+        const size_t draft_weights = draft_path.empty() ? 0 : ik2::draft::weights_bytes(draft_path);
         for (int pass = 0; pass < 2; ++pass) {   // (the drafter, else the prompt lookup alone)
             const bool model_drafter = pass == 0;
             if (model_drafter ? draft_path.empty() : !g_lookup) continue;
@@ -6600,7 +6599,7 @@ int main(int argc, char** argv) {
             // (the drafter: its context rows in FP16, else in FP8 - IK2_DRAFT_KV takes one; the load below measures)
             const char* kv_env = getenv("IK2_DRAFT_KV");
             const bool only16 = kv_env && std::string(kv_env) == "f16", only8 = kv_env && std::string(kv_env) == "fp8";
-            size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows, only8);
+            size_t need = draft_room(model_drafter ? draft_weights : 0, ctx, chunk, c, head_rows, only8);
             std::string why;
             if (off_layout && model_drafter && off_why.empty()) {
                 std::vector<std::pair<int, bool>> tries;   // (rows, FP8)
@@ -6613,7 +6612,7 @@ int main(int argc, char** argv) {
                 bool ok = false;
                 for (const auto& t : tries) {
                     ik2::draft::plan_context_rows(t.first == ctx ? 0 : t.first);
-                    need = draft_room(draft_path, ctx, chunk, c, head_rows, t.second);
+                    need = draft_room(draft_weights, ctx, chunk, c, head_rows, t.second);
                     why.clear();
                     if ((ok = room_ok(need, why))) {
                         g_draft_kv8 = t.second ? 1 : 0;
@@ -6623,7 +6622,7 @@ int main(int argc, char** argv) {
                 if (!ok) ik2::draft::plan_context_rows(0);
             } else if (model_drafter && !only8 && !only16 && !room_ok(need, why)) {
                 why.clear();
-                need = draft_room(draft_path, ctx, chunk, c, head_rows, true);
+                need = draft_room(draft_weights, ctx, chunk, c, head_rows, true);
             }
             why.clear();
             if (room_ok(need, why)) {

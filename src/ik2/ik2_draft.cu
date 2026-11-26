@@ -1,6 +1,7 @@
 // src/ik2/ik2_draft.cu - maya-ik2's drafter (the design: ik2_draft.hpp).
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
+#include "maya/artifact/dequant.hpp"
 #include "maya/artifact/gguf_reader.hpp"
 
 #include <cuda_fp16.h>
@@ -28,6 +29,7 @@ static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -36,6 +38,7 @@ namespace ik2::draft {
 namespace {
 
 namespace k = ik2::k;
+constexpr uint32_t kQ5_K = 13;
 
 void cu(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("drafter: ") + what + ": " + cudaGetErrorString(e));
@@ -242,7 +245,7 @@ int64_t src_dim0(const Src& s, const std::string& n) {
     return it->second.shape[0];
 }
 
-// a tensor's values as F32 (BF16, F16 or F32 in the file; a Q8_0 one as its values times their scales)
+// A tensor's values as F32, including the dequantized values of a GGUF's block types.
 std::vector<float> src_f32(const Src& s, const std::string& n, const std::vector<int64_t>& shape) {
     if (!s.g) {
         const auto b = st_bf16(s.st, n, shape);
@@ -265,8 +268,11 @@ std::vector<float> src_f32(const Src& s, const std::string& n, const std::vector
             const float sc = h2f_host((uint16_t) (p[0] | (p[1] << 8)));
             for (int j = 0; j < 32; ++j) v[b * 32 + j] = sc * (float) (int8_t) p[2 + j];
         }
+    } else if (t.type == kQ5_K) {
+        if (t.shape.front() % 256 != 0) throw std::runtime_error("drafter: " + t.name + ": partial Q5_K row");
+        for (size_t i = 0; i < v.size(); i += 256, p += 176) maya::dequantize_q5_K(p, v.data() + i);
     } else {
-        throw std::runtime_error("drafter: " + t.name + " is " + t.type_name() + " (BF16, F16, F32 or Q8_0 read)");
+        throw std::runtime_error("drafter: " + t.name + " is " + t.type_name() + " (BF16, F16, F32, Q8_0 or Q5_K read)");
     }
     return v;
 }
@@ -589,7 +595,7 @@ void layer_mlp(Drafter* d, DLayer& l, float* out) {
 }
 
 // a matrix from the file: [rows][K], the rows of `names` one after another (gate's then up's).  Q8_0 in a GGUF:
-// planar on the device when the drafter reads Q8_0 (d->q8), else its values in BF16, as a BF16 file's.
+// planar on the device when the drafter reads Q8_0 (d->q8). Other block types are expanded to BF16.
 DMat load_mat(Drafter* d, const Src& s, const std::vector<std::string>& names, const std::vector<int64_t>& rows,
               int64_t K) {
     DMat m;
@@ -640,6 +646,28 @@ int context_rows(int ctx) {
     //  whole context)
     const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : g_plan_rows > 0 ? g_plan_rows : ctx;
     return std::min(ctx, std::max(want, 2048));
+}
+
+size_t weights_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    const auto end = f.tellg();
+    size_t bytes = end > 0 ? (size_t) end : ((size_t) 640 << 20);
+    char magic[4];
+    if (!f.seekg(0).read(magic, sizeof magic) || std::memcmp(magic, "GGUF", sizeof magic) != 0) return bytes;
+    try {
+        const maya::GgufFile g(path);
+        if (g.count_type("Q5_K") == 0) return bytes;
+        // A draft with Q5_K layer matrices uses the BF16 path for every layer matrix.
+        for (const auto& t : g.tensors()) {
+            if (t.shape.size() != 2 || t.name.rfind("blk.", 0) != 0 || (t.type != kQ5_K && t.type != 8)) continue;
+            int block, encoded;
+            if (maya::block_geometry(t.type, block, encoded))
+                bytes += (size_t) (t.elements() / block) * (2 * block - encoded);
+        }
+    } catch (const std::runtime_error&) {
+        // The loader reports malformed files through the usual drafter fallback.
+    }
+    return bytes;
 }
 
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s, bool kv8) {

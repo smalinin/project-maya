@@ -73,5 +73,7 @@ void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
 void propose_times(double* submit_ms, double* wait_ms);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
+/// Estimate weight bytes before loading, including expansion of mixed GGUF matrices into BF16.
+size_t weights_bytes(const std::string& path);
 
 }  // namespace ik2::draft
