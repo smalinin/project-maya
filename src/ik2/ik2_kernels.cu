@@ -3744,8 +3744,61 @@ __device__ __forceinline__ void unpack_u32_i8(uint32_t q4, float* wv) {
     wv[3] = (float) (int8_t) (q4 >> 24);
 }
 
+template <int Type>
+__device__ __forceinline__ float iqs_lane_weight(const uint8_t* b, float d, int group, int lane) {
+    if constexpr (Type == kIQ2_S) {
+        const int sub = lane / 8, index = 4 * group + sub, bit = lane % 8;
+        const int grid = __ldg(b + 2 + index) | (((__ldg(b + 66 + group) >> (2 * sub)) & 3) << 8);
+        const int scale = (__ldg(b + 74 + group) >> (4 * (sub / 2))) & 15;
+        const float v = (float) ((iq2s_grid_at(grid) >> (8 * bit)) & 255u);
+        return d * (0.5f + scale) * 0.25f * v * ((__ldg(b + 34 + index) >> bit) & 1 ? -1.0f : 1.0f);
+    } else {
+        const int sub = lane / 4, bit = lane % 8;
+        const int grid = __ldg(b + 2 + 8 * group + sub) | (((__ldg(b + 66 + group) >> sub) & 1) << 8);
+        const int scale = (__ldg(b + 106 + group / 2) >> (4 * (group % 2))) & 15;
+        const float v = (float) ((iq3s_grid_at(grid) >> (8 * (lane % 4))) & 255u);
+        return d * (1 + 2 * scale) * v * ((__ldg(b + 74 + 4 * group + lane / 8) >> bit) & 1 ? -1.0f : 1.0f);
+    }
+}
+
+// Each lane still accumulates the same columns in the same order as the scalar IQ fallback. A block's scale
+// is read once, and gate and up share the activation load for each token in the window.
+template <int Type, class X, int N_CAP, bool Pair>
+__device__ __forceinline__ void row_dot_iqs(const uint8_t* w, const uint8_t* up, const X* const* xs, int n, int K,
+                                          float* out, float* out_up) {
+    constexpr int bytes = Type == kIQ2_S ? 82 : 110;
+    const int lane = threadIdx.x & 31;
+    float acc[N_CAP] = {}, acc_up[N_CAP] = {};
+    for (int base = 0; base < K; base += 256, w += bytes) {
+        const float d = half_bits_to_float((uint16_t) (__ldg(w) | (__ldg(w + 1) << 8)));
+        float du = 0;
+        if constexpr (Pair) du = half_bits_to_float((uint16_t) (__ldg(up) | (__ldg(up + 1) << 8)));
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const float wt = iqs_lane_weight<Type>(w, d, g, lane);
+            float wu = 0;
+            if constexpr (Pair) wu = iqs_lane_weight<Type>(up, du, g, lane);
+#pragma unroll
+            for (int t = 0; t < N_CAP; ++t) {
+                if (t >= n) break;
+                const float x = xval(xs[t], base + g * 32 + lane);
+                acc[t] += wt * x;
+                if constexpr (Pair) acc_up[t] += wu * x;
+            }
+        }
+        if constexpr (Pair) up += bytes;
+    }
+#pragma unroll
+    for (int t = 0; t < N_CAP; ++t) {
+        out[t] = wsum(acc[t]);
+        if constexpr (Pair) out_up[t] = wsum(acc_up[t]);
+    }
+}
+
 template <class X, int N_CAP>
 __device__ void row_dot_multi(int type, const uint8_t* w, const X* const* xs, int n, int K, float* out) {
+    if (type == kIQ2_S) return row_dot_iqs<kIQ2_S, X, N_CAP, false>(w, nullptr, xs, n, K, out, nullptr);
+    if (type == kIQ3_S) return row_dot_iqs<kIQ3_S, X, N_CAP, false>(w, nullptr, xs, n, K, out, nullptr);
     const int lane = threadIdx.x & 31;
     float acc[N_CAP];
 #pragma unroll
@@ -3949,6 +4002,8 @@ __device__ void row_dot_multi(int type, const uint8_t* w, const X* const* xs, in
 template <int N_CAP>
 __device__ void row_dot_pair_multi(int type, const uint8_t* wg, const uint8_t* wu, const float* const* xs, int n,
                                    int K, float* og, float* ou) {
+    if (type == kIQ2_S) return row_dot_iqs<kIQ2_S, float, N_CAP, true>(wg, wu, xs, n, K, og, ou);
+    if (type == kIQ3_S) return row_dot_iqs<kIQ3_S, float, N_CAP, true>(wg, wu, xs, n, K, og, ou);
     const int lane = threadIdx.x & 31;
     float ag[N_CAP], au[N_CAP];
 #pragma unroll

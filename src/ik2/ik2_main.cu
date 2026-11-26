@@ -5727,7 +5727,7 @@ std::string draft_key(const std::string& model, const std::string& draft_path, i
         key += buf;
     }
     if (n_gpu > 2) {
-        key += "|layer split";
+        key += "|layer split v2";   // remeasure after changing the grouped verification kernels
         for (int d = 1; d < n_gpu; ++d) {
             cudaDeviceProp other{};
             CU(cudaGetDeviceProperties(&other, d));
