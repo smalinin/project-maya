@@ -256,7 +256,8 @@ class LocalOther(unittest.TestCase):
                 tokenizer.assert_called_once()
                 self.assertEqual(tokenizer.call_args.args[2], linked)
                 draft_arg = maya.flag_value(cfg["args"], "--draft")
-                self.assertEqual(draft_arg, str(linked.with_name(draft.name)) if variant == "mini" else None)
+                self.assertEqual(draft_arg, str(linked.with_name(draft.name)))
+                self.assertEqual(maya.flag_value(cfg["args"], "--drafting"), "auto")
                 targets = [*maya.shard_set(linked), linked.with_name(draft.name), Path(cfg["vision"]["mmproj"])]
                 self.assertTrue(all(p.is_symlink() for p in targets))
                 self.assertEqual([p.resolve() for p in targets], [first, second, draft, vision])

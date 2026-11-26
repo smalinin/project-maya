@@ -2804,16 +2804,20 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 thinkingmachines' [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) (594B, ~17B active) on
 its own engine, `maya-ik2` (`src/ik2`; CUDA on Linux, Volta on), from unsloth's GGUFs
 ([unsloth/Inkling-2-Small-GGUF](https://huggingface.co/unsloth/Inkling-2-Small-GGUF): UD-Q4_K_XL, UD-Q3_K_XL) read in
-place. The routed experts sit in pinned host memory (~323 GiB for UD-Q4_K_XL, ~260 GiB for UD-Q3_K_XL) with a cache of
-them in VRAM; one request at a time, text only. `maya.py` does not set it up yet: docs/INKLING2.md section 6 has the
-tokenizer folder and the run config, then `python serve/server.py --engine maya --config ik2.json`.
+place. The routed experts sit in host memory or mapped GGUFs, with a cache in VRAM. Setup links a local model and an
+optional image projector. It offers a layer split on three or more NVIDIA GPUs and serves one request at a time.
 
 **Defaults**: temperature 1.0, top-p 1.0 (its card and files name none); the thinking level Auto, the template's own
 (0.9 - "high"). The template is thinkingmachines' (`tools/ik2/chat_template.jinja`), which takes every level by name:
 none, low (0.2), medium (0.7), high (0.9), xhigh and max (0.99); Off is none.
 
 Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's most, less if VRAM is short),
-`--gpus 1|2`, `--threads N` (8: the loading and the CPU lane), `--eos a,b`. Environment:
+`--gpus N`, `--threads N` (8: the loading and the CPU lane), `--eos a,b`. On a layer split, `--draft PATH` uses the
+external DSpark drafter on the final GPU, which also holds the output head. That GPU needs Ampere or newer. The
+target verifies the drafts across all selected GPUs. `--drafting auto` measures drafting and plain decoding at
+startup and keeps the faster mode. `--drafting on` enables drafting and `--drafting off` disables it. While the
+drafter is active, appending to a cached prefix reuses it. A request that diverges from the cached prefix replays
+its prompt to rebuild the drafter context. Environment:
 
 | Variable | Default | What it does |
 | --- | --- | --- |

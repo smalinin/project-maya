@@ -12796,9 +12796,7 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     n_gpu = len(pc["gpus"])
     two = n_gpu == 2 and pc.get("backend") != "hip"
     args += ["--gpus", str(n_gpu)] if n_gpu > 1 else []
-    how = "off" if n_gpu > 2 else ik2_drafting(a)
-    if n_gpu > 2 and drafter:
-        ok("drafting: off with the layer split")
+    how = "off" if n_gpu > 2 and not drafter else ik2_drafting(a)
     args += (["--draft", str(drafter)] if drafter and how != "off" else []) + ["--drafting", how]
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
     inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT, "drafting": how}

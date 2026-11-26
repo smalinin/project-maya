@@ -471,6 +471,12 @@ class Steps(unittest.TestCase):
                                          local={"variant": "small"})
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(cfg["gpu"], list(range(6)))
+        self.assertEqual(cfg["args"][4:], ["--gpus", "6", "--draft", str(d / "dspark.gguf"), "--drafting", "on"])
+        with patch.object(maya, "ROOT", self.root):
+            path = maya.write_config_ik2(args(drafting="off"), {"gpus": gpus, "backend": "cuda"}, {}, gguf,
+                                         d / "tokenizer", 32768, self.root, d, drafter=d / "dspark.gguf",
+                                         local={"variant": "small"})
+        cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(cfg["args"][4:], ["--gpus", "6", "--drafting", "off"])
 
     def test_drafter_step(self):

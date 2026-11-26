@@ -329,7 +329,9 @@ GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-m
 Apache 2.0) runs on `maya-ik2` (#974). In setup, choose **Inkling-2-Small → Add downloaded model → Link files** to use a
 compatible Small GGUF. Setup exports the tokenizer and writes a separate run config for each linked model. On Linux,
 it offers a layer split across all compatible NVIDIA GPUs when at least three are available. Use `--gpus` to select
-three or more GPU indices explicitly. Drafting is off in this layer split.
+three or more GPU indices explicitly. With a compatible external DSpark file selected, the engine can test drafting
+at startup and keep it when it is faster. Use `--drafting on` to enable drafting explicitly or `--drafting off` to
+disable it.
 
 The table shows manual engine runs. See [INKLING2.md](INKLING2.md#6-phase-2-the-engine-maya-ik2) for manual configuration.
 
