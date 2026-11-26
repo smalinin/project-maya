@@ -8205,12 +8205,19 @@ int main(int argc, char** argv) {
             // (dspark= / lookup=: the drafters this start runs - the Monitor's Speculation; drafting= the choice)
             const bool sp = (drafter || g_lookup) && spec_path();
             const char* wd = getenv("IK2_WATCHDOG_S");
+            int expert_slots = 0;
+            if (!layer_ends.empty())
+                for (int d = 0; d < n_gpu; ++d) expert_slots += dev_cache(d).total_slots();
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
-                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx,
-                        g_two.on ? 2 : n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0, drafting.c_str(),
+                        "drafting=%s experts=%d parallel=%d watchdog_s=%d path=%s drafter_format=%s "
+                        "expert_slots=%d experts_per_layer=%d\n",
+                        g_kv_fp8 ? "fp8" : "f16", ctx, g_two.on ? 2 : n_gpu, sp && drafter ? 1 : 0,
+                        sp && g_lookup ? 1 : 0, drafting.c_str(),
                         c.n_layer * c.E, g_par, wd && *wd ? std::max(0, std::atoi(wd)) : 600,
-                        g_fast ? "resident" : g_off ? "offload" : "cache");
-            // what fills each GPU (the Monitor's map): the dense weights, the experts' pool, the K / V cache
+                        g_fast ? "resident" : g_off ? "offload" : "cache",
+                        drafter ? ik2::draft::matrix_format(drafter) : "none", expert_slots, c.E);
+            const size_t draft_bytes = drafter ? ik2::draft::bytes(drafter) : 0;
+            // What fills each GPU (the Monitor's map): the dense weights, expert pool, K/V cache and drafter.
             // (two GPUs, the split: GPU 1 holds only its experts - g_two's own bytes)
             for (int d = 0; d < (g_two.on ? 2 : n_gpu); ++d) {
                 const int pd = g_two.on && d == 1 ? g_two.dev : d;
@@ -8224,9 +8231,13 @@ int main(int argc, char** argv) {
                 if (!(g_two.on && d == 1))
                     for (const auto& Vi : M.V)
                         if (M.L[Vi.l].dev == d) kv_d += (size_t) Vi.kv_cap * KD * kv_elem_b * 2;
-                std::printf("VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu pool=%zu\n", d, pci, tot, fr,
+                std::printf("VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu pool=%zu drafter=%zu", d, pci, tot, fr,
                             n_gpu == 1 && d == 0 ? g_dense_bytes : (size_t) 0, kv_d,
-                            g_two.on && d == 1 ? g_two.bytes : g_dev[d].EC.total_bytes());
+                            g_two.on && d == 1 ? g_two.bytes : g_dev[d].EC.total_bytes(), d == g_draft_dev ? draft_bytes : 0);
+                if (!layer_ends.empty())
+                    std::printf(" slots=%d layers=%d-%d", dev_cache(d).total_slots(),
+                                d ? layer_ends[d - 1] : 0, layer_ends[d]);
+                std::printf("\n");
             }
             use_dev(0);
             // (the split's GPU 1 was made current above without use_dev: back to GPU 0 - else the first request's
@@ -8797,6 +8808,13 @@ int main(int argc, char** argv) {
             }
             const int cached = (int) L;
             const double t0 = now();
+            auto report_prefill = [&](size_t read) {
+                if (!serve_maya) return;
+                const double elapsed = now() - t0;
+                std::printf("PP %zu %zu %.0f %.1f %d\n", read, ids.size(), elapsed * 1e3,
+                            (read - L) / std::max(1e-3, elapsed), cached);
+                std::fflush(stdout);
+            };
             const uint64_t miss0 = dev_cache(0).misses, bytes0 = dev_cache(0).bytes_up;
             for (auto& v : g_cnt_hist) v = 0;
             for (auto& v : g_src_hist) v = 0;
@@ -8820,12 +8838,7 @@ int main(int argc, char** argv) {
                         forward_prefill_sup(M, ids.data() + p0, n, (int) p0, sub_chunk,
                                             last_c ? OutMode::kLogits : OutMode::kNone, lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
-                        if (serve_maya) {   // (read, total, ms, tok/s, reused)
-                            const double ms = (now() - t0) * 1e3;
-                            std::printf("PP %zu %zu %.0f %.1f %d\n", p0 + n, ids.size(), ms,
-                                        (p0 + n - L) / std::max(1e-3, ms / 1e3), (int) L);
-                            std::fflush(stdout);
-                        }
+                        report_prefill(p0 + n);
                     }
                     big_end(g_dev[0].W, dev_cache(0), bs);
                 } else {
@@ -8845,6 +8858,7 @@ int main(int argc, char** argv) {
                             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
                             if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
                         }
+                        report_prefill(p0 + n);
                     }
                 }
             }

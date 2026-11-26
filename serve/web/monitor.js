@@ -86,6 +86,9 @@ function Throughput({m}) {
   const a = sparkPath(h.tok_s), b = sparkPath(h.prefill_tok_s_mean);
   // (the drafters on, and the share of their drafts the model kept: live from the engine's STAT lines, else the last answer's)
   const spec = speculationView(m);
+  const draft = eng.drafter_name;
+  const draftLabel = draft ? ["DSpark", eng.drafter_format].filter(Boolean).join(" · ")
+    : spec.state === "none" || spec.state === "off" ? "" : drafterName(spec.name);
   // the highest Decode figure since Maya started - live or a finished answer's (the server's, kept as each reading beats
   // it; from 32 tokens on: a few tokens' speed says little)
   const peak = m.totals && m.totals.peak_decode;
@@ -120,7 +123,8 @@ function Throughput({m}) {
         <span class="stat__label">Speculation</span>
         ${/* the share kept is the figure; the drafter (DSpark / MTP / DFlash2 - the prompt lookup beside it is not named) the note */ ""}
         <span class="stat__value num">${spec.state === "kept" ? spec.short : spec.state === "off" ? "off" : "–"}</span>
-        ${spec.state === "none" || spec.state === "off" ? null : html`<span class="stat__note">${drafterName(spec.name)}${spec.state === "kept" ? " · drafts kept" : ""}</span>`}
+        ${draftLabel ? html`<span class="stat__note">${draftLabel}${spec.state === "kept" ? " · drafts kept" : ""}</span>` : null}
+        ${draft ? html`<span class="stat__note stat__file" title=${draft}>${draft}</span>` : null}
         ${spec.state === "kept" && spec.detail ? html`<span class="stat__note num">${spec.detail}</span>` : null}</div>
     </div>
   </section>`;
@@ -362,7 +366,8 @@ function gpuLayers(g, eng) {
 // the KV cache streams from RAM only beyond its VRAM window (DeepSeek's engine: a window as long as the context)
 const kvWindow = (eng, ctx) => (+eng.kv_resident > 0 && +eng.kv_resident < ctx ? +eng.kv_resident : 0);
 function gpuSegs(g, eng) {
-  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : +eng.mtp ? "MTP" : dsparkEngine(eng) ? "DSpark" : "";
+  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : +eng.mtp ? "MTP"
+    : dsparkEngine(eng) || eng.engine_kind === "ik2" ? "DSpark" : "";
   return GPU_PARTS.filter((d) => (p[d.key] || 0) > 0 || d.key === "pool" || d.key === "kv")
     .map((d) => ({key: d.key, bytes: p[d.key] || 0, label: d.key === "drafter" && draft ? `Drafter (${draft})` : d.label}))
     .concat([{key: "free", label: "Free", bytes: g.free || 0}]);
@@ -390,7 +395,8 @@ function gpuDetail(g, segs, m) {
     act: "one token's working buffers",
     prompt: "a long prompt's chunks: their working buffers and the ring the CPU lane's experts stream through",
     tp: g.tp_n > 1 ? `the copies a group of ${g.tp_n} GPUs needs: the tensors each of them holds whole, and its layers' KV cache` : "",
-    drafter: [g.drafter ? `weights ${gb(g.drafter, 2)} GB` : "", g.window ? `verify window ${gb(g.window, 2)} GB` : ""].filter(Boolean).join(" · "),
+    drafter: eng.engine_kind === "ik2" ? eng.drafter_name
+      : [g.drafter ? `weights ${gb(g.drafter, 2)} GB` : "", g.window ? `verify window ${gb(g.window, 2)} GB` : ""].filter(Boolean).join(" · "),
     pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""].filter(Boolean).join(" · "),
     helper: "separate helper expert pool; CPU backing available for fallback",
     vision: g.vision_lent ? "the pool's tail, while it encodes" : g.vision_own ? "the vision tower, in the engine's process" : "its own process",
@@ -451,11 +457,14 @@ function GpuMap({m}) {
             : lentNow ? `Reading a prompt: the expert pool${one ? " lends" : "s lend"} it up to ${gb(lentNow)} GB (hatched).` : "";
   // advice: memory the expert pool could have at the next start
   const complete = eng.expert_slots && eng.experts && eng.expert_slots >= eng.experts;
-  const more = (g, b) => (g.slots && g.parts.pool ? Math.max(0, Math.floor(b / (g.parts.pool / g.slots))) : 0);
+  const remainingSlots = (g) => eng.engine_kind === "ik2" && eng.experts_per_layer && g.layers
+    ? Math.max(0, (g.layers[1] - g.layers[0]) * eng.experts_per_layer - g.slots) : Infinity;
+  const more = (g, b) => g.slots && g.parts.pool
+    ? Math.min(remainingSlots(g), Math.max(0, Math.floor(b / (g.parts.pool / g.slots)))) : 0;
   const where = (gs) => (one ? "this GPU" : gpuList(gs));
   const pools = (gs) => (one ? "the expert pool" : gs.length > 1 ? "their expert pools" : "its expert pool");
   // A dedicated helper (or drafter-only device) has no primary pool to grow on restart.
-  const hasPrimaryPool = (g) => g.slots > 0 && (g.parts.pool || 0) > 0;
+  const hasPrimaryPool = (g) => g.slots > 0 && (g.parts.pool || 0) > 0 && remainingSlots(g) > 0;
   const others = complete || plain ? [] : map.filter((g) => hasPrimaryPool(g) && (g.parts.other || 0) >= 0.5 * GIB);
   const frees = complete || plain ? [] : map.filter((g) => hasPrimaryPool(g) && !g.vision_lent && (g.free || 0) >= 2 * GIB);
   let advice = "";
@@ -482,7 +491,7 @@ function GpuMap({m}) {
     ${one || plain ? null : html`<div class="legend legend--sm" onPointerLeave=${() => setFocus(null)}>
       ${GPU_PARTS.map((d) => d.key).concat(["free"]).filter((k) => tot[k] > 0).map((k) => html`
         <span class="legend__item" onPointerOver=${() => setFocus(k === "free" ? null : k)}>
-          <i class=${`sw${k === "free" ? " sw--free" : ""}`} style=${`--gm-c:var(--gm-${k})`}></i>${label[k]} <b class="num">${gpuGb(tot[k])}</b></span>`)}</div>`}
+          <i class=${`sw${k === "free" ? " sw--free" : ""}`} style=${`--gm-c:var(--gm-${k})`}></i>${k === "free" ? "Free across GPUs" : label[k]} <b class="num">${gpuGb(tot[k])}</b></span>`)}</div>`}
     <div class="gpurows" data-focus=${focus || undefined} onPointerLeave=${() => { setFocus(null); setTip(null); }}>
       ${rows.map((r) => {
         const g = r.g, p = g.parts || {}, o = isOpen(r);
@@ -503,6 +512,7 @@ function GpuMap({m}) {
       })}
     </div>
     ${now ? html`<p class="card__note">${now}</p>` : null}
+    ${!plain && complete && eng.engine_kind === "ik2" ? html`<p class="card__note">Expert pools have room for all ${fmt(eng.experts)} experts.</p>` : null}
     ${advice ? html`<p class="card__note card__note--tip">${advice}</p>` : null}
     ${tip ? html`<div class="gputip" role="tooltip" style=${`left:${tip.x}px;top:${tip.y}px`}>${tip.text}</div>` : null}
   </section>`;
@@ -537,7 +547,7 @@ function Hardware({m, gpuEach}) {
   const v = {
     gpu: [hw.gpu_util == null ? null : fmt(hw.gpu_util), "%", each ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : multi ? `mean of ${gpus.length} cards` : st.gpu_name || ""],
     vram: [hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
-           each ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`)) : (multi ? `${gpus.length} cards · ` : "") + (eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : "")],
+           each ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`)) : (multi ? `${gpus.length} cards · ` : "") + (eng.expert_slots ? `${fmt(eng.expert_slots)} ${eng.engine_kind === "ik2" ? "expert slots" : "experts cached"}` : "")],
     temp: [hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C", each ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : multi ? `hottest of ${gpus.length} cards` : ""],
     power: [hw.gpu_power == null ? null : fmt(hw.gpu_power), "W",
             each ? per((g) => (g.power == null ? "–" : `${fmt(g.power)}${g.power_limit ? `/${fmt(g.power_limit)}` : ""} W`))

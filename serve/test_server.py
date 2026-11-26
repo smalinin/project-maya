@@ -1555,17 +1555,19 @@ class LiveRate(unittest.TestCase):
         engine.can_stop = False
         engine.max_context = 262144
         engine.prefill_tok_s_mean = 9999.0
-        engine.lines.put("PP 10000 12000 2000 1000.0")  # 8000 cached, 2000 newly read in two seconds
+        engine.lines.put("PP 10000 12000 2000 1000.0 8000")  # 8000 cached, 2000 newly read in two seconds
         engine.lines.put("DONE 1 12000 4000 10 stop 0 0 8000")
         gen = engine.generate([1], 1, {}, threading.Event())
         self.assertIsNone(next(gen))
-        self.assertEqual(engine.progress, (10000, 12000, 0, 2000.0))
+        self.assertEqual(engine.progress, (10000, 12000, 8000, 2000.0))
         self.assertEqual(engine.prefill_tok_s_mean, 1000.0)
         self.svc.engine = engine
         self.svc.status.update(busy=True)
         self.svc.latest_request = RequestStat()     # it has the engine; no answer token yet
-        self.assertEqual(self.metrics()["live"]["prefill_tok_s_mean"], 1000.0)
-        self.assertNotIn("prefill_tok_s", self.metrics()["live"])
+        live = self.metrics()["live"]
+        self.assertEqual((live["prefill_tok_s_mean"], live["prompt_read"], live["prompt_total"], live["prompt_reused"]),
+                         (1000.0, 10000, 12000, 8000))
+        self.assertNotIn("prefill_tok_s", live)
         self.assertEqual(self.svc._prefill_tok_s_mean(), 1000.0)
         self.svc.latest_request.first_token = time.time()
         self.svc.current_requests.add(self.svc.latest_request)

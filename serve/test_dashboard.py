@@ -163,6 +163,35 @@ class Dashboard(unittest.TestCase):
         self.engine.info.update(mtp=1)
         self.assertEqual(json.loads(self.req("GET", "/metrics")[2])["engine"]["speculation"], ["MTP"])
 
+    def test_metrics_report_the_inkling_drafter_that_loaded(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        name = "Inkling DSpark Q5_K-Mixed.gguf"
+        for fields, loaded, fmt, spec in (
+            ("dspark=1 drafter_format=Q5_K/BF16", name, "Q5_K/BF16", ["DSpark"]),
+            ("dspark=0 drafter_format=Q5_K/BF16", name, "Q5_K/BF16", []),
+            ("dspark=1", name, None, ["DSpark"]),
+            ("dspark=0 drafter_format=none", None, None, []),
+        ):
+            with self.subTest(fields=fields):
+                vram = f"VRAM dev=5 total=24000000000 free=5000000000 drafter={3000000000 if loaded else 0}\n"
+                stdout = iter((f"INFO engine=ik2 engine_kind=ik2 {fields}\n", vram, "READY 262144 stop\n"))
+                proc = SimpleNamespace(stdout=stdout, pid=12345, poll=lambda: None)
+                with patch("serve.server.subprocess.Popen", return_value=proc), \
+                        patch("serve.server.track_spawned"), patch("serve.server.threading.Thread"):
+                    self.svc.engine = StrataEngine("maya-ik2", ["--draft", str(Path(self.tmp.name) / name)])
+                metrics = json.loads(self.req("GET", "/metrics")[2])
+                engine = metrics["engine"]
+                self.assertEqual((engine["drafter_name"], engine["drafter_format"], engine["speculation"]), (loaded, fmt, spec))
+                if loaded:
+                    self.assertEqual(metrics["gpu_map"][0]["parts"]["drafter"], 3000000000)
+                    self.svc.engine.ended = True
+                    metrics = json.loads(self.req("GET", "/metrics")[2])
+                    self.assertIsNone(metrics["engine"]["drafter_name"])
+                    self.assertIsNone(metrics["engine"]["drafter_format"])
+                    self.assertIsNone(metrics["gpu_map"])
+
     def test_stat_lines_carry_the_draft_counts_and_the_ssd_bytes(self):
         # the engines' STAT lines (GLM, CYBER-FROST, DeepSeek, MiniMax): live draft_acc / draft_off and disk_gb reach the
         # Monitor's tiers.now as numbers
@@ -870,6 +899,37 @@ console.log(JSON.stringify(out));""")
         self.assertEqual(got["zeroKept"]["text"], "0% (0 of 40)")                  # a real 0%: drafted, none kept
         self.assertEqual(got["last"]["text"], "50% (600 of 1,200)")
         self.assertEqual(got["oldServer"]["state"], "none")
+
+    def test_monitor_shows_the_loaded_inkling_drafter_when_speculation_is_off(self):
+        got = self.node("""
+const {MonitorPage} = await import(web + "/monitor.js");
+const nodes = (v) => Array.isArray(v) ? v.flatMap(nodes) : v?.props ? [v, ...nodes(v.props.children)] : [];
+function card(engine) {
+  st.S.metrics = {engine, live: {state: "generating", spec_off: true}};
+  const tp = nodes(MonitorPage()).find((v) => v.type?.name === "Throughput");
+  const view = nodes(tp.type(tp.props));
+  return {
+    name: view.find((v) => v.props.class === "stat__note stat__file")?.props.children ?? null,
+    note: view.find((v) => v.props.class === "stat__note")?.props.children ?? null,
+    state: view.find((v) => v.props.class === "stat__value num")?.props.children ?? null,
+  };
+}
+console.log(JSON.stringify({active: card({speculation: ["DSpark"], drafter_name: "Inkling Q5_K Mixed.gguf",
+                                         drafter_format: "Q5_K/BF16"}), none: card({speculation: []})}));""")
+        self.assertEqual(got["active"]["name"], "Inkling Q5_K Mixed.gguf")
+        self.assertIn("DSpark · Q5_K/BF16", got["active"]["note"])
+        self.assertEqual(got["active"]["state"], "off")
+        self.assertIsNone(got["none"]["name"])
+
+    def test_monitor_shows_the_live_prefill_rate(self):
+        got = self.node("""
+const {MonitorPage} = await import(web + "/monitor.js");
+const nodes = (v) => Array.isArray(v) ? v.flatMap(nodes) : v?.props ? [v, ...nodes(v.props.children)] : [];
+st.S.metrics = {live: {state: "reading", prompt_read: 4096, prompt_total: 8192, prefill_tok_s_mean: 513.2}};
+const tp = nodes(MonitorPage()).find((v) => v.type?.name === "Throughput");
+const rate = nodes(tp.type(tp.props)).find((v) => v.props.class === "speed__mid num");
+console.log(JSON.stringify({rate: rate.props.children[0]}));""")
+        self.assertEqual(got["rate"], "513")
 
     def test_experts_on_the_ssd_have_their_bytes_like_the_other_tiers(self):
         got = self.node("""

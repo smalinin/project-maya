@@ -179,6 +179,10 @@ def speed(m: dict, width: int):
         badge += f" · {live['queued']} queued"
     lines.append(Text.assemble(("● ", tone), (badge, f"bold {tone}"), ("  " + what, MUTED)))
     lines.append(bar(frac, width))
+    if draft := eng.get("drafter_name"):
+        if draft_format := eng.get("drafter_format"):
+            draft += f" · {draft_format}"
+        lines.append(label("Drafter", clip(draft, max(1, width - 9))))
     ms = tn.get("ms_tok") if gen and tn else 1000 / rate if rate else None
     fresh = tn and tn.get("time") and time.time() - tn["time"] <= 30
     hit = tn.get("vram_hit") if fresh else last and last.get("hit_rate")

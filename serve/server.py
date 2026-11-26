@@ -1143,7 +1143,7 @@ class StrataEngine:
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
+        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--draft")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
@@ -1198,6 +1198,13 @@ class StrataEngine:
             # only after the process is reaped (a busy CI runner saw it alive right after a failed restart)
             self.ended = True
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+        if self.info.get("engine_kind") == "ik2":
+            # The engine confirms it retained the drafter after calibration. Older builds report the active DSpark flag.
+            fmt = self.info.get("drafter_format")
+            loaded = fmt != "none" if fmt is not None else self.info.get("dspark") == 1
+            draft = paths.get("--draft") if loaded else None
+            self.info["drafter_name"] = Path(draft).name if draft else None
+            self.info["drafter_format"] = fmt if draft else None
         # (#1026) a start that came out short of its VRAM reserve (maya-ds4: INFO reserve_short=<MiB>) - the engine
         # measured what it allocates after its experts' plan and keeps that free from its next start on: started
         # once more now, so the first start after an update or a new setting never serves with the reserve used up
@@ -3977,6 +3984,9 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
                   "trained_context": self.trained_context,
                   **({"dspark": self.dspark} if self.dspark is not None else {})}
+        drafter_gone = bool(engine.get("drafter_name")) and (self.unloaded or not self.engine.alive())
+        if drafter_gone:
+            engine["drafter_name"] = engine["drafter_format"] = None
         # the drafters on (empty: drafting is off): the Monitor's Speculation says "off", or the draft acceptance
         engine["speculation"] = speculation_modes(engine, lookup=self.lookup)
         with self.status_lock:
@@ -3992,7 +4002,7 @@ class Service:
                                                "cpu", "ram", "disk_mb", "engram_ms")}}   # (the last four: DeepSeek's)
         hw = dict(tel["now"])
         cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
-        return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
+        return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": None if drafter_gone else self._gpu_map(cards),
                 "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "loop_guard": guard, "hardware": hw,
                 "hardware_static":
