@@ -37,8 +37,8 @@ Adds interactive setup for downloaded GGUF models, including directory/file brow
 - [unsloth/Inkling-2-Small -- IQ3_XXS](https://huggingface.co/unsloth/Inkling-2-Small-GGUF)
 
 
-- [Xylolabs/Hy4 -- IQ3_S](https://huggingface.co/Xylolabs/Hy4-GGUF) - [Dfly2 -- Q5_K-Mixed](https://huggingface.co/smalinin/Hy4-DFly2-GGUF)
-- [AngelSlim/Hy4 -- IQ2](https://huggingface.co/AngelSlim/Hy4-GGUF) - [Dfly2 -- Q5_K-Mixed](https://huggingface.co/smalinin/Hy4-DFly2-GGUF)
+- [Xylolabs/Hy4 -- IQ3_S](https://huggingface.co/Xylolabs/Hy4-GGUF) - drafter >> [Dfly2 -- Q5_K-Mixed](https://huggingface.co/smalinin/Hy4-DFly2-GGUF)
+- [AngelSlim/Hy4 -- IQ2](https://huggingface.co/AngelSlim/Hy4-GGUF) - drafter >> [Dfly2 -- Q5_K-Mixed](https://huggingface.co/smalinin/Hy4-DFly2-GGUF)
 
 > Run a few representative prompts to build a hot-expert profile. Maya uses
 > this profile to prioritize frequently used experts in VRAM on subsequent launches.   
