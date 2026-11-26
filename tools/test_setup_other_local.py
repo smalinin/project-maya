@@ -192,14 +192,15 @@ class LocalOther(unittest.TestCase):
                     self.assertIn(524288, context.call_args.args[2])
                 self.assertEqual(cfg["model_name"], f"custom-{family}-q3_k")
 
-    def local_setup(self, family, source):
-        a = SimpleNamespace(model=None, models_dir=str(self.models), yes=False, check=False, context=4096, backend="cuda",
+    def local_setup(self, family, source, *, batch=False):
+        a = SimpleNamespace(model=None, model_dir=str(source) if batch else None, models_dir=str(self.models),
+                            yes=batch, check=False, context=4096, backend="cuda",
                             no_vision=False, repack=False, env=[], port=None, host=None, api_key=None)
         n_gpu = 6 if family == "ik2_small" else 1
         pc = {"backend": "cuda", "gpus": [{"index": i, "vram_gb": 48} for i in range(n_gpu)]}
         exe = self.root / "maya-ik2"
         exe.touch()
-        choose = [1 if family == "ik2" else 0, 3]  # 0) Add downloaded model, then Link files
+        choose = [] if batch else [1 if family == "ik2" else 0, 3]  # 0) Add downloaded model, then Link files
         with patch.multiple(maya, ROOT=self.root, IK2_EXE=exe), \
                 patch.object(maya, "choose", side_effect=choose), \
                 patch.object(maya.S, "ask_text", return_value=str(source)), \
@@ -262,6 +263,30 @@ class LocalOther(unittest.TestCase):
                 self.assertTrue(all(p.is_symlink() for p in targets))
                 self.assertEqual([p.resolve() for p in targets], [first, second, draft, vision])
         self.assertEqual(stock.read_text(), '{"preserve": true}')
+
+    def test_inkling_small_prefers_a_compatible_native_q8_drafter(self):
+        source = self.root / "small"
+        gguf(source / "custom.gguf", "inkling2", metadata={"inkling2.embedding_length": 4608})
+
+        def draft(name, width, tensor_type):
+            path = source / name
+            hy4_fixture.gguf(path, {"general.architecture": (8, "dflash"), "dflash.embedding_length": (4, width)},
+                             [("dspark_hidden_out.weight", 30, [32, width]),
+                              ("blk.0.attn_q.weight", tensor_type, [32, 1])])
+            return path
+
+        bf16 = draft("a-dspark-Q8_0-in-name-only.gguf", 4608, 30)
+        q8 = draft("z-renamed.gguf", 4608, 8)
+        draft("b-dspark-mini-Q8_0.gguf", 2304, 8)
+        candidates = maya.review_candidates(source, "ik2_small")
+        self.assertEqual([item["path"] for item in candidates["drafter"]], [q8, bf16])
+        for batch in (False, True):
+            with self.subTest(batch=batch):
+                _, cfg, _ = self.local_setup("ik2_small", source, batch=batch)
+                linked = Path(maya.flag_value(cfg["args"], "--draft"))
+                self.assertTrue(linked.is_symlink())
+                self.assertEqual(linked.resolve(), q8)
+                self.assertEqual(maya.flag_value(cfg["args"], "--drafting"), "auto")
 
     def test_inkling_rejects_an_unsupported_expert_type_before_linking(self):
         source = self.root / "inkling"

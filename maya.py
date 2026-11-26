@@ -3928,6 +3928,10 @@ def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
     for path, _ in listing:
         role = review_role(path, src)
         suffix = path.suffix.lower()
+        if family == "ik2_small" and role == "model" and suffix == ".gguf":
+            shard = SHARD_RE.search(path.name)
+            if (not shard or int(shard.group(1)) == 1) and gguf_head(path)[0] == "dflash":
+                role = "drafter"
         if family == "hy4_full" and suffix in (".gguf", ".gguf_file", ".dfly2"):
             from gguf_reader import GGUFFile
             try:
@@ -3965,6 +3969,16 @@ def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
         found["drafter"].sort(key=lambda c: (not c["path"].name.casefold().startswith("mtp-qwen"),
                                                 "shared" in c["path"].name.casefold(),
                                                 c["path"].name.casefold()))
+    if family == "ik2_small":
+        ranked = []
+        for candidate in found["drafter"]:
+            try:
+                fmt = ik2_drafter_format(candidate["path"], 4608)
+            except (OSError, TypeError, ValueError, KeyError, IndexError, struct.error):
+                continue
+            if fmt:
+                ranked.append((fmt != "q8_0", candidate))
+        found["drafter"] = [candidate for _, candidate in sorted(ranked, key=lambda item: item[0])]
     return found
 
 
@@ -4288,20 +4302,24 @@ def link_qwen_local(models: Path, chosen: dict) -> dict | None:
             "vision": dest / "vision" / vision["path"].name if vision else None}
 
 
-def ik2_local_drafter(path: Path, width: int) -> bool:
-    """Read the DSpark output projection and target geometry from its header."""
+def ik2_drafter_format(path: Path, width: int) -> str | None:
+    """The matrix format maya-ik2 uses for a matching DSpark file, determined from its header."""
     if path.suffix.lower() == ".safetensors":
         with path.open("rb") as f:
             (size,) = struct.unpack("<Q", f.read(8))
             if size > 64 << 20:
-                return False
+                return None
             header = json.loads(f.read(size))
-        return (header.get("markov_head.hidden_out.weight") or {}).get("shape", [0])[0] == width
+        tensor = header.get("markov_head.hidden_out.weight") if isinstance(header, dict) else None
+        shape = tensor.get("shape") if isinstance(tensor, dict) else None
+        return "bf16" if isinstance(shape, list) and shape and shape[0] == width else None
     from gguf_reader import GGUFFile
     g = GGUFFile(path)
-    return (g.metadata.get("general.architecture") == "dflash" and
-            g.metadata.get("dflash.embedding_length") == width and
-            any(t.name == "dspark_hidden_out.weight" for t in g.tensors))
+    if g.metadata.get("general.architecture") != "dflash" or g.metadata.get("dflash.embedding_length") != width or \
+            not any(t.name == "dspark_hidden_out.weight" for t in g.tensors):
+        return None
+    matrices = {t.type_name for t in g.tensors if t.name.startswith("blk.") and len(t.shape) == 2}
+    return "q8_0" if matrices == {"Q8_0"} else "bf16"
 
 
 def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
@@ -4363,7 +4381,7 @@ def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
                                   if t.name.endswith("_exps.weight") and t.type_name not in expert_types})
             if unsupported:
                 raise ValueError(f"maya-ik2 cannot read these expert types: {', '.join(unsupported)}")
-            if drafter and not ik2_local_drafter(drafter, width):
+            if drafter and not ik2_drafter_format(drafter, width):
                 raise ValueError(f"{drafter.name}: select the matching Inkling 2 DSpark drafter")
         if vision:
             meta = GGUFFile(vision).metadata
