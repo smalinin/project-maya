@@ -30,9 +30,18 @@ Adds interactive setup for downloaded GGUF models, including directory/file brow
 - [DeepSeek-V4.1-Flash-1017 — Q3_K]
 
 - [Qwen3.8-Flash-Next-Uncensored — Q8_0](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF)
-- [Qwen3.8-Flash-Next — Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/Q8_0)
+- [Qwen3.8-Flash-Next -- Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/Q8_0)
+
+- [unsloth/Inkling-2-Mini -- Q8_0](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
+
+- [unsloth/Inkling-2-Small -- IQ3_XXS](https://huggingface.co/unsloth/Inkling-2-Small-GGUF)
 
 
+- [Xylolabs/Hy4 -- IQ3_S](https://huggingface.co/Xylolabs/Hy4-GGUF)
+- [AngelSlim/Hy4 -- IQ2](https://huggingface.co/AngelSlim/Hy4-GGUF)
+
+> Run a few representative prompts to build a hot-expert profile. Maya uses
+> this profile to prioritize frequently used experts in VRAM on subsequent launches.   
 
 <hr>
 <p align="center">English | <a href="README.ja.md">日本語</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.pt-BR.md">Português</a></p>
