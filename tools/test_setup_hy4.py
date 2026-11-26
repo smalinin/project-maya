@@ -1252,6 +1252,25 @@ class Config(unittest.TestCase):
         self.assertEqual(c["env"], {"HY4_HOT_LEARN": "1"})
         self.assertNotIn("backend", c)
 
+    def test_full_hy4_defaults_to_warming_lane_experts(self):
+        model = self.root / "Hy4-local-IQ3_S"
+        pack = model / "maya-hy4"
+        pack.mkdir(parents=True)
+        pc = {"gpus": [{"index": 0}]}
+
+        def write(a):
+            return maya.write_config_hy4(a, pc, {}, pack, 128000, self.root, model, quant="local",
+                                         extra={"hy4_arch": maya.HY4_FULL_ARCH})
+
+        path = write(args())
+        config = maya.read_json(path)
+        self.assertEqual(config["env"]["HY4_LANE_WARM"], "1")
+        del config["env"]["HY4_LANE_WARM"]
+        path.write_text(json.dumps(config))
+        self.assertEqual(maya.read_json(write(args()))["env"]["HY4_LANE_WARM"], "1")
+        self.assertEqual(maya.read_json(write(args(env=["HY4_LANE_WARM=0"])))["env"]["HY4_LANE_WARM"], "0")
+        self.assertEqual(maya.read_json(write(args()))["env"]["HY4_LANE_WARM"], "0")
+
     def test_small_card_layout(self):
         fit = maya.hy4_fit(XS, [card(8)], used={0: 400})
         c = self.write(fit=fit, ctx=fit["context"])

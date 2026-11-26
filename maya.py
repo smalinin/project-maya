@@ -11564,6 +11564,8 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            **({"backend": "hip"} if pc.get("backend") == "hip" else {})}
     kept += keep_server_settings(cfg, old, a)
     env = {**(old.get("env") or {}), "HY4_HOT_LEARN": "1", **parse_env(a.env)}
+    if inst.get("hy4_arch") == HY4_FULL_ARCH:
+        env.setdefault("HY4_LANE_WARM", "1")
     if rmark is not None:
         rmark[0](env, *rmark[1:])
     cfg["env"] = env
