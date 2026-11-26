@@ -1252,7 +1252,7 @@ class Config(unittest.TestCase):
         self.assertEqual(c["env"], {"HY4_HOT_LEARN": "1"})
         self.assertNotIn("backend", c)
 
-    def test_full_hy4_defaults_to_warming_lane_experts(self):
+    def test_full_hy4_expert_defaults_and_overrides(self):
         model = self.root / "Hy4-local-IQ3_S"
         pack = model / "maya-hy4"
         pack.mkdir(parents=True)
@@ -1264,12 +1264,20 @@ class Config(unittest.TestCase):
 
         path = write(args())
         config = maya.read_json(path)
-        self.assertEqual(config["env"]["HY4_LANE_WARM"], "1")
-        del config["env"]["HY4_LANE_WARM"]
+        expected = {"HY4_LANE_WARM": "1", "HY4_FETCH": "mix:1", "HY4_FETCH_GB": "32"}
+        for key, value in expected.items():
+            self.assertEqual(config["env"].pop(key), value)
         path.write_text(json.dumps(config))
-        self.assertEqual(maya.read_json(write(args()))["env"]["HY4_LANE_WARM"], "1")
-        self.assertEqual(maya.read_json(write(args(env=["HY4_LANE_WARM=0"])))["env"]["HY4_LANE_WARM"], "0")
-        self.assertEqual(maya.read_json(write(args()))["env"]["HY4_LANE_WARM"], "0")
+        self.assertEqual(maya.read_json(write(args()))["env"], {"HY4_HOT_LEARN": "1", **expected})
+        override = {"HY4_LANE_WARM": "0", "HY4_FETCH": "off", "HY4_FETCH_GB": "16"}
+        assigned = args(env=[f"{key}={value}" for key, value in override.items()])
+        self.assertEqual(maya.read_json(write(assigned))["env"], {"HY4_HOT_LEARN": "1", **override})
+        self.assertEqual(maya.read_json(write(args()))["env"], {"HY4_HOT_LEARN": "1", **override})
+
+        config["args"] += ["--gpu-fetch", "lane"]
+        path.write_text(json.dumps(config))
+        rewritten = maya.read_json(write(args()))["args"]
+        self.assertEqual(rewritten[rewritten.index("--gpu-fetch") + 1], "lane")
 
     def test_small_card_layout(self):
         fit = maya.hy4_fit(XS, [card(8)], used={0: 400})

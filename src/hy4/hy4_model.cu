@@ -4586,7 +4586,7 @@ struct Model::Impl {
         // (Model::load starts them then)
         //  (a drafting trial: the lane as a start finds it before its copies are made - neither, and no files)
         if (lane && !o.trial && !fetch_setup(err)) return false;
-        if (g.full && lane && !o.trial && !fx.layers && !prompt_ram_setup(err)) return false;
+        if (g.full && lane && !o.trial && (!fx.layers || fx.mode == 2) && !prompt_ram_setup(err)) return false;
         if (lane && !o.trial && fx.mode != 1 && !fetch_pending()) q4x_start();
         if (lane && !fetch_pending()) route_start();
         st.experts_vram = n_res;
@@ -6991,6 +6991,10 @@ struct Model::Impl {
         std::memcpy(dst + l.tr[role], src, role == 2 ? cx.d_stride : cx.g_stride);
     }
 
+    const uint8_t* prompt_fetch_ram(const Layer& l) const {
+        return fx.mode == 2 && l.fx_on ? l.fx_mem : nullptr;
+    }
+
     bool prompt_ram_setup(std::string& err) {
         const char* route_env = std::getenv("HY4_ROUTE");
         const char* stream_env = std::getenv("HY4_STREAM");
@@ -7005,7 +7009,7 @@ struct Model::Impl {
         const double started = now_s();
         double last_report = started;
         for (Layer& l : L) {
-            if (!l.partial()) continue;
+            if (!l.partial() || prompt_fetch_ram(l)) continue;
             const size_t bytes = (size_t) l.n_lane() * l.blob;
             if (bytes == 0 || (double) bytes > budget) continue;
             Gpu& gp = G[(size_t) l.gpu];
@@ -7088,6 +7092,8 @@ struct Model::Impl {
             stg_np[m] = (int) u.size();
         }
         if (from_ram && u.empty()) return experts_sets(l, gp, T, err, l.slot_d);
+        const uint8_t* fetch_ram = from_ram ? prompt_fetch_ram(l) : nullptr;
+        const uint8_t* cached_ram = fetch_ram ? fetch_ram : l.prompt_ram;
         for (size_t p0 = 0; p0 < u.size(); p0 += (size_t) kStage) {
             const int np = (int) std::min(u.size() - p0, (size_t) kStage);
             const double tc = now_s();
@@ -7096,7 +7102,11 @@ struct Model::Impl {
                 pack_expert(l, e, role, bounce + (size_t) i * l.blob);
             };
             if (from_ram) {
-                auto cached_slot = [&](int i) { return l.prompt_ram ? l.prompt_slots[(size_t) u[p0 + (size_t) i]] : -1; };
+                auto cached_slot = [&](int i) {
+                    const int expert = u[p0 + (size_t) i];
+                    if (fetch_ram) return expert;
+                    return cached_ram ? l.prompt_slots[(size_t) expert] : -1;
+                };
                 std::vector<int> missing;
                 for (int i = 0; i < np; ++i)
                     if (cached_slot(i) < 0) missing.push_back(i);
@@ -7110,7 +7120,7 @@ struct Model::Impl {
                     const int slot = cached_slot(i);
                     end = i + 1;
                     while (end < np && cached_slot(end) == (slot < 0 ? -1 : slot + end - i)) ++end;
-                    const uint8_t* src = slot < 0 ? bounce + (size_t) i * l.blob : l.prompt_ram + (size_t) slot * l.blob;
+                    const uint8_t* src = slot < 0 ? bounce + (size_t) i * l.blob : cached_ram + (size_t) slot * l.blob;
                     CK(cudaMemcpyAsync(gp.stage + (size_t) i * l.blob, src, (size_t) (end - i) * l.blob,
                                        cudaMemcpyHostToDevice, gp.prompt_copy));
                 }
@@ -7230,7 +7240,7 @@ struct Model::Impl {
             // the GPU computes it while the host waits on the copies' event and the lane works
             // (the GPU fetch, a token window: the picks resolved and the GPU's misses copied first, beside the GEMVs
             //  below - gpu: no lane, no wait; mix: the lane takes the entries fetch_resolve left it)
-            const bool fxl = fx.mode != 0 && l.fx_on && T <= W && l.tpm < 0;
+            const bool fxl = fx.mode != 0 && l.fx_on && T <= W && l.tpm < 0 && !gp.prompt_stage;
             if (fxl && !fetch_layer(l, gp, T, err)) return false;
             if (fxl && fx.mode == 1 && fx.cache && fx.ahead && (size_t) l.il + 1 < L.size()) {
                 Layer& nl = L[(size_t) l.il + 1];
@@ -8468,10 +8478,12 @@ struct Model::Impl {
 
     int prompt_batch() const {
         const char* flag = std::getenv("HY4_PREFILL_PIPELINE");
+        // The mix only stages misses, so the prompt can still use the host's resident-slot tables.
         if (!g.full || G.size() < 2 || L.front().gpu == L.back().gpu || !imgs.empty() || prof || dump || inject ||
-            logit_hash || fx.layers || (flag && std::atoi(flag) == 0)) return Tc;
+            logit_hash || (fx.layers && fx.mode != 2) || route.mode == 3 || (flag && std::atoi(flag) == 0)) return Tc;
         for (const Layer& l : L)
-            if (l.partial() && !l.prompt_ram && !(flag && std::atoi(flag) != 0 && route.mode == 2)) return Tc;
+            if (l.partial() && !l.prompt_ram && !prompt_fetch_ram(l) && !(flag && std::atoi(flag) != 0 && route.mode == 2))
+                return Tc;
         return Tc * (int) G.size();
     }
 
@@ -9756,6 +9768,7 @@ bool Model::load(const Options& o, std::string& err) {
             err = "the GPU fetch's copies: " + err;
             return false;
         }
+        if (best == 2 && x.g.full && !x.prompt_ram_setup(err)) return false;
         if (best != 1 && x.lane) x.q4x_start();   // (the 4-bit copies, as without the fetch)
         if (x.lane) x.route_start();             // (the prompt route: by the fetch's mode)
         return true;

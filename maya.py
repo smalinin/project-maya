@@ -11509,6 +11509,7 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     stem = f"maya-{local_name}" if local_name else Q.config_stem("hy4", quant)
     cfg_path = ROOT / f"{stem}.json"
     old = read_json(cfg_path)
+    full = (extra or {}).get("hy4_arch") == HY4_FULL_ARCH
     # (--tp auto, the engine's default: tensor parallel over the largest group of equal GPUs, the fastest GPU holding
     #  the head and the drafts; the layers split where no group fits.  No --gpus: the server shows the engine only the
     #  config's "gpu" cards, and it takes all it sees)
@@ -11531,6 +11532,7 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     standard = fit["layout"] == HY4_STANDARD and (old.get("installer") or {}).get("layout", HY4_STANDARD) == HY4_STANDARD
     kept = keep_args(old.get("args") or [], args, ("--tp", "--main-gpu", "--cpu-threads", "--profile", "--draft",
                                                    "--draft-floor") +
+                     (("--gpu-fetch",) if full else ()) +
                      (("--chunk", "--reserve-gb", "--vram-experts") if standard else ()))
     rmark = None
     if getattr(a, "vram_reserve_mib", None) is not None:   # (#1026) given now: written, and a later setup keeps it
@@ -11564,8 +11566,10 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            **({"backend": "hip"} if pc.get("backend") == "hip" else {})}
     kept += keep_server_settings(cfg, old, a)
     env = {**(old.get("env") or {}), "HY4_HOT_LEARN": "1", **parse_env(a.env)}
-    if inst.get("hy4_arch") == HY4_FULL_ARCH:
+    if full:
         env.setdefault("HY4_LANE_WARM", "1")
+        env.setdefault("HY4_FETCH", "mix:1")
+        env.setdefault("HY4_FETCH_GB", "32")
     if rmark is not None:
         rmark[0](env, *rmark[1:])
     cfg["env"] = env
