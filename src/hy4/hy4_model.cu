@@ -3396,8 +3396,8 @@ struct Model::Impl {
             !mat_part(gp, p + "attn_gate.weight", l.gate, err, E, Hall * vm, 1, h0 * vm, h1 * vm, 0, E, 0, 1))
             return false;
         for (const Mat* m : {&l.q_a, &l.q_b, &l.kv_a, &l.k_b, &l.v_b, &l.wo, &l.gate})
-            if (m->type == kF32 || m->type == kBF16 || m->type == kF16 || m->type == kF8) {
-                err = p + ": an attention matrix in F32 / BF16 / F16 (maya-hy4 runs ggml's block types there)";
+            if (m->type != kF32 && !iq::mv_supported(m->type)) {
+                err = p + ": unsupported attention matrix type (maya-hy4 runs F32, BF16 loaded as F32, and ggml block types)";
                 return false;
             }
         if (l.mtp && (!f32(gp, p + "nextn.enorm.weight", l.enorm, err, E) ||
@@ -4901,6 +4901,13 @@ struct Model::Impl {
     // a 3D matrix head by head: y head h = M[h] x head h; x [T][H][..] (ldt, ldh), y + h ldyh, columns ldyt apart
     bool mm_heads(Gpu& gp, const Mat& M, const float* x, size_t ldt, size_t ldh, int T, int H, float* y, size_t ldyt,
                   size_t ldyh, bool pre = false) {
+        if (M.type == kF32) {   // (including BF16 weights expanded by mat() and mat_part())
+            const float one = 1.0f, zero = 0.0f;
+            const int ld = (int) (M.ld / sizeof(float));
+            return cublasSgemmStridedBatched(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, M.n, T, M.k, &one, (const float*) M.w,
+                                            ld, (long long) ld * M.n, x, (int) ldt, (long long) ldh, &zero, y,
+                                            (int) ldyt, (long long) ldyh, H) == CUBLAS_STATUS_SUCCESS;
+        }
         if (T > W) {   // (one strided batched GEMM over the heads: every head's matrix decoded to F16 at once)
             const size_t per = (size_t) M.n * M.k;
             if (per * H > gp.wband_n) return false;
