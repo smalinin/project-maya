@@ -2825,30 +2825,44 @@ class Q4xCheck(unittest.TestCase):
             self.assertNotIn("drafting", " ".join(maya.hy4_first_start_said(dict(cfg, args=["--mtp"]))))
 
     def test_the_hot_experts_file_is_kept_until_a_calibration(self):
-        """maya-hy4's HY4_HOT (on by default) places a start's experts in VRAM by scores the first start learns and
-        the starts after only read: a file a model in the data folder (not in the model's download), named by the
-        model's folder; --speed-calibration drops this model's file alone, so its run learns it again."""
+        """Read the model's pack-local scores, importing a legacy profile only when needed."""
         import serve.server as SV
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
-            c = self.cfg(root, args=["--pack", str(root / "Hy4-Flash-Maya-XS" / "maya-hy4"), "--max-context", "8192"])
-            self.assertEqual(SV.child_env(c)["HY4_HOT_FILE"],
-                             str(SV.ROOT / "data" / "hy4-expert-hot-Hy4-Flash-Maya-XS.bin"))
-            self.assertEqual(SV.hy4_hot_file({"args": ["--pack", "/m/My Pack!"]}).name, "hy4-expert-hot-My_Pack.bin")
+            pack = root / "Hy4-Flash-Maya-XS" / "maya-hy4"
+            pack.mkdir(parents=True)
+            mine = pack / "expert-hot.bin"
+            c = self.cfg(root, cwd=str(root), args=["--pack", str(pack.relative_to(root)), "--max-context", "8192"])
+            self.assertEqual(SV.hy4_hot_file(c), mine)
+            self.assertEqual(SV.hy4_hot_legacy_file({"args": ["--pack", "/m/My Pack!"]}).name, "hy4-expert-hot-My_Pack.bin")
             self.assertEqual(SV.hy4_hot_file({"args": []}).name, "hy4-expert-hot-model.bin")
             self.assertNotIn("HY4_HOT_FILE", SV.child_env({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}))
             (root / "data").mkdir()
-            mine = root / "data" / "hy4-expert-hot-Hy4-Flash-Maya-XS.bin"
+            legacy = root / "data" / "hy4-expert-hot-Hy4-Flash-Maya-XS.bin"
             other = root / "data" / "hy4-expert-hot-Hy4-Flash-Maya-S.bin"
-            mine.write_bytes(b"HY4HOT1\0")
+            legacy.write_bytes(b"HY4HOT1\0")
             other.write_bytes(b"HY4HOT1\0")
             said = []
-            with patch.object(maya, "ROOT", root), patch.object(maya, "ok", said.append),                     patch.object(SV, "HY4_HOT_SEEDS", root / "no-seeds"):
+            with patch.object(SV, "ROOT", root), patch.object(SV, "HY4_HOT_SEEDS", root / "no-seeds"), \
+                    patch.object(maya, "ok", said.append):
+                alternate = root / "custom-experts.bin"
+                custom = dict(c, env={"HY4_HOT_FILE": str(alternate)})
+                self.assertEqual(SV.child_env(custom)["HY4_HOT_FILE"], str(alternate))
+                self.assertFalse(mine.exists())
+                self.assertEqual(SV.child_env(c)["HY4_HOT_FILE"], str(mine))
+                self.assertEqual(mine.read_bytes(), legacy.read_bytes())
+                mine.write_bytes(b"new scores")
+                self.assertEqual(SV.child_env(c)["HY4_HOT_FILE"], str(mine))
+                self.assertEqual(mine.read_bytes(), b"new scores")
+                maya.hot_forget(c)
+                self.assertEqual(SV.child_env(c)["HY4_HOT_FILE"], str(mine))
+                self.assertEqual(mine.read_bytes(), b"")
+                legacy.unlink()
                 maya.hot_forget(c)
                 maya.hot_forget(c)                             # (none left: nothing said)
             self.assertFalse(mine.exists())
             self.assertTrue(other.exists())
-            self.assertEqual(len(said), 1)
+            self.assertEqual(len(said), 2)
             # the scores Maya ships (data/hy4-hot-seed, a file a size): HY4_HOT_SEED where there is one - a layout's
             # folder takes its size's; --speed-calibration leaves an empty file (this PC's own: the seed is not read)
             seeds = root / "seeds"

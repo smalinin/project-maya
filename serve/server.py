@@ -74,14 +74,47 @@ HY4_MEASURE_DOCS = ("docs/SETTINGS.md", "README.md")      # (... the text its fi
 HY4_MEASURE_CHARS = 200_000                               # (... about 55K tokens of it: up to 12 prompt chunks of 4096)
 
 
-def hy4_hot_file(cfg: dict) -> Path:
-    """maya-hy4's HY4_HOT scores for this config's model (each layer's experts a start places in VRAM): in the data
-    folder, a file a model - named by its folder (the pack's maya-hy4 folder sits in it)."""
-    args = cfg.get("args") or []
-    pack = Path(args[args.index("--pack") + 1]) if "--pack" in args[:-1] else None
+def hy4_pack_path(cfg: dict) -> Path | None:
+    pack = models.flag(cfg.get("args") or [], "--pack")
+    return (Path(cfg.get("cwd") or ".") / pack).absolute() if pack else None
+
+
+def _hy4_hot_stem(cfg: dict) -> str:
+    pack = hy4_pack_path(cfg)
     name = "" if pack is None else pack.parent.name if pack.name == "maya-hy4" else pack.name
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "model"
-    return ROOT / "data" / f"hy4-expert-hot-{name}.bin"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "model"
+
+
+def hy4_hot_legacy_file(cfg: dict) -> Path:
+    return ROOT / "data" / f"hy4-expert-hot-{_hy4_hot_stem(cfg)}.bin"
+
+
+def hy4_hot_file(cfg: dict) -> Path:
+    """The default writable expert profile, in the model's pack."""
+    pack = hy4_pack_path(cfg)
+    return pack / "expert-hot.bin" if pack is not None else hy4_hot_legacy_file(cfg)
+
+
+def hy4_hot_file_for_start(cfg: dict) -> Path:
+    """Import scores from the legacy path when the pack has no profile yet."""
+    path, legacy = hy4_hot_file(cfg), hy4_hot_legacy_file(cfg)
+    if path == legacy or path.exists() or not legacy.is_file():
+        return path
+    try:
+        # Publish a complete file without overwriting a profile installed by another start.
+        with tempfile.TemporaryDirectory(dir=path.parent, prefix=".hy4-hot-") as tmp:
+            staged = Path(tmp) / path.name
+            shutil.copyfile(legacy, staged)
+            if os.name == "nt":
+                staged.rename(path)
+            else:
+                os.link(staged, path)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        print(f"[maya] could not import the Hy4 expert profile into {path} ({exc}); using {legacy}", flush=True)
+        return legacy
+    return path
 
 
 HY4_HOT_SEEDS = ROOT / "data" / "hy4-hot-seed"            # (the scores Maya ships, a file a size: hy4_hot_seed)
@@ -90,10 +123,9 @@ HY4_HOT_SEEDS = ROOT / "data" / "hy4-hot-seed"            # (the scores Maya shi
 
 def hy4_hot_seed(cfg: dict) -> Path | None:
     """The HY4_HOT scores Maya ships for this config's model - data/hy4-hot-seed/hy4-expert-hot-<folder>.bin, the
-    folder's name as hy4_hot_file has it (a layout's folder, Hy4-Flash-Maya-XS-8GB, takes its size's) - for a PC that
+    model folder's name (a layout's folder, Hy4-Flash-Maya-XS-8GB, takes its size's) - for a PC that
     has no file of its own yet: its first start then places the experts as every start after it.  None: no such set."""
-    name = hy4_hot_file(cfg).name
-    stem = name[len("hy4-expert-hot-"):-len(".bin")]
+    stem = _hy4_hot_stem(cfg)
     size = re.match(r"(Hy4-Flash-Maya-[A-Za-z0-9]+)-", stem)
     for s in dict.fromkeys([stem] + ([size.group(1)] if size else [])):
         p = HY4_HOT_SEEDS / f"hy4-expert-hot-{s}.bin"
@@ -2607,7 +2639,8 @@ def child_env(cfg: dict) -> dict:
             if ids is not None:
                 env["HY4_DRAFT_IDS"] = str(ids)
         # HY4_HOT's scores for the next start live in a per-model file. HY4_HOT_LEARN refreshes them after an answer.
-        env.setdefault("HY4_HOT_FILE", str(hy4_hot_file(cfg)))
+        if "HY4_HOT_FILE" not in env:
+            env["HY4_HOT_FILE"] = str(hy4_hot_file_for_start(cfg))
         # (... and, where this PC has no such file yet, the scores Maya ships for the model - a first start places the
         #  experts as every start after it; a file of its own, learned or left by maya --speed-calibration, wins)
         seed = hy4_hot_seed(cfg)
