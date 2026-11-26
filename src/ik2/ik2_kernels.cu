@@ -5375,6 +5375,43 @@ __device__ __forceinline__ void store_f16x4(uint16_t* dst, float v0, float v1, f
     }
 }
 
+#ifndef MAYA_USE_HIP
+// Eight adjacent weights share a sign byte and either one IQ2_S grid or two IQ3_S grids.
+// Decode those together and write one aligned vector instead of reloading the block per value.
+template <int Type>
+__global__ void decode_f16_iqs_kernel(const uint8_t* blocks, size_t ntiles, uint4* out) {
+    const size_t tile = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (tile >= ntiles) return;
+    constexpr int bytes = Type == kIQ2_S ? 82 : 110;
+    const uint8_t* b = blocks + (tile / 32) * bytes;
+    const int i = tile % 32, group = i / 4, part = i % 4;
+    const unsigned high = b[66 + group];
+    const float d = half_bits_to_float((uint16_t) (b[0] | (b[1] << 8)));
+    unsigned signs;
+    uint64_t grid;
+    float scale;
+    if constexpr (Type == kIQ2_S) {
+        const unsigned index = b[2 + i] | (((high >> (2 * part)) & 3u) << 8);
+        grid = iq2s_grid_at(index);
+        signs = b[34 + i];
+        scale = d * (0.5f + ((b[74 + group] >> (4 * (part / 2))) & 15)) * 0.25f;
+    } else {
+        const unsigned hi = high >> (2 * part);
+        const unsigned lo_index = b[2 + 2 * i] | ((hi & 1u) << 8);
+        const unsigned hi_index = b[3 + 2 * i] | ((hi & 2u) << 7);
+        grid = iq3s_grid_at(lo_index) | ((uint64_t) iq3s_grid_at(hi_index) << 32);
+        signs = b[74 + i];
+        scale = d * (1 + 2 * ((b[106 + group / 2] >> (4 * (group % 2))) & 15));
+    }
+    float w[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        w[j] = scale * (float) ((grid >> (8 * j)) & 255u) * ((signs >> j) & 1u ? -1.0f : 1.0f);
+    out[tile] = make_uint4(f2_to_u32(w[0], w[1]), f2_to_u32(w[2], w[3]),
+                          f2_to_u32(w[4], w[5]), f2_to_u32(w[6], w[7]));
+}
+#endif
+
 // one thread per 32-value sub-block of IQ3_XXS / IQ4_XS -> 32 FP16 (ggml's dequantize_row_iq3_xxs / iq4_xs values)
 __global__ void decode_f16_iq_kernel(int type, const uint8_t* blocks, size_t nsub, uint16_t* out) {
     const size_t sb = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -8300,6 +8337,17 @@ void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaSt
         check("decode_f16_iq");
         return;
     }
+#ifndef MAYA_USE_HIP
+    if ((type == kIQ2_S || type == kIQ3_S) && n % 256 == 0 && ((uintptr_t) out & 15) == 0) {
+        const size_t tiles = n / 8;
+        if (type == kIQ2_S)
+            decode_f16_iqs_kernel<kIQ2_S><<<grid(tiles), kBlk, 0, s>>>(blocks, tiles, (uint4*) out);
+        else
+            decode_f16_iqs_kernel<kIQ3_S><<<grid(tiles), kBlk, 0, s>>>(blocks, tiles, (uint4*) out);
+        check("decode_f16_iqs");
+        return;
+    }
+#endif
     if ((type == kQ5_K || type == kQ6_K) && n % 256 == 0) {
         decode_f16_k_kernel<<<grid(n / 256, kBlk / 32), kBlk, 0, s>>>(type, blocks, n / 256, out);
         check("decode_f16_k");
