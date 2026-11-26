@@ -1032,7 +1032,7 @@ def describe(path: Path, running: str | None) -> dict:
                    context_more=not hy4_full(cfg) and bool(hy4_fits) and
                    max(hy4_fits) < (HY4_Q4_LONG if hy4_plain(cfg) else HY4_CONTEXTS)[-1])
         if hy4_full(cfg):
-            own["shown"] = "Hy4"
+            own.update(shown="Hy4", hy4_full=True)
     if ik2:
         # (Inkling-2-Mini: whether each context keeps every expert in VRAM on its card, by the cache's format; the
         #  page says where the engine would run its slower path)

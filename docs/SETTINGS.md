@@ -2419,6 +2419,16 @@ Engine options, in the config's `"args"`:
 | `MAYA_EXPERT_RAM_GB` | unset (what the RAM allows) | caps the experts' RAM tier, in GB (the dashboard's Models page: Experts in RAM) |
 | `MAYA_EXPERT_STAGERS` | Linux: the reads at once the model's drive serves fastest (2, 4, 8 or 16, measured in ~1 s at the first start on a drive and kept in `~/.config/project-maya/drive-reads.txt`; `MAYA_EXPERT_DRIVE_PROBE=0` skips the measurement); otherwise a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
 
+## Hy4
+
+For the full Hy4 (`hy_v4`), `--tp N` with `N >= 2` splits the attention heads and FFNs across `N` GPUs of the
+same kind. The Models page's **Tensor parallel** setting writes the same option. Auto and Off use the layer split.
+
+Each TP member holds its own resident latent KV and indexer cache. `--kv q8` reduces the latent cache's VRAM use.
+With `--dfly2`, the first TP member runs the drafter against its own copy of the target layers' caches. Other selected
+GPUs can hold routed experts, and the CPU lane handles experts that exceed available VRAM. The engine log lists the
+TP group and the GPU running DFly2.
+
 ## Hy4-Flash
 
 `./maya.sh --setup --model hy4-flash-maya-xs` (or `--hy4-quant maya-xs`; Windows: `START-MAYA.bat`, or pick
