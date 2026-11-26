@@ -262,7 +262,9 @@ class ModelName(unittest.TestCase):
                     patch.object(maya, "set_up_qwen", return_value=None), \
                     patch.object(maya, "choose_model", return_value=("download", "Maya-S-v2-IQ2_XXS")), \
                     patch.object(maya, "set_up_hy4", return_value=None), \
+                    patch.object(maya, "set_up_hy4_full", return_value=None), \
                     patch.object(maya, "set_up_ik2", return_value=None), \
+                    patch.object(maya, "set_up_ik2_small", return_value=None), \
                     patch.object(maya, "check_pc", side_effect=KeyboardInterrupt), \
                     patch.object(maya, "configs", return_value=[]), patch.object(S, "model_named") as named:
                 try:

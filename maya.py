@@ -890,6 +890,7 @@ HY4_CHUNK_UP_GIB = 0.95
 # folder.  One request at a time.
 import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on the card
 IK2 = Q.MODEL["ik2"]                               # "Inkling-2-Mini" (its id: the installer record, --model)
+IK2_SMALL = "Inkling-2-Small"
 IK2_SHOWN = Q.SHOWN["ik2"]
 IK2_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
 IK2_MANIFEST = ROOT / "tools" / "ik2" / "download.json"
@@ -899,7 +900,7 @@ IK2_DIR = "maya-ik2"                               # (in the model's folder: tok
 IK2_MODEL_NAME = "inkling-2-mini"
 IK2_MIN_CC = IK2F.MIN_CC
 IK2_PROFILE = ROOT / "data" / "expert-profile-ik2mini.bin"   # (the offload path's starting VRAM tier: maya-ik2's IK2_WARM)
-FAMILIES = ("glm", "glm53", "deepseek", "minimax", "qwen", "hy4", "hy4_full", "ik2")
+FAMILIES = ("glm", "glm53", "deepseek", "minimax", "qwen", "hy4", "hy4_full", "ik2", "ik2_small")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf(?:_file)?$")
 
 
@@ -1644,6 +1645,8 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -
     others)."""
     byid = {g["index"]: g for g in found}
     usable = [g for g in found if int(g["arch"]) >= min_cc]
+    if family == "ik2_small":
+        usable = [g for g in usable if IK2F.small_gpu(g)]
     kept = None if (a.gpus or a.gpu is not None) else \
         gpus_before(getattr(a, "gpus_before", None) if before is None else before, usable)
     if a.gpus or a.gpu is not None:
@@ -1664,6 +1667,18 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -
              f"it needs an NVIDIA GPU of compute capability {min_cc / 10:.1f} or newer (" +
              ("V100 and newer; Pascal - Tesla P40 / P100, GTX 10 - is experimental)" if min_cc < 80 else
               "RTX 30 / A100 and newer)"))
+    if family == "ik2_small":
+        split = sorted(usable, key=lambda g: (-g["vram_gb"], g["index"]))[:MAX_GPUS]
+        opts = [split]
+        if kept and len(kept) >= 3:
+            previous = [byid[i] for i in kept]
+            if previous != split:
+                opts.append(previous)
+        rows = [("Layer split over GPUs " + ", ".join(str(g["index"]) for g in cards),
+                 "recommended" if i == 0 else "as set up before", None) for i, cards in enumerate(opts)]
+        pick = choose("Which GPUs?", [f"{IK2_SMALL} splits its layers across three or more NVIDIA GPUs."], rows,
+                      len(opts) - 1, a.yes or a.check)
+        return opts[pick]
     if family == "ik2":
         # (Inkling-2-Mini: one GPU, or two on Linux - the larger first, it holds the dense weights and the cache; the
         #  second takes the experts the first does not hold.  Recommended: one where the largest holds every expert
@@ -1685,18 +1700,8 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -
             if IK2F.plan(one[0]["vram_gb"], IK2F.CONTEXTS[0])["resident"]:
                 labels[0] += " - it holds every expert"
             labels[1] += " - the second holds the experts the first does not"
-        layer_split = getattr(a, "ik2_layer_split", False)
-        if layer_split:
-            all_cards = [g for g in big if g["vram_gb"] >= IK2F.MIN_VRAM_GB][:MAX_GPUS]
-            if len(all_cards) > 2:
-                split = [byid[i] for i in kept] if kept and len(kept) > 2 else all_cards
-                opts.append(split)
-                labels.append("Layer split over GPUs " + ", ".join(str(g["index"]) for g in split))
-                if not kept or len(kept) > 2:
-                    default = len(opts) - 1
-        intro = (["Inkling 2 Small can split its layers across three or more NVIDIA GPUs."]
-                 if layer_split else ["Inkling 2 runs on one GPU, or on two: the first holds the dense weights, "
-                                      "the cache and every prompt,", "the second the experts the first does not."])
+        intro = [f"{IK2} runs on one GPU, or on two: the first holds the dense weights, the cache and every prompt,",
+                 "the second the experts the first does not."]
         pick = choose("Which GPUs?", intro,
                       [(lab, "recommended" if i == rec else None, None) for i, lab in enumerate(labels)], default,
                       a.yes or a.check)
@@ -1770,9 +1775,9 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     if mm3 and WIN and not MM3_ALL_PLATFORMS:
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
-    ik2 = family == "ik2"
-    ik2_layer_split = ik2 and getattr(a, "ik2_layer_split", False)
-    if ik2:   # (Inkling-2-Mini, an experimental preview: NVIDIA, Linux, one GPU - refused in one line before anything)
+    ik2 = family in ("ik2", "ik2_small")
+    ik2_layer_split = family == "ik2_small"
+    if ik2:
         why = IK2F.unsupported(a.backend, WIN, ik2_gpus_asked(a), [], layer_split=ik2_layer_split)
         if why:
             fail(why)
@@ -1813,12 +1818,14 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
               "install the NVIDIA driver (Ubuntu: sudo ubuntu-drivers install)") + f", restart, and run {ME} again")
     ik2_ram = mem_gb()[0] if ik2 and not getattr(a, "ik2_local", False) else 0.0
     if ik2:                                            # (no card new or large enough: the one line, before the list)
-        why = IK2F.unsupported("cuda", False, 0, found, ik2_ram)
+        why = IK2F.unsupported("cuda", False, 0, found, ik2_ram, layer_split=ik2_layer_split)
         if why:
             fail(why)
     say("  NVIDIA GPUs:")
     for g in found:
-        say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= max(min_cc, VALIDATED_CC) else
+        say(f"    {gpu_label(g)} - " + ("needs at least 8 GB of VRAM" if ik2_layer_split and
+                                       int(g["arch"]) >= min_cc and not IK2F.small_gpu(g) else
+                                       "can be used" if int(g["arch"]) >= max(min_cc, VALIDATED_CC) else
                                        "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
     chosen = choose_gpus(a, found, min_cc, family)
@@ -1836,11 +1843,12 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         if ik2 and len(chosen) == 2 else
         f": the model's layers are split across the {len(chosen)}"))
     if ik2 and any(g.get("unified_memory") for g in chosen):
-        warn(f"{IK2_SHOWN} has not been run yet on a GPU whose memory is the system's RAM: untested here")
+        name = IK2_SMALL if ik2_layer_split else IK2_SHOWN
+        warn(f"{name} has not been run yet on a GPU whose memory is the system's RAM: untested here")
     elif any(g.get("unified_memory") for g in chosen):
         say("  the GPU's memory is the system's RAM: the engine fills it with the most-used experts and leaves the "
             "rest to the RAM tier and the SSD, so the free RAM at the start is what the pool can take")
-    if vram < 23 and not ds4 and not mm3 and not hy4 and family not in ("qwen", "ik2"):
+    if vram < 23 and not ds4 and not mm3 and not hy4 and not ik2 and family != "qwen":
         # one small card: can any GLM-5.3-Flash quant start on it at all (glm_fit_verdict)?  Where none can, say so
         # here - the model's choice (step 2) then stops before any download
         try:
@@ -2096,16 +2104,19 @@ def config_family(cfg: dict) -> str:
 
 
 def setup_family(cfg: dict) -> str:
-    """Split the two GLM model choices in setup; both still use the engine's 'glm' config family."""
+    """The model's setup menu entry for an existing runtime config."""
     inst = cfg.get("installer") or {}
     if inst.get("hy4_arch") == HY4_FULL_ARCH:
         return "hy4_full"
-    return "glm53" if inst.get("quant") in G53_MODELS or G53.config_is_glm_dsa(cfg) else config_family(cfg)
+    if inst.get("quant") in G53_MODELS or G53.config_is_glm_dsa(cfg):
+        return "glm53"
+    family = config_family(cfg)
+    return "ik2_small" if family == "ik2" and not Q.is_ik2_mini(cfg) else family
 
 
 # each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
-FAMILY_TITLE = {**Q.MODEL, "glm53": G53.SHOWN, "qwen": "Qwen-3.8-Flash-Next", "ik2": "Inkling 2",
-                "hy4_full": HY4_FULL}
+FAMILY_TITLE = {**Q.MODEL, "glm53": G53.SHOWN, "qwen": "Qwen-3.8-Flash-Next",
+                "ik2_small": IK2_SMALL, "hy4_full": HY4_FULL}
 
 
 def setup_title(cfg: dict) -> str:
@@ -2122,7 +2133,8 @@ PARALLEL_FAMILIES = ("glm", "glm53", "deepseek", "minimax")
 def check_parallel(a, family: str) -> None:
     if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
         model = DS4 if family == "deepseek" else MM3 if family == "minimax" else HY4 if family == "hy4" else \
-            HY4_FULL if family == "hy4_full" else IK2_SHOWN if family == "ik2" else QWEN_SHOWN
+            HY4_FULL if family == "hy4_full" else IK2_SHOWN if family == "ik2" else \
+            IK2_SMALL if family == "ik2_small" else QWEN_SHOWN
         fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash; {model} serves "
              "one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
@@ -2138,6 +2150,8 @@ def choose_family(a, prev: dict) -> str:
     if a.model:
         if a.model == HY4_FULL:
             return "hy4_full"
+        if a.model == IK2_SMALL:
+            return "ik2_small"
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else \
             "hy4" if a.model == HY4 else "ik2" if a.model == IK2 else "glm53" if a.model in G53_MODELS else "glm"
     if getattr(a, "qwen_quant", None):                 # (--qwen-quant alone: Qwen's files named)
@@ -2204,8 +2218,9 @@ def choose_family(a, prev: dict) -> str:
                   "fastest one holds the head and the drafts), up to a 256K context - run on NVIDIA RTX 30 / A100 "
                   "and newer, Linux." if q4 else "")))
     rows.append((HY4_FULL, None, "Tencent's full Hy4. Add local hy_v4 GGUFs and an optional hy_v4_vl image projector."))
-    rows.append(("Inkling 2 (experimental)", None, ik2_about() +
-                 " Add downloaded model accepts compatible Inkling-2-Mini and Inkling-2-Small GGUFs."))
+    rows.append((IK2, None, ik2_about() + " Add downloaded model accepts compatible Inkling-2-Mini GGUFs."))
+    rows.append((IK2_SMALL, None, "Add downloaded Inkling-2-Small GGUFs. "
+                 "Requires three or more NVIDIA GPUs on Linux."))
     return FAMILIES[choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)]
 
 
@@ -3822,11 +3837,18 @@ def linked_model_type(path: Path) -> str | None:
     """Family from a model header/config only. No size or checksum is consulted."""
     if path.suffix.lower() in (".gguf", ".gguf_file"):
         arch = gguf_head(path)[0]
+        if arch == "inkling2":
+            from gguf_reader import GGUFFile
+            try:
+                meta = GGUFFile(path).metadata
+                return "ik2" if meta.get("inkling2.num_loops", 1) > 1 else "ik2_small"
+            except (OSError, TypeError, ValueError, KeyError, IndexError, struct.error):
+                return None
         return ("glm" if arch in GLM_ARCHS else "glm53" if arch == G53.ARCH else
                 "deepseek" if arch == "deepseek41" else "minimax" if arch == "minimax-m3" else
                 "qwen" if arch == "qwen4exp" else "hy4" if arch == "hy_v4_flash" else
                 "hy4_full" if arch == HY4_FULL_ARCH else
-                "ik2" if arch in ("inkling2", "inkling2_loop") else None)
+                "ik2" if arch == "inkling2_loop" else None)
     if path.name == "config.json":
         conf = read_json(path)
         if (conf.get("quantization_config") or {}).get("quant_method") == "exl3":
@@ -4010,7 +4032,7 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | di
             if model is None:
                 warn("select a model file before linking")
                 continue
-            if family in ("hy4", "hy4_full", "ik2"):
+            if family in ("hy4", "hy4_full", "ik2", "ik2_small"):
                 local = link_hy4_or_ik2(models, chosen, family)
                 if local is not None:
                     return local
@@ -4289,7 +4311,8 @@ def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
     first = model["anchor"]
     if linked_model_type(first) != family:
         arch = gguf_head(first)[0]
-        want = {"hy4": "Hy4-Flash (hy_v4_flash)", "hy4_full": "Hy4 (hy_v4)", "ik2": "Inkling 2 (inkling2)"}[family]
+        want = {"hy4": "Hy4-Flash (hy_v4_flash)", "hy4_full": "Hy4 (hy_v4)",
+                "ik2": f"{IK2} (inkling2)", "ik2_small": f"{IK2_SMALL} (inkling2)"}[family]
         warn(f"{first.name}: select a {want} GGUF" + (f"; detected {arch}" if arch else ""))
         return None
     hy4 = family == "hy4"
@@ -4345,12 +4368,12 @@ def link_hy4_or_ik2(models: Path, chosen: dict, family: str) -> dict | None:
         if vision:
             meta = GGUFFile(vision).metadata
             projector = meta.get("clip.projector_type") or meta.get("clip.vision.projector_type")
-            want_projector = {"hy4": "hy_v4_flash", "hy4_full": HY4_FULL_PROJECTOR, "ik2": "inkling2v"}[family]
+            want_projector = ("hy_v4_flash" if hy4 else HY4_FULL_PROJECTOR if full_hy4 else "inkling2v")
             if projector != want_projector:
                 raise ValueError(f"{vision.name}: the vision projector does not match the selected model")
             if full_hy4 and meta.get("clip.vision.projection_dim") != base.get("hy_v4.embedding_length"):
                 raise ValueError(f"{vision.name}: the projector's output width does not match the model")
-            if family == "ik2" and meta.get("clip.vision.projection_dim", width) != width:
+            if family in ("ik2", "ik2_small") and meta.get("clip.vision.projection_dim", width) != width:
                 raise ValueError(f"{vision.name}: select the vision projector for Inkling-2-{variant.title()}")
     except (OSError, TypeError, ValueError, KeyError, IndexError, struct.error) as exc:
         warn(f"{first.name}: {exc}")
@@ -8337,6 +8360,8 @@ def _set_up(a, prev: dict) -> Path | None:
         return set_up_hy4_full(a, prev)
     if family == "ik2":
         return set_up_ik2(a, prev)
+    if family == "ik2_small":
+        return set_up_ik2_small(a, prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -12853,8 +12878,7 @@ def set_up_ik2_local(a, prev: dict, local: dict) -> Path:
     same = (prev.get("installer") or {}).get("model_dir") == str(d)
     a.gpus_before = prev.get("gpu")
     a.ik2_local = True
-    a.ik2_layer_split = local["variant"] == "small" and a.backend == "cuda" and sys.platform.startswith("linux")
-    pc = check_pc(a, "ik2")
+    pc = check_pc(a, "ik2_small" if local["variant"] == "small" else "ik2")
     step(2, "your choices")
     ok(f"model: {gguf.name} (linked GGUF in {d})")
     old_ctx = flag_value(prev.get("args") or [], "--max-context") if same else None
@@ -12872,6 +12896,31 @@ def set_up_ik2_local(a, prev: dict, local: dict) -> Path:
     return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, local["drafter"], local=local)
 
 
+def set_up_ik2_small(a, prev: dict) -> Path | None:
+    models = setup_models_dir(a, prev)
+    if getattr(a, "model_dir", None):
+        src = Path(a.model_dir).expanduser().resolve()
+        if not src.is_dir():
+            fail(f"{src} is not a directory with {IK2_SMALL} GGUF files")
+        if a.yes:
+            candidates = review_candidates(src, "ik2_small")
+            if len(candidates["model"]) != 1 or (len(candidates["vision"]) > 1 and not a.no_vision):
+                fail(f"{src}: need one {IK2_SMALL} GGUF set and at most one vision projector",
+                     "run setup without --yes to choose the files")
+            chosen = {role: options[0] if options else None for role, options in candidates.items()}
+            if a.no_vision:
+                chosen["vision"] = None
+            local = link_hy4_or_ik2(models, chosen, "ik2_small")
+        else:
+            local = review_downloaded_model(a, src, models, "ik2_small")
+    else:
+        if a.yes:
+            fail(f"{IK2_SMALL} needs a downloaded GGUF set", "give its folder with --model-dir")
+        local = choose_with_add(a, f"Which files of {IK2_SMALL}?", ["Choose files you already downloaded."],
+                                [], 0, False, models, "ik2_small")
+    return set_up_ik2_local(a, prev, local) if isinstance(local, dict) else None
+
+
 def set_up_ik2(a, prev: dict) -> Path | None:
     """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
     run: a Mac, AMD on Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 8 GB, an AMD
@@ -12881,11 +12930,10 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     config."""
     inst = prev.get("installer") or {}
     a.ik2_local = False
-    a.ik2_layer_split = False
     models_before = setup_models_dir(a, prev)
     if not (a.yes or getattr(a, "check", False) or getattr(a, "model", None)):
         m = ik2_entry()
-        local = choose_with_add(a, "Which Inkling 2 files?", ["The files to set up:"],
+        local = choose_with_add(a, f"Which files of {IK2}?", ["The files to set up:"],
                                 [(Q.shown("ik2", Q.IK2_QUANT, m["download_gb"]), None, m["about"])],
                                 0, False, setup_models_dir(a, prev), "ik2")
         if isinstance(local, dict):
@@ -13008,10 +13056,14 @@ def model_option(a) -> str | None:
     if a.model.casefold() == "hy4-full":
         a.model = HY4_FULL
         return None
+    if a.model.casefold() in (IK2_SMALL.casefold(), "ik2-small"):
+        a.model = IK2_SMALL
+        return None
     hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
     if hit is None:
         return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (experimental), or a GLM-5.3-Flash download: " + ", ".join(MODELS))
+                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (experimental), "
+                f"{IK2_SMALL}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
     family, key = hit
     if family == "glm":
         a.model = key
@@ -13069,10 +13121,12 @@ def main() -> int:
                          + ", ".join(i for _, _, _, i in Q.QUANTS) +
                          f" - or {DS4} / {MM3} / {HY4} (their files asked, or --ds4-quant / --mm3-quant / --hy4-quant), "
                          "hy4-full (local Hy4 GGUF), "
-                         f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (an experimental preview),"
+                         f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (an experimental preview), "
+                         f"{IK2_SMALL} (local GGUF),"
                          " or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
-    ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax, {HY4} or {QWEN_SHOWN}: their "
+    ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax, {HY4}, {QWEN_SHOWN} or "
+                                        f"{IK2_SMALL}: their "
                                         "folder (a GGUF's shards, or the EXL3 quant's files and the Engram shards 47 / "
                                         "48 of DeepSeek's repo), or an EXL3 folder of GLM-5.3-Flash or "
                                         "MiniMax-M3.1-Flash at any bit rate (whole by its own index; its own sampling "
@@ -13349,11 +13403,11 @@ def main() -> int:
     prev = read_json(have[0]) if have else {}
     if a.check:
         hy4 = a.model in (HY4, HY4_FULL) or bool(getattr(a, "hy4_quant", None))
-        ik2 = a.model == IK2                           # (Inkling-2-Mini's preview: its refusals, or this PC's card)
+        ik2 = a.model in (IK2, IK2_SMALL)
         ds4 = not hy4 and not ik2 and (a.model == DS4 or bool(a.model_dir) and exl3_folder_family(a.model_dir) is None)
         quant = choose_ds4_quant(a, prev) if ds4 else None
         pc = check_pc(a, "hy4_full" if a.model == HY4_FULL else "hy4" if hy4 else
-                      "ik2" if ik2 else "deepseek" if ds4 else "glm",
+                      "ik2_small" if a.model == IK2_SMALL else "ik2" if ik2 else "deepseek" if ds4 else "glm",
                       gguf=ds4 and quant != "exl3")
         if hy4 and a.model != HY4_FULL:                 # (the layout and the context that fit this VRAM, or why none does)
             quant = choose_hy4_quant(a, prev if config_family(prev) == "hy4" else {})

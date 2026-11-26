@@ -195,10 +195,11 @@ class LocalOther(unittest.TestCase):
     def local_setup(self, family, source):
         a = SimpleNamespace(model=None, models_dir=str(self.models), yes=False, check=False, context=4096, backend="cuda",
                             no_vision=False, repack=False, env=[], port=None, host=None, api_key=None)
-        pc = {"backend": "cuda", "gpus": [{"index": 0, "vram_gb": 48}]}
+        n_gpu = 6 if family == "ik2_small" else 1
+        pc = {"backend": "cuda", "gpus": [{"index": i, "vram_gb": 48} for i in range(n_gpu)]}
         exe = self.root / "maya-ik2"
         exe.touch()
-        choose = [0 if family == "hy4" else 1, 3]  # 0) Add downloaded model, then Link files
+        choose = [1 if family == "ik2" else 0, 3]  # 0) Add downloaded model, then Link files
         with patch.multiple(maya, ROOT=self.root, IK2_EXE=exe), \
                 patch.object(maya, "choose", side_effect=choose), \
                 patch.object(maya.S, "ask_text", return_value=str(source)), \
@@ -209,7 +210,7 @@ class LocalOther(unittest.TestCase):
                 patch.object(maya, "vision_encoder_ready", return_value=True), \
                 patch.object(maya, "ik2_tokenizer_step", return_value=self.root / "tokenizer") as tokenizer, \
                 patch.object(maya, "write_run_script", return_value=self.root / "run-test.sh"):
-            setup = maya.set_up_hy4 if family == "hy4" else maya.set_up_ik2
+            setup = {"hy4": maya.set_up_hy4, "ik2": maya.set_up_ik2, "ik2_small": maya.set_up_ik2_small}[family]
             path = setup(a, {})
         return path, json.loads(path.read_text()), tokenizer
 
@@ -243,14 +244,20 @@ class LocalOther(unittest.TestCase):
                 draft = gguf(source / "dspark-custom.gguf", "dflash", metadata={"dflash.embedding_length": width},
                              tensors=[("dspark_hidden_out.weight", [1, width])])
                 vision = gguf(source / "mmproj.gguf", "clip", metadata={"clip.vision.projector_type": "inkling2v"})
-                path, cfg, tokenizer = self.local_setup("ik2", source)
+                family = "ik2" if variant == "mini" else "ik2_small"
+                other = "ik2_small" if variant == "mini" else "ik2"
+                self.assertFalse(maya.review_candidates(source, other)["model"])
+                path, cfg, tokenizer = self.local_setup(family, source)
                 self.assertEqual(path.name, f"maya-inkling-2-{variant}-local-custom.json")
                 self.assertEqual(maya.Q.is_ik2_mini(cfg), variant == "mini")
+                self.assertEqual(maya.setup_family(cfg), family)
+                self.assertEqual(maya.config_family(cfg), "ik2")
                 linked = Path(maya.flag_value(cfg["args"], "--model"))
                 tokenizer.assert_called_once()
                 self.assertEqual(tokenizer.call_args.args[2], linked)
-                targets = [*maya.shard_set(linked), Path(maya.flag_value(cfg["args"], "--draft")),
-                           Path(cfg["vision"]["mmproj"])]
+                draft_arg = maya.flag_value(cfg["args"], "--draft")
+                self.assertEqual(draft_arg, str(linked.with_name(draft.name)) if variant == "mini" else None)
+                targets = [*maya.shard_set(linked), linked.with_name(draft.name), Path(cfg["vision"]["mmproj"])]
                 self.assertTrue(all(p.is_symlink() for p in targets))
                 self.assertEqual([p.resolve() for p in targets], [first, second, draft, vision])
         self.assertEqual(stock.read_text(), '{"preserve": true}')

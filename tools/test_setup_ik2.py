@@ -58,17 +58,22 @@ class Names(unittest.TestCase):
         self.assertEqual(Q.config_stem("ik2", Q.IK2_QUANT), "maya-inkling-2-mini")
         for name in ("inkling-2-mini", "Inkling-2-Mini", "inkling-2-mini-ud-q4_k_xl", "ik2-mini", "INKLING2-MINI"):
             self.assertEqual(Q.resolve(name), ("ik2", Q.IK2_QUANT), name)
-        self.assertIsNone(Q.resolve("inkling-2-small"))   # (Inkling-2-Small: by hand, no setup)
+        self.assertIsNone(Q.resolve("inkling-2-small"))   # (local files only, no download catalog)
         self.assertEqual((maya.IK2, maya.IK2_SHOWN, maya.IK2_MODEL_NAME),
                          ("Inkling-2-Mini", "Inkling 2 Mini", "inkling-2-mini"))
-        self.assertIn("ik2", maya.FAMILIES)
-        self.assertEqual(maya.FAMILY_TITLE["ik2"], "Inkling 2")
+        self.assertEqual(maya.FAMILY_TITLE["ik2"], maya.IK2)
+        self.assertEqual(maya.FAMILY_TITLE["ik2_small"], maya.IK2_SMALL)
 
     def test_model_option(self):
         a = args(model="inkling-2-mini")
         self.assertIsNone(maya.model_option(a))
         self.assertEqual(a.model, maya.IK2)
         self.assertEqual(maya.choose_family(a, {}), "ik2")
+        for name in ("inkling-2-small", "ik2-small"):
+            a = args(model=name)
+            self.assertIsNone(maya.model_option(a))
+            self.assertEqual(a.model, maya.IK2_SMALL)
+            self.assertEqual(maya.choose_family(a, {}), "ik2_small")
 
     def test_its_own_defaults(self):
         """Inkling-2-Mini has its own entry, its author's values (not Inkling-2-Small's): temperature 1.0, top-p 1.0,
@@ -347,7 +352,7 @@ class TwoCards(unittest.TestCase):
 
 
 class Picker(unittest.TestCase):
-    def test_its_row_last_and_picked(self):
+    def test_variants_have_separate_rows(self):
         got = {}
 
         def pick(title, intro, opts, default, yes, *x):
@@ -355,8 +360,9 @@ class Picker(unittest.TestCase):
             return len(opts) - 1
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             fam = maya.choose_family(args(model=None, model_dir=None, gguf_dir=None, draft=None), {})
-        self.assertEqual((got["rows"][-1], fam), ("Inkling 2 (experimental)", "ik2"))
-        about = got["about"]["Inkling 2 (experimental)"]
+        self.assertEqual(got["rows"][-2:], [maya.IK2, maya.IK2_SMALL])
+        self.assertEqual(fam, "ik2_small")
+        about = got["about"][maya.IK2]
         for part in ("EXPERIMENTAL PREVIEW", "thinkingmachines' Inkling-2-Mini", "UD-Q4_K_XL", "18 GB",
                      "V100 / RTX 20", "Linux", "8 GB or more", "Halo / APU with 24 GB", "pictures"):
             self.assertIn(part, about)
@@ -444,12 +450,19 @@ class Steps(unittest.TestCase):
 
     def test_small_layer_split_uses_all_selected_gpus(self):
         gpus = [card(48, i) for i in range(5)] + [card(24, 5)]
-        a = args(ik2_local=True, ik2_layer_split=True, drafting="on")
-        with patch.object(maya, "WIN", False), patch.object(maya, "choose", side_effect=lambda *p: p[3]):
-            self.assertEqual(maya.choose_gpus(a, gpus, maya.IK2_MIN_CC, "ik2"), gpus)
+        a = args(model=maya.IK2_SMALL, ik2_local=True, drafting="on", gpus_before=[0, 1])
+        found = gpus + [card(6, 6), card(24, 7, arch="61")]
+        with patch.object(maya, "WIN", False), patch.object(maya, "choose", side_effect=lambda *p: p[3]) as pick:
+            self.assertEqual(maya.choose_gpus(a, found, maya.IK2_MIN_CC, "ik2_small"), gpus)
+            self.assertEqual(len(pick.call_args.args[2]), 1)
+            self.assertEqual(maya.choose_gpus(a, found, maya.IK2_MIN_CC, "ik2_small", before=[0, 2, 5]),
+                             [gpus[0], gpus[2], gpus[5]])
         self.assertIsNone(F.unsupported("cuda", False, 6, gpus, layer_split=True))
         self.assertIsNotNone(F.unsupported("cuda", False, 6, gpus))
         self.assertIsNotNone(F.unsupported("cuda", True, 6, gpus, layer_split=True))
+        self.assertIsNotNone(F.unsupported("cuda", False, 0, found[-3:], layer_split=True))
+        for flags in ({"gpu": 0}, {"gpus": "0,1"}):
+            self.assertIn("at least three GPUs", refusal(lambda: maya.check_pc(args(**flags), "ik2_small")))
         d = self.root / "Inkling-2-Small-local-UD-IQ3_XXS"
         gguf = d / "Inkling-2-Small-UD-IQ3_XXS.gguf"
         with patch.object(maya, "ROOT", self.root):

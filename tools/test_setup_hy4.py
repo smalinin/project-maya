@@ -389,12 +389,12 @@ class Picker(unittest.TestCase):
 
     def test_local_setup_is_listed_before_publication(self):
         got = self.rows()
-        self.assertEqual(got["rows"][-3:], ["Hy4-Flash", "Hy4", "Inkling 2 (experimental)"])
+        self.assertEqual(got["rows"][-4:], ["Hy4-Flash", "Hy4", maya.IK2, maya.IK2_SMALL])
         self.assertEqual(got["family"], "glm")
 
     def test_listed_once_published(self):
         got = self.rows(man=manifest())
-        self.assertEqual(got["rows"][-3:], ["Hy4-Flash", "Hy4", "Inkling 2 (experimental)"])
+        self.assertEqual(got["rows"][-4:], ["Hy4-Flash", "Hy4", maya.IK2, maya.IK2_SMALL])
         about = got["about"]["Hy4-Flash"]
         for part in ("Tencent's Hy4-flash", "Hy4-Flash-Maya-XS (108 GB)", "NVIDIA from V100 on", "Linux or Windows",
                      "pictures (its vision tower", "thinking High or Off", "tool calls", "Tencent's own Q4_K_M (AngelSlim",
@@ -2263,7 +2263,7 @@ class Names(unittest.TestCase):
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             self.assertEqual(maya.choose_family(a, {}), "hy4")
         self.assertEqual(len(rows), len(maya.FAMILIES))
-        label, note, about = rows[-3]
+        label, note, about = rows[maya.FAMILIES.index("hy4")]
         self.assertEqual(label, "Hy4-Flash")
         self.assertIn("Q4_K_M", about)
         self.assertIn("pictures", about)
