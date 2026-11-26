@@ -4509,7 +4509,7 @@ inline bool spec_path() {
 
 // VRAM drafting takes beside the model (the plan's check that it changes nothing): the window's records (every
 // visit's four convs, for rollback_block) and buffers, whichever drafts; with the drafter (path) its weights (the
-// file's: BF16 in mtp.safetensors, native Q8_0 or expanded BF16 in a GGUF), its fold through the head (FP16 [256][n_rows]
+// file's: BF16 in mtp.safetensors, BF16 or packed Q8_0 / Q5_K in a GGUF), its fold through the head (FP16 [256][n_rows]
 // and a bias), its layer without a window's context (FP16 K and V, 8 heads of 128: 4 KiB a position, IK2_DRAFT_CTX's
 // positions), its windowed layers' rings (F32, 2048 positions: Inkling-2-Mini's drafter 2, Small's 4), its
 // attention's partials (not a context's size: its logits stay in shared memory) and the target's F32 taps for one
@@ -5663,6 +5663,7 @@ std::string draft_key(const std::string& model, const std::string& draft_path, i
                   p.name, p.totalGlobalMem / 1e9, p.major, p.minor, drv, base.c_str(), fsize(model),
                   draft_path.empty() ? -1LL : fsize(draft_path), ctx, g_kv_fp8 ? "fp8" : "f16");
     std::string key = buf;
+    if (ik2::draft::has_q5_matrices(draft_path)) key += "|native Q5_K";
     if (g_two.want) {   // (two GPUs, the split: its own measurement - GPU 1 by name and size)
         cudaDeviceProp p1{};
         CU(cudaGetDeviceProperties(&p1, g_two.dev));
@@ -7563,7 +7564,7 @@ int main(int argc, char** argv) {
         }
         if (drafter) {
             std::printf("drafter: %s, %s matrices, its context rows %s%s, %.2f GiB of VRAM, %.1f s\n",
-                        draft_path.c_str(), ik2::draft::matrices_q8(drafter) ? "Q8_0" : "BF16",
+                        draft_path.c_str(), ik2::draft::matrix_format(drafter),
                         ik2::draft::context_fp8(drafter) ? "FP8" : "FP16",
                         ik2::draft::context_fp8(drafter) && kv_want == "auto" ? (off_dr ? " (the plan's)" : " (FP16's do not fit beside every expert)")
                                                                                : "",

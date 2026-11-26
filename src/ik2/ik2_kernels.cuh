@@ -342,6 +342,8 @@ struct MvAlt {
 /// tensor cores (a value times its block scale rounded to FP16, as the prompt path's decode_q8p_f16).
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s);
+/// y [T][ldy] = W . x for a packed GGUF Q5_K matrix and BF16 inputs [T][K]. K is a multiple of 256.
+void q5_tile(const uint8_t* w, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s);
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s);

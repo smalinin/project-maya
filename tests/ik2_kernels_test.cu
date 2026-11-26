@@ -3292,6 +3292,43 @@ void test_window_launches() {
     }
 }
 
+void test_q5_tile() {
+    const int N = 35, K = 768, T = 11, ldy = 2 * N;
+    std::vector<uint8_t> w((size_t) N * (K / 256) * 176);
+    for (size_t i = 0; i < w.size(); i += 176) {
+        for (size_t j = 4; j < 176; ++j) w[i + j] = (uint8_t) rng();
+        const uint16_t scale = f2h_host(0.001f + std::fabs(frand(0.001f)));
+        const uint16_t minimum = f2h_host(0.007f + std::fabs(frand(0.007f)));
+        w[i] = (uint8_t) scale, w[i + 1] = (uint8_t) (scale >> 8);
+        w[i + 2] = (uint8_t) minimum, w[i + 3] = (uint8_t) (minimum >> 8);
+    }
+    std::vector<uint16_t> x((size_t) T * K);
+    for (auto& v : x) {
+        const float f = frand(2.0f);
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof bits);
+        v = (uint16_t) (bits >> 16);
+    }
+    std::vector<float> wf((size_t) N * K);
+    k::decode_host(k::kQ5_K, w.data(), wf.size(), wf.data());
+    for (float& v : wf) v = h2f_host(f2h_host(v));
+    auto* dw = dev(w);
+    auto* dx = dev(x);
+    auto* dy = dev_n<float>((size_t) T * ldy);
+    k::q5_tile(dw, N, K, dx, T, dy + N, ldy, 0);
+    std::vector<double> want((size_t) T * ldy);
+    for (int t = 0; t < T; ++t)
+        for (int c = 0; c < K; ++c) {
+            const uint32_t bits = (uint32_t) x[(size_t) t * K + c] << 16;
+            float f;
+            std::memcpy(&f, &bits, sizeof f);
+            const double a = h2f_host(f2h_host(f));
+            for (int r = 0; r < N; ++r) want[(size_t) t * ldy + N + r] += a * wf[(size_t) r * K + c];
+        }
+    expect("q5_tile (11 tokens, strided)", host(dy, want.size()), want, 2e-5, 2e-4);
+    cudaFree(dw), cudaFree(dx), cudaFree(dy);
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -3340,6 +3377,7 @@ int main() {
     test_mv_blocks(true);
     test_experts_grouped(true);
     test_iq_s_formats();
+    test_q5_tile();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

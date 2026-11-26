@@ -2844,6 +2844,16 @@ __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
 #endif
 }
 
+__host__ __device__ __forceinline__ void q5_scale_min(const uint8_t* q, int group, int& scale, int& minimum) {
+    if (group < 4) {
+        scale = q[group] & 63;
+        minimum = q[group + 4] & 63;
+    } else {
+        scale = (q[group + 4] & 0xF) | ((q[group - 4] >> 6) << 4);
+        minimum = (q[group + 4] >> 4) | ((q[group] >> 6) << 4);
+    }
+}
+
 __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, size_t v) {
     if (type == kBF16) {
         const uint8_t* p = blocks + 2 * v;
@@ -2921,11 +2931,7 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
         const uint8_t* q = b + 4;
         const int is = 2 * j64 + half;
         int sc, m;
-        if (is < 4) {
-            sc = q[is] & 63, m = q[is + 4] & 63;
-        } else {
-            sc = (q[is + 4] & 0xF) | ((q[is - 4] >> 6) << 4), m = (q[is + 4] >> 4) | ((q[is] >> 6) << 4);
-        }
+        q5_scale_min(q, is, sc, m);
         const uint8_t lo = b[48 + 32 * j64 + l];
         const int hb = (b[16 + l] >> (2 * j64 + half)) & 1;
         const int val = (half ? (lo >> 4) : (lo & 0xF)) + (hb ? 16 : 0);
@@ -5452,6 +5458,33 @@ __device__ __forceinline__ uint32_t q8_pair(uint32_t w) {
 }
 __device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) { return h2_mul(q8_pair(w), scale); }
 
+template <int Splits>
+__device__ __forceinline__ void store_quant_tile(const float* acc, int N, int T, float* out, int ldy) {
+    const int lane = threadIdx.x % 32, split = threadIdx.x / 32;
+    __shared__ float4 part[Splits][32];
+    part[split][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    __syncthreads();
+    if (split) return;
+    float4 v = part[0][lane];
+#pragma unroll
+    for (int i = 1; i < Splits; ++i) {
+        const float4 z = part[i][lane];
+        v.x += z.x;
+        v.y += z.y;
+        v.z += z.z;
+        v.w += z.w;
+    }
+    const int row = 16 * blockIdx.x + lane / 4, token = 8 * blockIdx.y + 2 * (lane % 4);
+    if (token < T) {
+        if (row < N) out[(size_t) token * ldy + row] = v.x;
+        if (row + 8 < N) out[(size_t) token * ldy + row + 8] = v.z;
+    }
+    if (token + 1 < T) {
+        if (row < N) out[(size_t) (token + 1) * ldy + row] = v.y;
+        if (row + 8 < N) out[(size_t) (token + 1) * ldy + row + 8] = v.w;
+    }
+}
+
 #ifndef IK2_Q8_TILE_AHEAD
 #define IK2_Q8_TILE_AHEAD 2
 #endif
@@ -5504,28 +5537,70 @@ __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int 
         a[3] = q8_h2(a1.y >> 16, s1);
         mma16816(acc, a, v.y, v.w);
     }
-    __shared__ float4 part[Splits][32];
-    part[split][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
-    __syncthreads();
-    if (split) return;
-    float4 v = part[0][lane];
-#pragma unroll
-    for (int i = 1; i < Splits; ++i) {
-        const float4 z = part[i][lane];
-        v.x += z.x;
-        v.y += z.y;
-        v.z += z.z;
-        v.w += z.w;
+    store_quant_tile<Splits>(acc, N, T, out, ldy);
+}
+
+__device__ __forceinline__ uint32_t q5_pair(uint32_t q, float scale, float minimum) {
+    const float lo = fmaf(scale, (float) (q & 31u), -minimum);
+    const float hi = fmaf(scale, (float) ((q >> 8) & 31u), -minimum);
+    return f2_to_u32(lo, hi);
+}
+
+__device__ __forceinline__ uint4 q5_fragment(const uint8_t* b, int group, int col) {
+    const uint32_t dm = __ldg((const uint32_t*) b);
+    int sc, mn;
+    q5_scale_min(b + 4, group, sc, mn);
+    const float scale = __half2float(__ushort_as_half((uint16_t) dm)) * sc;
+    const float minimum = __half2float(__ushort_as_half((uint16_t) (dm >> 16))) * mn;
+    const uint2 hi = __ldg((const uint2*) (b + 16 + col));
+    const uint2 lo = __ldg((const uint2*) (b + 48 + (group / 2) * 32 + col));
+    const int shift = 4 * (group & 1);
+    const uint32_t q0 = ((lo.x >> shift) & 0x0F0F0F0Fu) | (((hi.x >> group) & 0x01010101u) << 4);
+    const uint32_t q1 = ((lo.y >> shift) & 0x0F0F0F0Fu) | (((hi.y >> group) & 0x01010101u) << 4);
+    return make_uint4(q5_pair(q0, scale, minimum), q5_pair(q0 >> 16, scale, minimum),
+                      q5_pair(q1, scale, minimum), q5_pair(q1 >> 16, scale, minimum));
+}
+
+__device__ __forceinline__ uint32_t bf16_pair_to_f16(uint32_t b) {
+    const float lo = bits_to_float(b << 16), hi = bits_to_float(b & 0xFFFF0000u);
+    return f2_to_u32(lo, hi);
+}
+
+// Unpack the GGUF blocks straight into MMA registers. The mixed drafter shares its BF16 input with its BF16 matrices.
+template <int Splits>
+__global__ void q5_mma_tile(const uint8_t* w, int N, int K, const uint16_t* x, int T, float* out, int ldy) {
+    const int lane = threadIdx.x % 32, split = threadIdx.x / 32, g = lane / 4, col = (lane % 4) * 8;
+    const int row = 16 * blockIdx.x + g, token = min(8 * (int) blockIdx.y + g, T - 1);
+    const size_t row_bytes = (size_t) (K / 256) * 176;
+    const uint8_t* w0 = w + (size_t) min(row, N - 1) * row_bytes;
+    const uint8_t* w1 = w + (size_t) min(row + 8, N - 1) * row_bytes;
+    float acc[4] = {};
+    for (int i = split; i < K / 32; i += Splits) {
+        const size_t block = (i / 8) * 176;
+        const uint4 v = *(const uint4*) (x + (size_t) token * K + i * 32 + col);
+        const uint4 a0 = q5_fragment(w0 + block, i % 8, col), a1 = q5_fragment(w1 + block, i % 8, col);
+        const uint32_t a[4] = {a0.x, a1.x, a0.z, a1.z};
+        const uint32_t b[4] = {a0.y, a1.y, a0.w, a1.w};
+        mma16816(acc, a, bf16_pair_to_f16(v.x), bf16_pair_to_f16(v.z));
+        mma16816(acc, b, bf16_pair_to_f16(v.y), bf16_pair_to_f16(v.w));
     }
-    const int token0 = blockIdx.y * 8 + 2 * t;
-    if (token0 < T) {
-        if (row < N) out[(size_t)token0 * ldy + row] = v.x;
-        if (row + 8 < N) out[(size_t)token0 * ldy + row + 8] = v.z;
+    store_quant_tile<Splits>(acc, N, T, out, ldy);
+}
+
+// CUDA devices without the 16-wide MMA instruction can consume the same packed weights.
+__global__ void q5_tile_scalar(const uint8_t* w, int N, int K, const uint16_t* x, float* out, int ldy) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= N) return;
+    const uint8_t* wr = w + (size_t) row * (K / 256) * 176;
+    const uint16_t* xr = x + (size_t) blockIdx.y * K;
+    float acc = 0.0f;
+    for (int i = lane; i < K; i += 32) {
+        const float v = bits_to_float((uint32_t) xr[i] << 16);
+        acc = fmaf(__half2float(__ushort_as_half(f2h(decode_value(kQ5_K, wr, i)))),
+                   __half2float(__ushort_as_half(f2h(v))), acc);
     }
-    if (token0 + 1 < T) {
-        if (row < N) out[(size_t)(token0 + 1) * ldy + row] = v.y;
-        if (row + 8 < N) out[(size_t)(token0 + 1) * ldy + row + 8] = v.w;
-    }
+    for (int step = 16; step > 0; step /= 2) acc += __shfl_xor_sync(0xffffffffu, acc, step);
+    if (!lane) out[(size_t) blockIdx.y * ldy + row] = acc;
 }
 
 
@@ -8193,6 +8268,14 @@ void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x
     need_class(75, "q8_tile");
     q8_mma_tile<4><<<dim3((N + 15) / 16, (T + 7) / 8), 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
     check("q8_mma_tile");
+}
+
+void q5_tile(const uint8_t* w, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s) {
+    if (arch_class() >= 75)
+        q5_mma_tile<4><<<dim3((N + 15) / 16, (T + 7) / 8), 128, 0, s>>>(w, N, K, x, T, y, ldy);
+    else
+        q5_tile_scalar<<<dim3((N + 3) / 4, T), 128, 0, s>>>(w, N, K, x, y, ldy);
+    check("q5_tile");
 }
 
 

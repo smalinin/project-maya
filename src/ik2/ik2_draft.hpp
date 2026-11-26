@@ -38,7 +38,7 @@ constexpr int kTaps = 8, kBlock = 8;
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s, bool kv8 = false);
 /// Frees everything load() and fold() took on the device (a drafter that does not fit after all).
 void destroy(Drafter* d);
-bool matrices_q8(const Drafter* d);
+const char* matrix_format(const Drafter* d);
 bool context_fp8(const Drafter* d);
 /// The rows of the context cache of the layer without a window (IK2_DRAFT_CTX, default ctx).
 int context_rows(int ctx);
@@ -73,7 +73,9 @@ void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
 void propose_times(double* submit_ms, double* wait_ms);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
-/// Estimate weight bytes before loading, including expansion of mixed GGUF matrices into BF16.
+/// Estimate weight bytes before loading, allowing for GGUF tensors that still need BF16 storage.
 size_t weights_bytes(const std::string& path);
+/// Whether the GGUF uses packed Q5_K layer matrices, for the drafting calibration key.
+bool has_q5_matrices(const std::string& path);
 
 }  // namespace ik2::draft

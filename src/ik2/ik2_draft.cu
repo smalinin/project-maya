@@ -338,18 +338,18 @@ void check_gguf(const maya::GgufFile& g, int C, int layers, int H, int KV, int F
 
 }  // namespace
 
-// a layer's matrix [out][in]: BF16 (cuBLAS, BF16 inputs), or a GGUF's Q8_0 kept planar - q its int8 values, qd its
-// blocks' FP16 scales - for q8_tile (the tensor cores, FP16 inputs)
+// A layer's matrix [out][in]: BF16, planar Q8_0 (q and its FP16 scales qd), or packed GGUF Q5_K.
 struct DMat {
     uint16_t* bf = nullptr;
     int8_t* q = nullptr;
     uint16_t* qd = nullptr;
+    uint8_t* q5 = nullptr;
 };
 
 struct DLayer {
     bool local = false;
     float *in_norm, *post_norm, *dflare, *q_norm, *k_norm, *k_norm_ctx;
-    DMat wq, wk, wv, wo, wkc, wvc, wgu, wd;
+    DMat wq, wk, wv, wo, wkc, wvc, wgu, wu, wd;            // wu is separate if gate and up use different formats
     float *kc = nullptr, *vc = nullptr;                    // the context caches, F32 [cap][KV * 128] (a window's
     uint16_t *kc16 = nullptr, *vc16 = nullptr;             //  layer) or FP16 (the layer that sees the whole context)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;                //  ... or FP8 E4M3 (load's kv8), times k_scale / v_scale
@@ -362,6 +362,7 @@ struct Drafter {
     float* ctx_tmp = nullptr;   // write_context's K and V rows before an FP16 cache, [2][kMixRows][KV * 128]
     float eps = 1e-6f, theta = 1e6f;
     bool q8 = false;   // the layers' matrices Q8_0 (a GGUF's): their inputs FP16, else BF16
+    bool q5 = false;   // a GGUF with native Q5_K layer matrices
     bool kv8 = false;  // the layer without a window's context rows FP8 E4M3, K times k_scale, V times v_scale
     // (K is RMS-normed a head - |k| <= sqrt(128) x its norm's weight, 12.4 at most measured - V not: 17.7 at most
     //  measured; 448 is E4M3's largest value - powers of two, so the scaling itself rounds nothing)
@@ -513,9 +514,10 @@ void gemm_h(Drafter* d, const uint16_t* W, int N, int K, const void* X, int T, f
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "gemm_h");
 }
-// Y [T][N] (ldy) = X [T][K] . W^T, X as act() made it: BF16 for a BF16 matrix, FP16 for a Q8_0 one
+// Y [T][N] (ldy) = X [T][K] . W^T, X as act() made it: FP16 for Q8_0 and BF16 for the other formats.
 void gemm(Drafter* d, const DMat& W, int N, int K, const uint16_t* X, int T, float* Y, int ldy) {
     if (W.q) k::q8_tile(W.q, W.qd, N, K, X, T, Y, ldy, d->s);
+    else if (W.q5) k::q5_tile(W.q5, N, K, X, T, Y, ldy, d->s);
     else gemm_bf(d, W.bf, N, K, X, T, Y, ldy);
 }
 void act(Drafter* d, const float* x, size_t n, uint16_t* y) {
@@ -588,14 +590,19 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out, bool dyn = false) {
 void layer_mlp(Drafter* d, DLayer& l, float* out) {
     const int T = kBlock;
     act(d, d->h, (size_t) T * d->C, d->hb);
-    gemm(d, l.wgu, 2 * d->F, d->C, d->hb, T, d->gu, 2 * d->F);
+    const bool separate = l.wu.bf || l.wu.q5;
+    gemm(d, l.wgu, separate ? d->F : 2 * d->F, d->C, d->hb, T, d->gu, 2 * d->F);
+    if (separate) gemm(d, l.wu, d->F, d->C, d->hb, T, d->gu + d->F, 2 * d->F);
     if (d->q8) k::silu_mul_f16(d->gu, T, d->F, d->hb2, d->s);
     else k::silu_mul_bf16(d->gu, T, d->F, d->hb2, d->s);
     gemm(d, l.wd, d->C, d->F, d->hb2, T, out, d->C);
 }
 
-// a matrix from the file: [rows][K], the rows of `names` one after another (gate's then up's).  Q8_0 in a GGUF:
-// planar on the device when the drafter reads Q8_0 (d->q8). Other block types are expanded to BF16.
+bool is_q5_mat(const Src& s, const std::string& name, int64_t rows, int64_t K) {
+    return s.g && g_tensor(s, name, {rows, K}).type == kQ5_K;
+}
+
+// A matrix from the file: [rows][K], with the rows of `names` stacked when they use the same runtime format.
 DMat load_mat(Drafter* d, const Src& s, const std::vector<std::string>& names, const std::vector<int64_t>& rows,
               int64_t K) {
     DMat m;
@@ -619,6 +626,27 @@ DMat load_mat(Drafter* d, const Src& s, const std::vector<std::string>& names, c
         cu(cudaMemcpy(m.q, q.data(), n, cudaMemcpyHostToDevice), "upload");
         cu(cudaMemcpy(m.qd, sc.data(), n / 32 * 2, cudaMemcpyHostToDevice), "upload");
         d->vram += n + n / 16;
+        return m;
+    }
+    if (is_q5_mat(s, names.front(), rows.front(), K)) {
+        if (K % 256 != 0) throw std::runtime_error("drafter: " + names.front() + ": partial Q5_K row");
+        const size_t row_bytes = (size_t) (K / 256) * 176;
+        size_t bytes = 0;
+        for (int64_t r : rows) bytes += (size_t) r * row_bytes;
+        m.q5 = dalloc<uint8_t>(bytes);
+        const uint64_t available = s.g->file_size() - s.g->data_start();
+        size_t offset = 0;
+        for (size_t i = 0; i < names.size(); ++i) {
+            const auto& t = g_tensor(s, names[i], {rows[i], K});
+            if (t.type != kQ5_K) throw std::runtime_error("drafter: " + t.name + " is " + t.type_name() + ", Q5_K expected");
+            const size_t part_bytes = (size_t) rows[i] * row_bytes;
+            if (t.offset > available || part_bytes > available - t.offset)
+                throw std::runtime_error("drafter: truncated Q5_K tensor " + t.name);
+            cu(cudaMemcpy(m.q5 + offset, s.g->tensor_data(t), part_bytes, cudaMemcpyHostToDevice), "upload Q5_K");
+            offset += part_bytes;
+        }
+        d->q5 = true;
+        d->vram += bytes;
         return m;
     }
     std::vector<uint16_t> v;
@@ -648,6 +676,19 @@ int context_rows(int ctx) {
     return std::min(ctx, std::max(want, 2048));
 }
 
+bool has_q5_matrices(const std::string& path) {
+    if (path.empty()) return false;
+    try {
+        if (!is_gguf(path)) return false;
+        const maya::GgufFile g(path);
+        for (const auto& t : g.tensors())
+            if (t.type == kQ5_K && t.shape.size() == 2 && t.name.rfind("blk.", 0) == 0) return true;
+    } catch (const std::runtime_error&) {
+        // The loader reports malformed files through the usual drafter fallback.
+    }
+    return false;
+}
+
 size_t weights_bytes(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     const auto end = f.tellg();
@@ -657,9 +698,10 @@ size_t weights_bytes(const std::string& path) {
     try {
         const maya::GgufFile g(path);
         if (g.count_type("Q5_K") == 0) return bytes;
-        // A draft with Q5_K layer matrices uses the BF16 path for every layer matrix.
+        // Layer Q5_K stays packed. Mixed Q8_0 and Q5_K outside the layers still use BF16.
         for (const auto& t : g.tensors()) {
-            if (t.shape.size() != 2 || t.name.rfind("blk.", 0) != 0 || (t.type != kQ5_K && t.type != 8)) continue;
+            const bool layer = t.name.rfind("blk.", 0) == 0;
+            if (t.shape.size() != 2 || t.type != (layer ? 8 : kQ5_K)) continue;
             int block, encoded;
             if (maya::block_geometry(t.type, block, encoded))
                 bytes += (size_t) (t.elements() / block) * (2 * block - encoded);
@@ -695,8 +737,7 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         local[i] = mini ? i != 1 : std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids);
     if (f.g) {
         check_gguf(*f.g, C, layers, d->H, d->KV, d->F, d->taps, local);
-        // (the layers' matrices on the tensor cores straight from their Q8_0 blocks - q8_tile, sm_75 on; else their
-        //  values in BF16, as mtp.safetensors' are read)
+        // When every layer matrix is Q8_0, prepare FP16 inputs for q8_tile. Mixed layers use BF16 inputs.
         bool all_q8 = true;
         for (const auto& t : f.g->tensors())
             if (t.name.rfind("blk.", 0) == 0 && t.shape.size() == 2) all_q8 = all_q8 && t.type == 8;
@@ -734,7 +775,13 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         l.wo = load_mat(d, f, {b + "self_attn.o_proj.weight"}, {C}, H * 128);
         l.wkc = load_mat(d, f, {b + "self_attn.k_proj_ctx.weight"}, {KV * 128}, C);
         l.wvc = load_mat(d, f, {b + "self_attn.v_proj_ctx.weight"}, {KV * 128}, C);
-        l.wgu = load_mat(d, f, {b + "mlp.gate_proj.weight", b + "mlp.up_proj.weight"}, {F, F}, C);   // gate's, up's
+        const std::string gate = b + "mlp.gate_proj.weight", up = b + "mlp.up_proj.weight";
+        if (is_q5_mat(f, gate, F, C) == is_q5_mat(f, up, F, C)) {
+            l.wgu = load_mat(d, f, {gate, up}, {F, F}, C);
+        } else {
+            l.wgu = load_mat(d, f, {gate}, {F}, C);
+            l.wu = load_mat(d, f, {up}, {F}, C);
+        }
         l.wd = load_mat(d, f, {b + "mlp.down_proj.weight"}, {C}, F);
         if (l.local) {   // (a window of 1024: a ring of 2048 rows, F32)
             l.cap = std::min(ctx, 2048);
@@ -1038,7 +1085,7 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 }
 
 size_t bytes(const Drafter* d) { return d->vram; }
-bool matrices_q8(const Drafter* d) { return d->q8; }
+const char* matrix_format(const Drafter* d) { return d->q8 ? "Q8_0" : d->q5 ? "Q5_K/BF16" : "BF16"; }
 bool context_fp8(const Drafter* d) { return d->kv8; }
 void destroy(Drafter* d) {
     if (!d) return;
