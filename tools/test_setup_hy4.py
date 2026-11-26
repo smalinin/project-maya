@@ -1264,12 +1264,12 @@ class Config(unittest.TestCase):
 
         path = write(args())
         config = maya.read_json(path)
-        expected = {"HY4_LANE_WARM": "1", "HY4_FETCH": "mix:1", "HY4_FETCH_GB": "32"}
-        for key, value in expected.items():
-            self.assertEqual(config["env"].pop(key), value)
+        expected = {"HY4_HOT_LEARN": "1", "HY4_LANE_WARM": "1"}
+        self.assertEqual(config["env"], expected)
+        del config["env"]["HY4_LANE_WARM"]
         path.write_text(json.dumps(config))
-        self.assertEqual(maya.read_json(write(args()))["env"], {"HY4_HOT_LEARN": "1", **expected})
-        override = {"HY4_LANE_WARM": "0", "HY4_FETCH": "off", "HY4_FETCH_GB": "16"}
+        self.assertEqual(maya.read_json(write(args()))["env"], expected)
+        override = {"HY4_LANE_WARM": "0", "HY4_FETCH": "mix:1", "HY4_FETCH_GB": "16"}
         assigned = args(env=[f"{key}={value}" for key, value in override.items()])
         self.assertEqual(maya.read_json(write(assigned))["env"], {"HY4_HOT_LEARN": "1", **override})
         self.assertEqual(maya.read_json(write(args()))["env"], {"HY4_HOT_LEARN": "1", **override})
