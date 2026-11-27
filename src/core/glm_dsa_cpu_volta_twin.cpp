@@ -60,11 +60,6 @@ bool mla_fused_supported(int n_head, int qk_nope, int qk_rope, int kv_lora, int 
     return false;
 }
 
-size_t topk_mb_work_bytes(int T) {
-    // per row: hist[256] u32, state {prefix, mask, need, counter, counter2, pad x3}, per-block {gt, eq, off, eqb}
-    return (size_t) std::max(T, 0) * (256 + 8 + 4 * kTopkMbBlocks) * 4;
-}
-
 namespace vtwin {
 namespace {
 
@@ -298,14 +293,20 @@ void idx_score_wmma(const IdxScoreWmma& a) {
     for (int t = 0; t < a.T; ++t) {
         const int pt = a.pos ? a.pos[t] : a.n_kv - 1;
         std::vector<float> q((size_t) a.idx_heads * D);
-        for (size_t i = 0; i < q.size(); ++i) q[i] = half_float(half_sat(a.iq[(size_t) t * a.idx_heads * D + i]));
+        for (size_t i = 0; i < q.size(); ++i) {
+            const float value = a.iq[(size_t) t * a.idx_heads * D + i];
+            q[i] = half_float(a.clamp_queries ? half_sat(value) : half_bits(value));
+        }
         for (int s = 0; s < a.n_kv; ++s) {
             float* out = a.score + (size_t) t * ld + s;
             if (s > pt) {
                 *out = -kInf;
                 continue;
             }
-            for (int e = 0; e < D; ++e) key[e] = half_float(half_sat(key_value(a, s, e)));
+            for (int e = 0; e < D; ++e) {
+                const float value = key_value(a, s, e);
+                key[e] = a.key_f16 ? value : half_float(half_sat(value));
+            }
             float acc = 0.0f;
             for (int h = 0; h < a.idx_heads; ++h) {
                 float dot = 0.0f;

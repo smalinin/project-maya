@@ -2446,6 +2446,18 @@ packing time under the `HY4_PREFILL_RAM_GB` budget. For short windows with at le
 indexer selects candidates per tile and merges them with the same score order and tie-breaking as the single-block
 selector. `HY4_DSA_TOPK_MIN` changes that threshold. Set it to `0` to use the single-block selector throughout.
 
+With a saved full Hy4 routing profile, `HY4_PROFILE_SLOTS=1` reassigns expert slots between layers on each GPU
+within its existing expert memory budget. Each layer keeps at least half of its previous slots. This mode is opt-in.
+
+For windows of 17 to 256 prompt tokens, the full Hy4 layer split with GPU fetch off can use measured CPU expert
+costs and PCIe bandwidth to choose where to compute each layer's nonresident experts. The long prefill pipeline
+keeps its streaming route. `HY4_SHORT_PREFILL=stream` leaves all windows to the ordinary route, and
+`HY4_SHORT_PREFILL=lane` uses the CPU for the short windows.
+
+On supported NVIDIA GPUs, full Hy4 can compute single-row DSA scores with GLM's WMMA kernel and reduce the
+heads' scores before writing them to global memory. Set `HY4_DSA_WMMA_MIN=32768` to enable it from 32,768 visible
+positions. The default `0` uses GEMM throughout.
+
 **On AMD.** `--backend hip` builds `build-hip/maya-hy4`. On a GPU that shares the PC's memory (Strix Halo / Gorgon Halo) the engine takes what the RAM has available less a headroom for the system - 8 GB, or a tenth of the RAM if that is more (`HY4_RAM_HEADROOM_GB`) - says the figures in one line at its start, and keeps every routed expert in the GPU's memory where the size fits: the model file is not held twice (its file cache is given back as the weights are copied in), and the n-gram table stays on the SSD. Run on a Gorgon Halo (Radeon 8065S, `gfx1151`); Radeon cards (`gfx1100`) by the contributor, with Tencent's Q4_K_M. Tensor parallel on AMD compiles but has not been run. Windows with an AMD GPU: experimental (offered by the setup, not tested by us; [AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)) - there a GPU that shares the PC's memory keeps within the memory Windows dedicates to it (`HY4_APU_DEDICATED_GB=<n>`: n GB instead, a test) and within what Windows can still commit less the same headroom, tensor parallel is not taken unless `--tp N` asks for it, and the engine hands the GPU its queued work at the points where the host or another GPU waits for it (`HY4_WIN_SUBMIT=0`: not, for tests).
 
 **Defaults from Tencent's release**: temperature 0.9, top-p 1.0, no top-k; the thinking budget is 32768 tokens; the

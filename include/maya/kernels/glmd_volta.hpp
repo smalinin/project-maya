@@ -124,9 +124,14 @@ struct IdxScoreWmma {
     const int* pos = nullptr;    // device (T) or null
     float* score = nullptr;      // (ld, T)
     int ld = 0;                  // >= n_kv; 0 = n_kv
+    bool clamp_queries = true;    // false uses the standard FP16 rounding of Hy4's GEMM
 };
 constexpr int kIdxWmmaMinDecode = 16384;   // the decode crossover of B10.3 (n_kv > it)
 constexpr int kIdxTokPerBlock = 4;         // tokens per WMMA block (the B tile 128 x 128 FP16)
+constexpr int kIdxWmmaWarps = 8;
+constexpr size_t idx_wmma_shared_bytes(int tokens, int heads, int dim) {
+    return ((size_t) tokens * heads + kIdxWmmaWarps * 16) * (dim + 8) * 2 + (size_t) tokens * heads * 4;
+}
 /// WMMA shapes: idx_heads % 16 == 0, idx_heads <= 32, idx_dim % 16 == 0, idx_dim <= 256, and the warp's 16 x idx_heads
 /// f32 output scratch fits the 16 x (idx_dim + 8) FP16 key tile it reuses: 64 * idx_heads <= 32 * (idx_dim + 8),
 /// i.e. 2 * idx_heads <= idx_dim + 8 (GLM-5.3 32 x 128 fits; 32 x 32 or 16 x 16 would overrun the next warp's tile).
@@ -156,7 +161,9 @@ bool idx_score(const IdxScoreWmma& a, void* stream);
 constexpr int kTopkMbBlocks = 64;
 constexpr int kTopkMbThreads = 512;
 constexpr int kTopkMbMin = 32768;
-size_t topk_mb_work_bytes(int T);
+constexpr size_t topk_mb_work_bytes(int T) {
+    return T > 0 ? (size_t) T * (256 + 8 + 4 * kTopkMbBlocks) * sizeof(uint32_t) : 0;
+}
 bool topk_mb_init(void* work, int T, void* stream);
 bool topk_mb(const float* score, int ld, int n_kv, int T, const int* pos, int top_k, int* sel, void* work,
              void* stream);

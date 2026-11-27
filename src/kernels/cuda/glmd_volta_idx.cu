@@ -64,10 +64,7 @@ __device__ __forceinline__ __half half_sat(float v) { return __float2half(fmaxf(
 // 8 warps x 16 cells per block, TB tokens per block (blockIdx.y), NTH = idx_heads / 16 column tiles per token.
 // Shared: the queries of the block's tokens as FP16 [TB * H][D + 8] (matrix_b, col-major), the head weights, and per
 // warp a 16 x (D + 8) FP16 key tile that becomes the warp's 16 x H f32 output scratch after the k-loop.
-constexpr int kIdxWarps = 8;
-size_t idx_wmma_smem(int TB, int H, int D) {
-    return (size_t) TB * H * (D + 8) * 2 + (size_t) kIdxWarps * 16 * (D + 8) * 2 + (size_t) TB * H * 4;
-}
+constexpr int kIdxWarps = kIdxWmmaWarps;
 
 template <int TB, int NTH, bool F16K>
 __global__ void __launch_bounds__(kIdxWarps * 32) idx_wmma_kernel(const MAYA_GRID_CONSTANT IdxScoreWmma a, int ld) {
@@ -89,7 +86,8 @@ __global__ void __launch_bounds__(kIdxWarps * 32) idx_wmma_kernel(const MAYA_GRI
     for (int i = tid; i < TB * H * D; i += blockDim.x) {
         const int r = i / D, e = i - r * D;   // r = tok * H + h
         const int tok = r / H;
-        sB[(size_t) r * LDD + e] = tok < ntok ? half_sat(a.iq[(size_t) t0 * H * D + i]) : __float2half(0.0f);
+        const float q = tok < ntok ? a.iq[(size_t) t0 * H * D + i] : 0.0f;
+        sB[(size_t) r * LDD + e] = a.clamp_queries ? half_sat(q) : __float2half_rn(q);
     }
     for (int i = tid; i < TB * H; i += blockDim.x) sW[i] = i / H < ntok ? a.w[(size_t) t0 * H + i] : 0.0f;
     if (tid < TB) s_pos[tid] = tid < ntok ? (a.pos ? a.pos[t0 + tid] : a.n_kv - 1) : -1;
@@ -163,7 +161,7 @@ __global__ void __launch_bounds__(kIdxWarps * 32) idx_wmma_kernel(const MAYA_GRI
 
 template <int TB, int NTH>
 bool launch_idx_wmma(const IdxScoreWmma& a, int ld, cudaStream_t s) {
-    const size_t smem = idx_wmma_smem(TB, NTH * 16, a.idx_dim);
+    const size_t smem = idx_wmma_shared_bytes(TB, NTH * 16, a.idx_dim);
     if (smem > 48 * 1024) {
         static std::atomic<unsigned> done[2]{};
         int dev = 0;

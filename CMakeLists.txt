@@ -1031,7 +1031,8 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     # kernels (src/ds4/ds4_iq) and maya-mm3's OS helpers; NVIDIA, and AMD on Linux
     if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
       add_executable(maya-hy4 src/hy4/hy4_main.cpp src/hy4/hy4_model.cu src/hy4/hy4_vision.cu src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp src/hy4/hy4_tp.cpp
-                              src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_lt.cu)
+                              src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_lt.cu
+                              src/kernels/cuda/glmd_volta_idx.cu)
       if(MAYA_ENABLE_HIP AND MAYA_HIPBLASLT_AVAILABLE)   # (the prompt path's FP16 GEMMs on AMD: ds4_lt.cu, measured)
         set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS MAYA_HIPBLASLT_AVAILABLE=1)
         target_link_libraries(maya-hy4 PRIVATE roc::hipblaslt)

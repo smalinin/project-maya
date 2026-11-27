@@ -53,6 +53,17 @@ int main() {
         CHECK(hy4::prompt_cache_layers(layers, {1.0, 2.0, 1.0}, 11) == (std::vector<size_t>{3, 1}));
         CHECK(hy4::prompt_cache_layers(layers, {1.0, 2.0, 1.0}, 2).empty());
     }
+    {
+        const std::vector<hy4::ExpertSlotLayer> layers{
+            {10, 4, {0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.05, 0.05}},
+            {20, 4, {0.40, 0.40, 0.05, 0.04, 0.04, 0.03, 0.02, 0.02}},
+            {8, 8, {0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125}},
+            {1, 3, {}},
+        };
+        CHECK(hy4::profile_expert_slots(layers, 8) == (std::vector<int>{8, 2, 8, 3}));
+        CHECK(hy4::profile_expert_slots(layers, 5) == (std::vector<int>{5, 3, 8, 3}));
+        CHECK(hy4::profile_expert_slots({}, 5).empty());
+    }
     // fits with F16 rows: F16, nothing else asked (the start is the one before --kv auto reached this layout)
     for (int kv : {-1, 0}) {
         Card c{8.0, 6.0, 1.0, 0.8, ""};

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <numeric>
 #include <vector>
 
 namespace hy4 {
@@ -54,6 +55,49 @@ struct PromptCacheLayer {
     int gpu;
     size_t bytes;
 };
+
+struct ExpertSlotLayer {
+    size_t bytes = 0;               // one resident expert
+    int slots = 0;
+    std::vector<double> frequency;  // descending, normalized over this layer's routes
+};
+
+// Reallocate a single GPU's existing expert budget. Keep half of each layer's existing slots as a prior for
+// routing patterns absent from the profile. Prefer a larger saved routing frequency per byte of VRAM.
+inline std::vector<int> profile_expert_slots(const std::vector<ExpertSlotLayer>& layers, int limit) {
+    struct Slot {
+        size_t layer;
+        int rank;
+        double density;
+    };
+    std::vector<Slot> candidates;
+    std::vector<int> original, selected;
+    size_t budget = 0;
+    double hits_before = 0.0, hits_after = 0.0;
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto& l = layers[il];
+        original.push_back(l.slots);
+        const int cap = std::min(limit, (int) l.frequency.size());
+        if (!l.bytes || l.slots < 2 || cap < l.slots || l.slots >= (int) l.frequency.size()) {
+            selected.push_back(l.slots);
+            continue;
+        }
+        const int keep = l.slots / 2;
+        selected.push_back(keep);
+        budget += l.bytes * (l.slots - keep);
+        hits_before += std::accumulate(l.frequency.begin() + keep, l.frequency.begin() + l.slots, 0.0);
+        for (int i = keep; i < cap; ++i) candidates.push_back({il, i, l.frequency[(size_t) i] / l.bytes});
+    }
+    std::stable_sort(candidates.begin(), candidates.end(), [](const Slot& a, const Slot& b) { return a.density > b.density; });
+    for (const Slot& s : candidates) {
+        const auto& l = layers[s.layer];
+        if (l.bytes > budget) continue;
+        budget -= l.bytes;
+        ++selected[s.layer];
+        hits_after += l.frequency[(size_t) s.rank];
+    }
+    return hits_after > hits_before + 1e-9 ? selected : original;
+}
 
 // A stage's cold experts have to be packed and uploaded on each chunk. Spend the pinned cache on the
 // stage with the most estimated work remaining. A wholly cached layer needs no dispatch to the packing pool.

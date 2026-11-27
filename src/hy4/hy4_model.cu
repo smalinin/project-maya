@@ -25,6 +25,7 @@
 #include "../ds4/ds4_lt.hpp"
 #include "../ds4/ds4_pcie.hpp"
 #include "../core/vram_late.hpp"   // (#1026: the reserve held for the whole run)
+#include "maya/kernels/glmd_volta.hpp"
 
 #include <atomic>
 #include <cublas_v2.h>
@@ -482,6 +483,7 @@ struct Gpu {
     uint8_t* stage = nullptr;   // (a prompt's streamed experts: kStage slots of the largest local blob)
     size_t stage_bytes = 0;
     double h2d_gbs = 10.0;      // (... the copies to it, GB/s: measured at the load)
+    bool dsa_wmma = false;
     int heads_one = -1;         // (a token window's head-by-head GEMVs in one launch: 1, 8 heads a launch: 0, -1 not
                                 //  timed yet - mm_heads)
     int* pmap = nullptr;        // (... each expert's slot in them, -1: not this pass's)
@@ -1707,6 +1709,49 @@ struct Model::Impl {
         for (const auto& [n, t] : pk.t)
             if (n.compare(0, pre.size(), pre) == 0 && n.find("_exps.") != std::string::npos) b += t.bytes;
         return g.n_expert ? b / (size_t) g.n_expert + 768 : 0;
+    }
+    static size_t expert_align(size_t bytes) { return (bytes + 255) / 256 * 256; }
+    static size_t expert_blob(size_t gate, size_t down) { return 2 * expert_align(gate) + expert_align(down); }
+
+    void place_profile_slots() {
+        const char* enabled = std::getenv("HY4_PROFILE_SLOTS");
+        if (!g.full || tp > 1 || !enabled || std::atoi(enabled) == 0 || (!hot.loaded && prof_in.empty())) return;
+        const int limit = (int) std::floor(std::max(0.0, std::min(1.0, o.vram_experts)) * g.n_expert);
+        int moved = 0;
+        for (size_t gi = 0; gi < G.size(); ++gi) {
+            std::vector<size_t> indices;
+            std::vector<ExpertSlotLayer> layers;
+            for (size_t il = (size_t) g.n_dense_lead; il < L.size(); ++il) {
+                const Layer& l = L[il];
+                if (l.gpu != (int) gi || l.n_res < 2 || l.n_res >= g.n_expert) continue;
+                const std::string prefix = "blk." + std::to_string(il) + ".ffn_";
+                const Tensor *gate = pk.get(prefix + "gate_exps.weight"), *down = pk.get(prefix + "down_exps.weight");
+                if (!gate || !down) continue;
+                const size_t gb = iq::row_bytes(type_id(gate->type), g.n_lat) * (size_t) g.n_ff_exp;
+                const size_t db = iq::row_bytes(type_id(down->type), g.n_ff_exp) * (size_t) g.n_lat;
+                if (!gb || !db) continue;
+                ExpertSlotLayer slots{expert_blob(gb, db), l.n_res, {}};
+                const size_t first = il * g.n_expert;
+                for (size_t e = first; e < first + g.n_expert; ++e) {
+                    const double weight = hot.loaded ? hot.score[e] : (double) prof_in[e];
+                    slots.frequency.push_back(std::isfinite(weight) && weight > 0 ? weight : 0.0);
+                }
+                const double total = std::accumulate(slots.frequency.begin(), slots.frequency.end(), 0.0);
+                if (total <= 0.0) continue;
+                std::sort(slots.frequency.rbegin(), slots.frequency.rend());
+                for (double& weight : slots.frequency) weight /= total;
+                indices.push_back(il);
+                layers.push_back(std::move(slots));
+            }
+            const auto selected = profile_expert_slots(layers, limit);
+            for (size_t i = 0; i < indices.size(); ++i) {
+                moved += std::max(0, selected[i] - L[indices[i]].n_res);
+                L[indices[i]].n_res = selected[i];
+            }
+        }
+        if (moved)
+            info.push_back("INFO Hy4 expert placement: " + std::to_string(moved) +
+                           " VRAM slots reassigned between layers by the routing profile");
     }
     size_t layer_bytes(int il) const {
         size_t b = 0;
@@ -3481,14 +3526,13 @@ struct Model::Impl {
                 return false;
             }
             const size_t gb = iq::row_bytes(l.tg, lat) * (size_t) ff, db = iq::row_bytes(l.td, ff) * (size_t) lat;
-            auto al = [](size_t b) { return (b + 255) / 256 * 256; };
             if (N > 1 && !l.mtp)
                 return expert_slices(l, gp, err, m, units > 0 ? units : N, pk.data(*tg), pk.data(*tu), pk.data(*td)) &&
                        caches(l, gp, err);
             l.tr[0] = 0;
-            l.tr[1] = al(gb);
-            l.tr[2] = 2 * al(gb);
-            l.blob = al(2 * al(gb) + db);
+            l.tr[1] = expert_align(gb);
+            l.tr[2] = 2 * expert_align(gb);
+            l.blob = expert_blob(gb, db);
             l.ffe = ff;
             if (l.mtp || round) l.n_res = g.n_expert;   // (the MTP block's: always all in VRAM - rounded from BF16)
             l.n_res = std::max(0, std::min(l.n_res, g.n_expert));
@@ -3744,6 +3788,14 @@ struct Model::Impl {
         // (the second stream: only for a GPU's own scratch - not for a size-only pass, arena_bytes' stand-in GPU)
         gp.ixf = !only_bytes && fork_wanted(gp.dev, ix_fork);
         gp.atf = !only_bytes && fork_wanted(gp.dev, attn_fork);
+#if !defined(MAYA_USE_HIP)
+        if (!only_bytes && g.full && dsa_wmma_min > 0 && glmd::idx_score_wmma_supported(g.ix_heads, g.ix_dim)) {
+            int major = 0, optin = 0;
+            gp.dsa_wmma = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, gp.dev) == cudaSuccess &&
+                          cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, gp.dev) == cudaSuccess &&
+                          major >= 7 && (size_t) optin >= glmd::idx_wmma_shared_bytes(glmd::kIdxTokPerBlock, g.ix_heads, g.ix_dim);
+        }
+#endif
         if (!only_bytes && !gp.s4 && (gp.ixf || gp.atf)) {
             CK(cudaStreamCreateWithFlags(&gp.s4, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&gp.evf, cudaEventDisableTiming));
@@ -4262,6 +4314,7 @@ struct Model::Impl {
             else info.push_back("INFO the expert profile " + o.profile + " was not read (missing, or another model's)");
         }
         hot_init();
+        place_profile_slots();
         // the host's parts: the token embeddings and the Engram table, read in place
         const Tensor* te = need("token_embd.weight", err);
         if (!te) return false;
@@ -5166,6 +5219,10 @@ struct Model::Impl {
         const char* value = std::getenv("HY4_DSA_TOPK_MIN");
         return value ? std::max(0, std::atoi(value)) : 32768;
     }();
+    const int dsa_wmma_min = [] {
+        const char* value = std::getenv("HY4_DSA_WMMA_MIN");
+        return value ? std::max(0, std::atoi(value)) : 0;
+    }();
     bool full_picks(Layer& l, Gpu& gp, int T, int64_t p0) {
         const int D = g.ix_dim, H = g.ix_heads, maxk = g.ix_top_k + 1;
         k::indexer_norm(gp.ik, T, D, l.ix_k_norm, l.ix_k_bias, g.eps, gp.s);
@@ -5179,8 +5236,13 @@ struct Model::Impl {
         const int ld = (int) o.max_ctx + 1;
         for (int t0 = 0; t0 < T; t0 += kSub) {
             const int ts = std::min(kSub, T - t0), rows = (int) p0 + t0 + ts;
-            if (rows > g.ix_top_k && !ix_score_gemm(l, gp, t0, ts, rows, ld, (const uint16_t*) l.pooled))
-                return false;
+            if (rows > g.ix_top_k) {
+                const glmd::IdxScoreWmma wmma{gp.iq + (size_t) t0 * H * D, gp.wt + (size_t) t0 * H, l.pooled,
+                                              1, H, D, rows, ts, gp.pos + t0, gp.score, ld, false};
+                const bool fused = gp.dsa_wmma && !inject && rows >= dsa_wmma_min && ts == 1 &&
+                                   glmd::idx_score_wmma(wmma, gp.s);
+                if (!fused && !ix_score_gemm(l, gp, t0, ts, rows, ld, (const uint16_t*) l.pooled)) return false;
+            }
             int* keys = gp.keys + (size_t) t0 * maxk;
             int* nk = gp.knk + t0;
             // The score GEMM's scratch is free after ix_reduce; attention can use it again after selection.
@@ -6006,6 +6068,66 @@ struct Model::Impl {
         std::vector<double> prev_str;
         int windows = 0;
     } route;
+    struct ShortPrefillCost {
+        double first = 0.0, repeat = 0.0;  // seconds per distinct expert and per additional routed token
+    };
+    static constexpr int kShortPrefillMax = 256;
+    const std::string short_prefill = [] {
+        const char* value = std::getenv("HY4_SHORT_PREFILL");
+        return value ? std::string(value) : std::string("auto");
+    }();
+    std::map<std::pair<int, int>, ShortPrefillCost> short_cost;
+
+    void short_prefill_setup() {
+        if (!g.full || !lane || tp > 1 || fx.mode != 0 || route.mode == 3 || short_prefill != "auto") return;
+        for (const Layer& l : L) {
+            const std::pair<int, int> type{l.tg, l.td};
+            if (!l.partial() || short_cost.find(type) != short_cost.end()) continue;
+            std::vector<int> experts;
+            for (int e = 0; e < g.n_expert && experts.size() < 12; ++e)
+                if (l.on_lane(e)) experts.push_back(e);
+            const int n = (int) experts.size();
+            if (n < 4) continue;
+            constexpr int repeats = 3;
+            const int width = l.cex.f.n_embd;
+            std::vector<float> in((size_t) repeats * n * width, 0.125f), out(in.size());
+            std::vector<CpuEntry> entries;
+            auto sample = [&](int m) {
+                entries.clear();
+                for (int i = 0; i < m * n; ++i) entries.push_back({i, experts[(size_t) i % n], 1.0f});
+                const double t = now_s();
+                cpu_experts(*lane, l.cex, entries, in.data(), m * n, out.data());
+                return now_s() - t;
+            };
+            (void) sample(1);  // page in the representative weights before measuring them
+            const double first = std::min(sample(1), sample(1)) / n;
+            const double burst = std::min(sample(repeats), sample(repeats)) / n;
+            short_cost[type] = {first, std::max(first * 0.2, (burst - first) / (repeats - 1))};
+        }
+        if (!short_cost.empty())
+            info.push_back("INFO Hy4 short prefill: measured CPU expert costs for " + std::to_string(short_cost.size()) +
+                           " quantization pairs, used on chunks up to " + std::to_string(kShortPrefillMax) + " tokens");
+    }
+
+    // -1 leaves the normal route in charge, 0 chooses the CPU and 1 streams weights to the GPU.
+    int short_prefill_route(const Layer& l, const Gpu& gp, const int* ids, int T) const {
+        if (short_prefill == "lane") return 0;
+        const auto it = short_cost.find({l.tg, l.td});
+        if (it == short_cost.end()) return -1;
+        int n = 0, unique = 0;
+        std::vector<bool> seen((size_t) g.n_expert, false);
+        for (int i = 0; i < T * g.n_used; ++i) {
+            const int e = ids[i];
+            if (!l.on_lane(e)) continue;
+            ++n;
+            if (!seen[(size_t) e]) ++unique, seen[(size_t) e] = true;
+        }
+        const auto& c = it->second;
+        const double cpu = unique * c.first + (n - unique) * c.repeat;
+        const double gb = (double) unique * l.blob * 1e-9;
+        const double pcie = gb / std::max(0.1, gp.h2d_gbs) + (l.prompt_ram ? 0.0 : gb / copy_gbs);
+        return cpu < pcie * 0.95 ? 0 : 1;
+    }
     // the lane's prompt calls run on 4-bit copies (made or being made, in use: kept or forced - not on trial)
     bool q4x_in_use() const {
         if (lane_count().q4x_mode.load(std::memory_order_relaxed) != 1) return false;
@@ -7386,6 +7508,9 @@ struct Model::Impl {
             }
             bool sh_early = false;   // (the shared expert's down already queued - one GPU's token windows, below)
             const bool ram_prompt = lane_on && T > W && (l.prompt_ram || gp.prompt_stage) && route.mode != 3;
+            const bool short_route = g.full && lane_on && T > W && T <= kShortPrefillMax && !gp.prompt_stage &&
+                                     l.tpm < 0 && fx.mode == 0 && route.mode != 3 &&
+                                     (short_prefill == "lane" || !short_cost.empty());
             if (lane_on) {
                 // The same event orders both the device slot table and the evicted expert's pinned RAM copy.
                 if (gp.hot_wait && l.il >= gp.hot_first) {
@@ -7393,7 +7518,7 @@ struct Model::Impl {
                     gp.hot_wait = false;
                 }
                 CK(cudaMemcpyAsync(host_ids, gp.ids, sizeof(int) * T * nu, cudaMemcpyDeviceToHost, s));
-                if (!ram_prompt) {
+                if (!ram_prompt || short_route) {
                     CK(cudaMemcpyAsync(h_w, gp.rw, sizeof(float) * T * nu, cudaMemcpyDeviceToHost, s));
                     CK(cudaMemcpyAsync(h_lat, gp.lat, sizeof(float) * T * lat, cudaMemcpyDeviceToHost, s));
                 }
@@ -7427,7 +7552,8 @@ struct Model::Impl {
             const int* slot = lane_on || l.tpm >= 0 ? l.slot_d : nullptr;
             bool streamed = false, lat_pre = false;   // (lat_pre: the experts' sum wrote latout's int8 rows)
             const bool share = l.tpm >= 0 && !l.stream_e.empty() && T >= kTpStream;
-            if (ram_prompt) {
+            const int short_side = short_route ? short_prefill_route(l, gp, host_ids, T) : -1;
+            if (ram_prompt && short_side != 0) {
                 ok = ok && experts_streamed(l, gp, T, err, false, true);
                 streamed = true;
             } else if (T > W) {
@@ -7438,6 +7564,11 @@ struct Model::Impl {
                 if (share) {   // (tensor parallel with the CPU lane: every member its share, to its own GPU)
                     ok = ok && experts_streamed(l, gp, T, err, true);
                     streamed = true;
+                } else if (short_side >= 0) {
+                    if (short_side == 1) {
+                        ok = ok && experts_streamed(l, gp, T, err);
+                        streamed = true;
+                    }
                 } else if (lane_on && route.any) {
                     int n_ent = 0;
                     std::vector<char> used((size_t) g.n_expert, 0);
@@ -10071,6 +10202,7 @@ bool Model::load(const Options& o, std::string& err) {
     auto finish_load = [&](bool calibrate) {
         if (!measure() || (calibrate && !measure_pc())) return false;
         m->hot_prepare_decode();
+        m->short_prefill_setup();
         return true;
     };
     if (std::getenv("HY4_NO_WARMUP")) return finish_load(false);
