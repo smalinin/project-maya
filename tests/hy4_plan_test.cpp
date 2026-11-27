@@ -48,6 +48,11 @@ int main() {
         CHECK(hy4::place_layers({62, 74}, {3}, layers, 8, 8, 4, nullptr, &staged));
         CHECK(staged == (std::vector<size_t>{0, 0}));
     }
+    {
+        const std::vector<hy4::PromptCacheLayer> layers{{0, 4}, {0, 5}, {1, 3}, {1, 6}, {2, 0}};
+        CHECK(hy4::prompt_cache_layers(layers, {1.0, 2.0, 1.0}, 11) == (std::vector<size_t>{3, 1}));
+        CHECK(hy4::prompt_cache_layers(layers, {1.0, 2.0, 1.0}, 2).empty());
+    }
     // fits with F16 rows: F16, nothing else asked (the start is the one before --kv auto reached this layout)
     for (int kv : {-1, 0}) {
         Card c{8.0, 6.0, 1.0, 0.8, ""};

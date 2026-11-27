@@ -1021,6 +1021,36 @@ static void test_f16_range() {
     cudaFree(input);
 }
 
+static void test_tiled_topk() {
+    constexpr int n = 65536, top = 2048, ldk = top + 1;
+    const std::vector<int> positions{0, top - 1, 8191, 8192, 32768, n - 1, n - 11};
+    const int T = (int) positions.size();
+    auto scores = randn((size_t) T * n);
+    for (int i = 0; i < n; ++i) {
+        scores[(size_t) (T - 2) * n + i] = 1.0f;
+        scores[(size_t) (T - 1) * n + i] = i % 5 == 0 ? 0.0f : -0.0f;
+    }
+    auto* dscore = dev(scores);
+    auto* dpos = dev(positions);
+    const std::vector<int> blank((size_t) T * ldk, -1);
+    auto *ref = dev(blank), *keys = dev(blank);
+    auto *rc = dev(std::vector<int>(T)), *nk = dev(std::vector<int>(T));
+    const size_t workspace_ints = (size_t) T * n;
+    auto* workspace = dev(std::vector<int>(workspace_ints));
+    hy4::k::ix_select(dscore, n, T, dpos, 1, top, ref, ldk, rc, nullptr, true);
+    CHECK(hy4::k::ix_select_tiled(dscore, n, T, dpos, n, top, keys, ldk, nk, workspace, workspace_ints, nullptr));
+    CHECK(host(keys, blank.size()) == host(ref, blank.size()));
+    CHECK(host(nk, T) == host(rc, T));
+    CHECK(!hy4::k::ix_select_tiled(dscore, n, T, dpos, n, top, keys, ldk, nk, workspace, 1, nullptr));
+    cudaFree(workspace);
+    cudaFree(nk);
+    cudaFree(rc);
+    cudaFree(keys);
+    cudaFree(ref);
+    cudaFree(dpos);
+    cudaFree(dscore);
+}
+
 static void test_dfly_keys() {
     constexpr int capacity = 2048, rows = 7, pos = 32000, stride = capacity + rows;
     std::vector<int> picks(capacity);
@@ -1056,6 +1086,7 @@ int main() {
     test_router();
     test_indexer();
     test_dfly_keys();
+    test_tiled_topk();
     test_engram();
     test_row_top();
     test_hc(6144);

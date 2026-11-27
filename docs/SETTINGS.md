@@ -2439,6 +2439,13 @@ the corresponding trunk layer's index and KV cache. During decode, hot expert sw
 streams. The first affected FFN waits for both the new weights and the updated slot table. The engine uses the
 synchronous transfer when the pinned decode buffer is unavailable or a CPU re-encoding worker can access those slots.
 
+With full Hy4 and Q8_K CPU activations, the decode window quantizes each gate/up slice in the same worker job. The
+prefill pipeline divides its existing pinned staging memory among the GPUs so that one stage's PCIe transfer can
+overlap another stage's packing. Its pinned expert cache prioritizes stages with the highest estimated transfer and
+packing time under the `HY4_PREFILL_RAM_GB` budget. For short windows with at least 32,768 visible positions, the
+indexer selects candidates per tile and merges them with the same score order and tie-breaking as the single-block
+selector. `HY4_DSA_TOPK_MIN` changes that threshold. Set it to `0` to use the single-block selector throughout.
+
 **On AMD.** `--backend hip` builds `build-hip/maya-hy4`. On a GPU that shares the PC's memory (Strix Halo / Gorgon Halo) the engine takes what the RAM has available less a headroom for the system - 8 GB, or a tenth of the RAM if that is more (`HY4_RAM_HEADROOM_GB`) - says the figures in one line at its start, and keeps every routed expert in the GPU's memory where the size fits: the model file is not held twice (its file cache is given back as the weights are copied in), and the n-gram table stays on the SSD. Run on a Gorgon Halo (Radeon 8065S, `gfx1151`); Radeon cards (`gfx1100`) by the contributor, with Tencent's Q4_K_M. Tensor parallel on AMD compiles but has not been run. Windows with an AMD GPU: experimental (offered by the setup, not tested by us; [AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)) - there a GPU that shares the PC's memory keeps within the memory Windows dedicates to it (`HY4_APU_DEDICATED_GB=<n>`: n GB instead, a test) and within what Windows can still commit less the same headroom, tensor parallel is not taken unless `--tp N` asks for it, and the engine hands the GPU its queued work at the points where the host or another GPU waits for it (`HY4_WIN_SUBMIT=0`: not, for tests).
 
 **Defaults from Tencent's release**: temperature 0.9, top-p 1.0, no top-k; the thinking budget is 32768 tokens; the

@@ -26,7 +26,8 @@ public:
     ~Lane();
     Lane(const Lane&) = delete;
     Lane& operator=(const Lane&) = delete;
-    void parallel_for(int n, const std::function<void(int)>& f, const std::vector<int>* node_of = nullptr);
+    void parallel_for(int n, const std::function<void(int)>& f, const std::vector<int>* node_of = nullptr,
+                      bool pin_caller = true);
     int threads() const;
     int nodes() const;
     /// every worker asleep - no job for longer than the spin (between answers); false for a lane of no workers
@@ -217,8 +218,8 @@ bool q4x_memo_put(const std::string& path, const std::string& key, Q4xMemo m);
 const char* lane_kernels_id();
 
 /// out [T][n_embd] = each token's weighted sum of its entries' experts (rows with no entry: 0), x [T][n_embd]; the
-/// experts' weights read once for up to 8 of their tokens.  Scratch is the lane's own (grown as needed).
+/// experts' weights read once per token group. Short decode windows can quantize each gate/up slice in the same job.
 void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x, int T,
-                 float* out);
+                 float* out, bool fuse_h_quant = false);
 
 }  // namespace hy4

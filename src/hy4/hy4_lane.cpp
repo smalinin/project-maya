@@ -3,6 +3,10 @@
 
 #include "maya/kernels/cpu/pool.hpp"
 
+#if defined(MAYA_NATIVE_EXPERTS)
+#include "ggml.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <string>
@@ -424,7 +428,7 @@ bool Lane::move_to_node(const void* ptr, size_t bytes, int node) {
 #endif
 }
 
-void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vector<int>* node_of) {
+void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vector<int>* node_of, bool pin_caller) {
     if (n <= 0) return;
     if (p->th.empty() || n == 1) {
         for (int i = 0; i < n; ++i) f(i);
@@ -445,7 +449,7 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
             p->items[q].push_back(i);
         }
     }
-    if (p->caller_core >= 0) {   // (the thread that brings the jobs: pinned once)
+    if (pin_caller && p->caller_core >= 0) {   // (the thread that brings the jobs: pinned once)
         thread_local const Impl* pinned_for = nullptr;
         if (pinned_for != p.get()) {
             maya::kernels::cpu::pin_current_thread(p->caller_core);
@@ -670,11 +674,18 @@ uint64_t ram_total() {
 }
 
 void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x, int T,
-                 float* out) {
+                 float* out, bool fuse_h_quant) {
     const iqc::IqCpu& f = ex.f;
     const int E = f.n_embd, F = f.n_ff, n = (int) entries.size();
     std::fill(out, out + (size_t) T * E, 0.0f);
     if (n == 0) return;
+    // Q8_K computes the scale and sums independently in each 256-element block.
+    constexpr int kQ8Block = 256;
+#if defined(MAYA_NATIVE_EXPERTS)
+    fuse_h_quant = fuse_h_quant && f.d_act == GGML_TYPE_Q8_K && F % kQ8Block == 0;
+#else
+    fuse_h_quant = false;
+#endif
     LaneProf& lp = lane_prof();
     auto clk = [&] {
         return lp.on ? std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0.0;
@@ -708,7 +719,7 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         iqc::iq_cpu_quant(f.gu_act, x + (size_t) t * E, E, sc.xq.data() + (size_t) t * f.act_bytes);
     };
     const int nq = (int) sc.toks.size();
-    if (nq <= 2)
+    if (nq <= 2 || fuse_h_quant)
         for (int i = 0; i < nq; ++i) qx(i);
     else
         lane.parallel_for(nq, qx);
@@ -729,7 +740,9 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         for (int a = i; a < j; a += gn) groups.push_back({e, a, std::min(gn, j - a), q4});
         i = j;
     }
-    const int gu_chunks = (F + kRowChunk - 1) / kRowChunk, dn_chunks = (E + kRowChunk - 1) / kRowChunk;
+    const int gu_step = fuse_h_quant ? kQ8Block : kRowChunk;
+    const int gu_chunks = (F + gu_step - 1) / gu_step, dn_chunks = (E + kRowChunk - 1) / kRowChunk;
+    sc.hq.resize((size_t) n * f.h_bytes);
     // each group's expert's NUMA node - e % nodes, where place_experts puts its pages - the work items routed by it
     std::vector<int> gu_node, dn_node;
     if (lane.nodes() > 1)
@@ -741,7 +754,7 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
     const double tp1 = clk();
     lane.parallel_for((int) groups.size() * gu_chunks, [&](int it) {
         const Grp& gr = groups[(size_t) (it / gu_chunks)];
-        const int r0 = (it % gu_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
+        const int r0 = (it % gu_chunks) * gu_step, r1 = std::min(F, r0 + gu_step);
         const void* act[kMaxNt];
         float* ff[kMaxNt];
         for (int k = 0; k < gr.c; ++k) {
@@ -754,16 +767,23 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         else
             iqc::iq_cpu_gate_up(f, ex.G((size_t) gr.e), ex.U((size_t) gr.e), act,
                                 gr.c, ff, r0, r1, ex.limit);
+        if (fuse_h_quant) {
+            const size_t offset = (size_t) r0 * f.h_bytes / F;
+            for (int k = 0; k < gr.c; ++k) {
+                const int id = sc.order[(size_t) (gr.a + k)];
+                iqc::iq_cpu_quant(f.d_act, ff[k] + r0, r1 - r0, sc.hq.data() + id * f.h_bytes + offset);
+            }
+        }
     }, gu_node.empty() ? nullptr : &gu_node);
-    // each entry's h quantized once (each down item quantized its entries' h before: 12 times over in a decode)
-    sc.hq.resize((size_t) n * f.h_bytes);
-    const auto qh = [&](int i) {
-        iqc::iq_cpu_quant(f.d_act, sc.h.data() + (size_t) i * F, F, sc.hq.data() + (size_t) i * f.h_bytes);
-    };
-    if (n <= 2)
-        for (int i = 0; i < n; ++i) qh(i);
-    else
-        lane.parallel_for(n, qh);
+    if (!fuse_h_quant) {
+        const auto qh = [&](int i) {
+            iqc::iq_cpu_quant(f.d_act, sc.h.data() + (size_t) i * F, F, sc.hq.data() + (size_t) i * f.h_bytes);
+        };
+        if (n <= 2)
+            for (int i = 0; i < n; ++i) qh(i);
+        else
+            lane.parallel_for(n, qh);
+    }
     const double tp2 = clk();
     lane.parallel_for((int) groups.size() * dn_chunks, [&](int it) {
         const Grp& gr = groups[(size_t) (it / dn_chunks)];

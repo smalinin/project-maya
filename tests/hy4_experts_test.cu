@@ -399,6 +399,11 @@ void run_case(int tg, int td, int n_exp, int T, std::mt19937& rng, int F = 1536,
             for (int j = 0; j < nu; ++j) ent.push_back({t, ids[(size_t) t * nu + j], w[(size_t) t * nu + j]});
         static hy4::Lane lane(7);
         hy4::cpu_experts(lane, cx, ent, x.data(), T, out.data());
+        if (T <= hy4::k::kMaxWin) {
+            std::vector<float> fused(out.size());
+            hy4::cpu_experts(lane, cx, ent, x.data(), T, fused.data(), true);
+            CHECK(std::memcmp(out.data(), fused.data(), out.size() * sizeof(float)) == 0);
+        }
         const double r = rel(out);
         std::printf("  CPU lane, types %s/%s, %d tokens: rel %.2e\n", iq::name(tg), iq::name(td), T, r);
         // ggml-cpu's activations for the K-quants are Q8_K - a scale a 256 values, the device's a 32 - rounded twice (x,

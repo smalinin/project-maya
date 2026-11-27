@@ -247,6 +247,9 @@ void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, co
 /// own group's positions up to itself -> keys[t][0 .. nk[t]), ldk apart
 void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
                cudaStream_t s, bool token_indexer = false);
+/// Full Hy4's token selector over at most n visible keys. Reuses workspace for per-tile candidates.
+bool ix_select_tiled(const float* score, size_t ld, int T, const int* pos, int n, int top, int* keys, int ldk, int* nk,
+                     int* workspace, size_t workspace_ints, cudaStream_t s);
 /// DFly2 reuses the committed row's picks, in order, followed by each draft row's causal tail.
 void dfly_key_lists(const int* picks, const int* count, int capacity, int pos, int rows, int* keys, int ldk, int* nk,
                     cudaStream_t s);

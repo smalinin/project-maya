@@ -2436,18 +2436,32 @@ __device__ __forceinline__ uint32_t ord_key(float f) {
 }
 // a block (1024 threads) a token: the top `top` of its nv scores (radix select on the order-preserving keys, then the
 // picks in index order - the ties at the threshold the lowest indices), their kpool positions each, then the tail
+template <bool Tile = false, bool Merge = false>
 __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict__ score, size_t ld,
                                                          const int* __restrict__ pos, int kpool, int top,
                                                          int* __restrict__ keys, int ldk, int* __restrict__ nk,
-                                                         bool token_indexer) {
+                                                         bool token_indexer, int tile_size = 0,
+                                                         const int* __restrict__ candidates = nullptr, int stride = 0) {
     __shared__ int hist[256];
     __shared__ uint32_t s_prefix, s_mask;
     __shared__ int s_need;
     __shared__ int s_gt[32], s_eq[32];   // (the warps' totals, then their offsets)
     const int t = blockIdx.x, nth = blockDim.x, tid = threadIdx.x;
-    const int p = pos[t], nv = p / kpool + (token_indexer ? 1 : 0);
-    const float* sc = score + (size_t) t * ld;
+    const int p = pos[t], visible = p / kpool + (token_indexer ? 1 : 0);
+    int nv = visible;
+    const int begin = Tile ? (int) blockIdx.y * tile_size : 0;
+    const float* sc = score + (size_t) t * ld + begin;
     int* kt = keys + (size_t) t * ldk;
+    if constexpr (Tile) {
+        nv = min(tile_size, visible - begin);
+        if (nv <= 0) return;
+        kt += blockIdx.y * top;
+    }
+    if constexpr (Merge) {
+        nv = visible / tile_size * top + min(visible % tile_size, top);
+        candidates += (size_t) t * stride;
+    }
+    const auto key = [&](int g) { return ord_key(sc[Merge ? candidates[g] : g]); };
     const int nsel = min(nv, top);
     uint32_t thr = 0;   // the threshold key: every key > thr picked, then ties at thr
     int take_eq = 0;    // ... how many of the ties
@@ -2462,7 +2476,7 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
             __syncthreads();
             const uint32_t pre = s_prefix, msk = s_mask;
             for (int g = tid; g < nv; g += nth) {
-                const uint32_t kk = ord_key(sc[g]);
+                const uint32_t kk = key(g);
                 if ((kk & msk) == pre) atomicAdd(&hist[(kk >> shift) & 255], 1);
             }
             __syncthreads();
@@ -2486,7 +2500,7 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
     int cg = 0, ce = 0;
     if (nv > top)
         for (int g = b0; g < b1; ++g) {
-            const uint32_t kk = ord_key(sc[g]);
+            const uint32_t kk = key(g);
             cg += kk > thr;
             ce += kk == thr;
         }
@@ -2535,7 +2549,7 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
         if (nv <= top) {
             slot = ng++;
         } else {
-            const uint32_t kk = ord_key(sc[g]);
+            const uint32_t kk = key(g);
             if (kk > thr) {
                 slot = ng + min(ne, take_eq);
                 ++ng;
@@ -2545,12 +2559,14 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
             }
         }
         if (slot < 0) continue;
-        for (int k = 0; k < kpool; ++k) kt[slot * kpool + k] = g * kpool + k;
+        const int cell = Merge ? candidates[g] : begin + g;
+        for (int k = 0; k < kpool; ++k) kt[slot * kpool + k] = cell * kpool + k;
     }
-    __syncthreads();
-    const int ntail = token_indexer ? 0 : p % kpool + 1;
-    for (int k = tid; k < ntail; k += nth) kt[nsel * kpool + k] = nv * kpool + k;
-    if (tid == 0) nk[t] = nsel * kpool + ntail;
+    if constexpr (!Tile) {
+        const int ntail = token_indexer ? 0 : p % kpool + 1;
+        for (int k = tid; k < ntail; k += nth) kt[nsel * kpool + k] = visible * kpool + k;
+        if (tid == 0) nk[t] = nsel * kpool + ntail;
+    }
 }
 
 constexpr int kDflyKeyThreads = 128;
@@ -3135,8 +3151,23 @@ void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, co
 }
 void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
                cudaStream_t s, bool token_indexer) {
-    ix_select_kernel<<<T, 1024, 0, s>>>(score, ld, pos, kpool, top, keys, ldk, nk, token_indexer);
+    ix_select_kernel<><<<T, 1024, 0, s>>>(score, ld, pos, kpool, top, keys, ldk, nk, token_indexer);
     check("ix_select");
+}
+bool ix_select_tiled(const float* score, size_t ld, int T, const int* pos, int n, int top, int* keys, int ldk, int* nk,
+                     int* workspace, size_t workspace_ints, cudaStream_t s) {
+    const int tile_size = std::max(8192, 4 * top);
+    const int tiles = (n + tile_size - 1) / tile_size, stride = tiles * top;
+    if (tiles < 2 || workspace_ints < (size_t) T * stride) return false;
+    // Every tile emits up to top candidates in position order. The merge sees the same scores, in the same
+    // relative order, as the original selection. No discarded candidate can be a global winner.
+    ix_select_kernel<true><<<dim3(T, tiles), 1024, 0, s>>>(score, ld, pos, 1, top, workspace, stride, nullptr, true,
+                                                           tile_size);
+    check("ix_select tiles");
+    ix_select_kernel<false, true><<<T, 1024, 0, s>>>(score, ld, pos, 1, top, keys, ldk, nk, true, tile_size, workspace,
+                                                    stride);
+    check("ix_select merge");
+    return true;
 }
 void dfly_key_lists(const int* picks, const int* count, int capacity, int pos, int rows, int* keys, int ldk, int* nk,
                     cudaStream_t s) {

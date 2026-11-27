@@ -50,6 +50,42 @@ inline bool place_layers(const std::vector<double>& budgets, const std::vector<i
     return true;
 }
 
+struct PromptCacheLayer {
+    int gpu;
+    size_t bytes;
+};
+
+// A stage's cold experts have to be packed and uploaded on each chunk. Spend the pinned cache on the
+// stage with the most estimated work remaining. A wholly cached layer needs no dispatch to the packing pool.
+inline std::vector<size_t> prompt_cache_layers(const std::vector<PromptCacheLayer>& layers,
+                                               const std::vector<double>& seconds_per_byte, size_t budget) {
+    std::vector<size_t> pending(seconds_per_byte.size(), 0), chosen;
+    std::vector<bool> cached(layers.size(), false);
+    for (const auto& layer : layers)
+        if (layer.bytes) pending[(size_t) layer.gpu] += layer.bytes;
+    while (budget > 0) {
+        size_t best = layers.size();
+        double slowest = -1.0;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            const auto& layer = layers[il];
+            if (cached[il] || layer.bytes == 0 || layer.bytes > budget) continue;
+            const size_t gpu = (size_t) layer.gpu;
+            const double cost = pending[gpu] * seconds_per_byte[gpu];
+            if (best == layers.size() || cost > slowest || (cost == slowest && layer.bytes > layers[best].bytes)) {
+                best = il;
+                slowest = cost;
+            }
+        }
+        if (best == layers.size()) break;
+        const auto& layer = layers[best];
+        pending[(size_t) layer.gpu] -= layer.bytes;
+        budget -= layer.bytes;
+        cached[best] = true;
+        chosen.push_back(best);
+    }
+    return chosen;
+}
+
 /// A MoE layer's routed experts in VRAM (the INFO line's vram_slots, the Monitor's "Where the experts live"): those a GPU
 /// holds - whole (the layer split: the layer's own slot map) or a slice of (tensor parallel: each member's and each
 /// helper's map; every expert has its blocks on some member, so all of them) - the others the CPU lane's.  `maps`:

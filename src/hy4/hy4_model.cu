@@ -393,6 +393,8 @@ struct Layer {
 struct PromptStage {
     int* ids = nullptr;
     int* slots = nullptr;
+    uint8_t* bounce = nullptr;
+    int bounce_slots = 0;
     Stats stats;
 };
 
@@ -622,7 +624,7 @@ struct Model::Impl {
     int* h_ids = nullptr;
     float *h_w = nullptr, *h_lat = nullptr, *h_cpu = nullptr;
     uint8_t* h_stage = nullptr;   // (pinned: a pass of streamed experts, kStage blobs)
-    std::mutex prompt_bounce_mu;  // fallback for experts evicted from the startup placement
+    std::mutex prompt_pack_mu;  // each stage owns its pinned slice; only dispatch to the CPU lane is shared
     const double ev_poll_s = (double) lane_waits().ev_poll_us * 1e-6;   // (0: asleep on the event at once)
     int route_side = -1;          // (a prompt chunk's layer timed for the route's rates: 0 lane, 1 stream; route_add)
     double route_amount = 0;      // (... its lane entries / its streamed MB)
@@ -5160,6 +5162,10 @@ struct Model::Impl {
         else k::rope(x, T, heads, ld, heads * ld, off, g.rope, gp.pos, base, gp.s);
     }
 
+    const int dsa_tiled_min = [] {
+        const char* value = std::getenv("HY4_DSA_TOPK_MIN");
+        return value ? std::max(0, std::atoi(value)) : 32768;
+    }();
     bool full_picks(Layer& l, Gpu& gp, int T, int64_t p0) {
         const int D = g.ix_dim, H = g.ix_heads, maxk = g.ix_top_k + 1;
         k::indexer_norm(gp.ik, T, D, l.ix_k_norm, l.ix_k_bias, g.eps, gp.s);
@@ -5175,8 +5181,13 @@ struct Model::Impl {
             const int ts = std::min(kSub, T - t0), rows = (int) p0 + t0 + ts;
             if (rows > g.ix_top_k && !ix_score_gemm(l, gp, t0, ts, rows, ld, (const uint16_t*) l.pooled))
                 return false;
-            k::ix_select(gp.score, ld, ts, gp.pos + t0, 1, g.ix_top_k, gp.keys + (size_t) t0 * maxk, maxk,
-                         gp.knk + t0, gp.s, true);
+            int* keys = gp.keys + (size_t) t0 * maxk;
+            int* nk = gp.knk + t0;
+            // The score GEMM's scratch is free after ix_reduce; attention can use it again after selection.
+            if (ts <= W && dsa_tiled_min > 0 && rows >= dsa_tiled_min &&
+                k::ix_select_tiled(gp.score, ld, ts, gp.pos + t0, rows, g.ix_top_k, keys, maxk, nk,
+                                   reinterpret_cast<int*>(gp.sS), gp.sS_n, gp.s)) continue;
+            k::ix_select(gp.score, ld, ts, gp.pos + t0, 1, g.ix_top_k, keys, maxk, nk, gp.s, true);
         }
         return true;
     }
@@ -7069,14 +7080,20 @@ struct Model::Impl {
         double budget = (double) ram_available() - reserve;
         if (const char* limit = std::getenv("HY4_PREFILL_RAM_GB")) budget = std::min(budget, std::atof(limit) * 1e9);
         if (budget <= 0) return true;
+        std::vector<PromptCacheLayer> candidates;
+        std::vector<double> copy_cost;
+        for (const Gpu& gp : G) copy_cost.push_back(1.0 / std::max(0.1, gp.h2d_gbs) + 1.0 / copy_gbs);
+        for (const Layer& l : L) {
+            const size_t bytes = l.partial() && !prompt_fetch_ram(l) ? (size_t) l.n_lane() * l.blob : 0;
+            candidates.push_back({l.gpu, bytes});
+        }
         int cached = 0, layers = 0;
         size_t used = 0;
         const double started = now_s();
         double last_report = started;
-        for (Layer& l : L) {
-            if (!l.partial() || prompt_fetch_ram(l)) continue;
-            const size_t bytes = (size_t) l.n_lane() * l.blob;
-            if (bytes == 0 || (double) bytes > budget) continue;
+        for (size_t il : prompt_cache_layers(candidates, copy_cost, (size_t) budget)) {
+            Layer& l = L[il];
+            const size_t bytes = candidates[il].bytes;
             Gpu& gp = G[(size_t) l.gpu];
             CK(cudaSetDevice(gp.dev));
             auto* ram = (uint8_t*) ram_alloc(bytes);
@@ -7104,7 +7121,6 @@ struct Model::Impl {
                 CK(cudaStreamCreateWithFlags(&gp.prompt_copy, cudaStreamNonBlocking));
                 CK(cudaEventCreateWithFlags(&gp.prompt_ready, cudaEventDisableTiming));
             }
-            budget -= (double) bytes;
             used += bytes;
             cached += (int) experts.size();
             ++layers;
@@ -7132,7 +7148,8 @@ struct Model::Impl {
         cudaStream_t s = gp.s;
         const bool own_ids = share && l.tpm > 0;   // (member 0 has the routing in h_ids: its lane's copy)
         int* ids = gp.prompt_stage ? gp.prompt_stage->ids : own_ids ? gp.hs_ids : h_ids;
-        uint8_t* bounce = share ? gp.hs_stage : h_stage;
+        uint8_t* bounce = gp.prompt_stage ? gp.prompt_stage->bounce : share ? gp.hs_stage : h_stage;
+        const int bounce_slots = gp.prompt_stage ? gp.prompt_stage->bounce_slots : kStage;
         int* pmap_h = gp.prompt_stage ? gp.prompt_stage->slots : share ? gp.hs_pmap : h_pmap;
         Stats& stats = gp.prompt_stage ? gp.prompt_stage->stats : st;
         if (own_ids) {
@@ -7172,27 +7189,45 @@ struct Model::Impl {
                     if (fetch_ram) return expert;
                     return cached_ram ? l.prompt_slots[(size_t) expert] : -1;
                 };
+                // Resident experts can run while the host packs the first pass's cold weights.
+                if (p0 == 0 && !experts_sets(l, gp, T, err, l.slot_d)) return false;
                 std::vector<int> missing;
-                for (int i = 0; i < np; ++i)
-                    if (cached_slot(i) < 0) missing.push_back(i);
-                std::unique_lock<std::mutex> bounce_lock(prompt_bounce_mu, std::defer_lock);
-                if (!missing.empty()) {
-                    if (gp.prompt_stage) bounce_lock.lock();
-                    lane->parallel_for((int) missing.size() * 3, [&](int task) { copy(missing[(size_t) task / 3] * 3 + task % 3); });
-                }
-                stats.stream_ms += (now_s() - tc) * 1e3;
-                for (int i = 0, end = 0; i < np; i = end) {
+                for (int i = 0; i < np;) {
                     const int slot = cached_slot(i);
-                    end = i + 1;
-                    while (end < np && cached_slot(end) == (slot < 0 ? -1 : slot + end - i)) ++end;
-                    const uint8_t* src = slot < 0 ? bounce + (size_t) i * l.blob : cached_ram + (size_t) slot * l.blob;
-                    CK(cudaMemcpyAsync(gp.stage + (size_t) i * l.blob, src, (size_t) (end - i) * l.blob,
+                    if (slot < 0) {
+                        missing.push_back(i++);
+                        continue;
+                    }
+                    int end = i + 1;
+                    while (end < np && cached_slot(end) == slot + end - i) ++end;
+                    CK(cudaMemcpyAsync(gp.stage + (size_t) i * l.blob, cached_ram + (size_t) slot * l.blob,
+                                       (size_t) (end - i) * l.blob,
                                        cudaMemcpyHostToDevice, gp.prompt_copy));
+                    i = end;
+                }
+                for (size_t b0 = 0; b0 < missing.size(); b0 += bounce_slots) {
+                    // The CPU pool has one caller at a time; H2D runs after releasing it.
+                    const int nb = (int) std::min((size_t) bounce_slots, missing.size() - b0);
+                    const double pack_start = now_s();
+                    {
+                        std::unique_lock<std::mutex> lock(prompt_pack_mu, std::defer_lock);
+                        if (gp.prompt_stage) lock.lock();
+                        lane->parallel_for(nb * 3, [&](int task) {
+                            const size_t i = (size_t) task / 3;
+                            pack_expert(l, u[p0 + (size_t) missing[b0 + i]], task % 3, bounce + i * l.blob);
+                        }, nullptr, !gp.prompt_stage);
+                    }
+                    stats.stream_ms += (now_s() - pack_start) * 1e3;
+                    for (int i = 0, end = 0; i < nb; i = end) {
+                        const int dst = missing[b0 + (size_t) i];
+                        end = i + 1;
+                        while (end < nb && missing[b0 + (size_t) end] == dst + end - i) ++end;
+                        CK(cudaMemcpyAsync(gp.stage + (size_t) dst * l.blob, bounce + (size_t) i * l.blob,
+                                           (size_t) (end - i) * l.blob, cudaMemcpyHostToDevice, gp.prompt_copy));
+                    }
+                    if (b0 + nb < missing.size()) CK(cudaStreamSynchronize(gp.prompt_copy));
                 }
                 CK(cudaEventRecord(gp.prompt_ready, gp.prompt_copy));
-                if (bounce_lock.owns_lock()) CK(cudaStreamSynchronize(gp.prompt_copy));
-                // The copy for the first pass runs beside the GPU's resident experts.
-                if (p0 == 0 && !experts_sets(l, gp, T, err, l.slot_d)) return false;
                 CK(cudaStreamWaitEvent(s, gp.prompt_ready, 0));
             } else if (share) {   // (the lane's pool is one caller's: a member's own threads)
                 std::atomic<int> next{0};
@@ -7461,9 +7496,9 @@ struct Model::Impl {
                     cached.packed_stride = l.blob;
                     cached.packed_up = l.tr[1];
                     cached.packed_down = l.tr[2];
-                    cpu_experts(*lane, cached, lane_entries, h_lat, T, h_cpu);
+                    cpu_experts(*lane, cached, lane_entries, h_lat, T, h_cpu, g.full && T <= W);
                 } else {
-                    cpu_experts(*lane, l.cex, lane_entries, h_lat, T, h_cpu);
+                    cpu_experts(*lane, l.cex, lane_entries, h_lat, T, h_cpu, g.full && T <= W);
                 }
                 const double ms = (now_s() - tc) * 1e3;
                 st.cpu_ms += ms;
@@ -8562,14 +8597,22 @@ struct Model::Impl {
             stages.push_back({begin, end, L[begin].gpu, {nullptr, cudaFreeHost}, {nullptr, cudaFreeHost},
                               end < L.size() && !L[end].ix});
         }
+        const int streamed = (int) std::count_if(stages.begin(), stages.end(),
+                                                [&](const Stage& s) { return G[(size_t) s.gpu].stage_bytes != 0; });
+        const int bounce_slots = kStage / std::max(1, streamed);
+        if (bounce_slots == 0) return true;
+        uint8_t* bounce = h_stage;
         for (Stage& stage : stages) {
             Gpu& gp = G[(size_t) stage.gpu];
-            const bool partial = std::any_of(L.begin() + stage.begin, L.begin() + stage.end,
-                                             [](const Layer& l) { return l.partial(); });
-            if (partial && !gp.prompt_copy) {
-                CK(cudaSetDevice(gp.dev));
-                CK(cudaStreamCreateWithFlags(&gp.prompt_copy, cudaStreamNonBlocking));
-                CK(cudaEventCreateWithFlags(&gp.prompt_ready, cudaEventDisableTiming));
+            if (gp.stage_bytes) {
+                stage.context.bounce = bounce;
+                stage.context.bounce_slots = bounce_slots;
+                bounce += gp.stage_bytes / kStage * bounce_slots;
+                if (!gp.prompt_copy) {
+                    CK(cudaSetDevice(gp.dev));
+                    CK(cudaStreamCreateWithFlags(&gp.prompt_copy, cudaStreamNonBlocking));
+                    CK(cudaEventCreateWithFlags(&gp.prompt_ready, cudaEventDisableTiming));
+                }
             }
             if (stage.end < L.size()) {
                 const size_t bytes = (size_t) Tc * (hidden_row + (stage.sends_keys ? key_row + sizeof(int) : 0));
@@ -8606,6 +8649,7 @@ struct Model::Impl {
         auto run = [&](size_t si, std::string& err) -> bool {
             Stage& stage = stages[si];
             Gpu& gp = G[(size_t) stage.gpu];
+            unpin_this_thread();
             CK(cudaSetDevice(gp.dev));
             int* positions = (int*) stage.host.get();
             std::fill_n(positions, (size_t) position_planes() * Tc, 0);
