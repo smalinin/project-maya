@@ -482,6 +482,7 @@ struct Gpu {
     float* cpo = nullptr;   // (the CPU lane's sums, [Tc][n_lat])
     uint8_t* stage = nullptr;   // (a prompt's streamed experts: kStage slots of the largest local blob)
     size_t stage_bytes = 0;
+    int stage_slots = 128;
     double h2d_gbs = 10.0;      // (... the copies to it, GB/s: measured at the load)
     bool dsa_wmma = false;
     int heads_one = -1;         // (a token window's head-by-head GEMVs in one launch: 1, 8 heads a launch: 0, -1 not
@@ -489,6 +490,7 @@ struct Gpu {
     int* pmap = nullptr;        // (... each expert's slot in them, -1: not this pass's)
     cudaStream_t prompt_copy = nullptr;
     cudaEvent_t prompt_ready = nullptr;
+    void *pipe_output = nullptr, *pipe_host = nullptr;  // pinned hand-off and routing buffers, reused across prompts
     cudaStream_t hot_copy = nullptr;
     cudaEvent_t hot_start = nullptr, hot_ready = nullptr;
     bool hot_pending = false, hot_wait = false;
@@ -1048,6 +1050,8 @@ struct Model::Impl {
             if (gp.fxst) cudaStreamDestroy(gp.fxst);
             if (gp.prompt_ready) cudaEventDestroy(gp.prompt_ready);
             if (gp.prompt_copy) cudaStreamDestroy(gp.prompt_copy);
+            if (gp.pipe_output) cudaFreeHost(gp.pipe_output);
+            if (gp.pipe_host) cudaFreeHost(gp.pipe_host);
             if (gp.hot_start) cudaEventDestroy(gp.hot_start);
             if (gp.hot_ready) cudaEventDestroy(gp.hot_ready);
             if (gp.hot_copy) cudaStreamDestroy(gp.hot_copy);
@@ -2009,6 +2013,86 @@ struct Model::Impl {
     // the drafters' room on the head's GPU: one drafter at a time (--mtp or --dfly2), so the larger of the two the plan
     // counts - with either of them on, or none, the plan is the same
     double draft_plan_bytes() const { return std::max(mtp_plan_bytes(), dfly_plan_bytes()); }
+    bool stage_measured = false;
+    bool choose_staging(std::string& err) {
+        if (stage_measured || !g.full) return true;
+        stage_measured = true;
+        const char* setting = std::getenv("HY4_STAGE_SLOTS");
+        if (setting && std::string(setting) != "auto") {
+            const int slots = std::atoi(setting);
+            if (slots != 32 && slots != 64 && slots != 128) {
+                err = "HY4_STAGE_SLOTS must be auto, 32, 64 or 128";
+                return false;
+            }
+            for (Gpu& gp : G) gp.stage_slots = slots;
+            return true;
+        }
+        size_t blob = 0;
+        for (int il = g.n_dense_lead; il < g.n_layer; ++il) blob = std::max(blob, expert_bytes(il));
+        if (!blob) return true;
+        const std::string file = o.pack + "/staging.txt";
+        std::unique_ptr<void, decltype(&cudaFreeHost)> host_memory(nullptr, cudaFreeHost);
+        for (Gpu& gp : G) {
+            CK(cudaSetDevice(gp.dev));
+            cudaDeviceProp properties{};
+            CK(cudaGetDeviceProperties(&properties, gp.dev));
+            int driver = 0;
+            CK(cudaDriverGetVersion(&driver));
+            const std::string key = "Hy4 staging v1|" + std::string(properties.name) + "|" +
+                                    std::to_string(properties.pciDomainID) + ":" + std::to_string(properties.pciBusID) +
+                                    ":" + std::to_string(properties.pciDeviceID) + "|" + std::to_string(driver) +
+                                    "|" + std::to_string(blob);
+            const std::string memo = pcie::cal_get(file, key);
+            int cached = 0;
+            if (std::sscanf(memo.c_str(), "%d", &cached) == 1 && (cached == 32 || cached == 64 || cached == 128)) {
+                gp.stage_slots = cached;
+                continue;
+            }
+            // Calibration memory is released before the model's allocation plan is applied.
+            if (!host_memory) {
+                void* buffer = nullptr;
+                if (cudaHostAlloc(&buffer, blob * kStage, cudaHostAllocPortable) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    break;
+                }
+                host_memory.reset(buffer);
+                std::memset(buffer, 0, blob * kStage);
+            }
+            void* device = nullptr;
+            if (cudaMalloc(&device, blob * kStage) != cudaSuccess) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            std::vector<StageSample> samples;
+            for (int slots : {32, 64, 128}) {
+                std::vector<double> times;
+                for (int rep = 0; rep < 4; ++rep) {
+                    const double started = now_s();
+                    const auto copied = cudaMemcpyAsync(device, host_memory.get(), blob * slots, cudaMemcpyHostToDevice, gp.s);
+                    if (copied != cudaSuccess || cudaStreamSynchronize(gp.s) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        break;
+                    }
+                    if (rep) times.push_back((now_s() - started) * 1e3);
+                }
+                if (times.size() == 3) {
+                    std::sort(times.begin(), times.end());
+                    samples.push_back({slots, times[1]});
+                }
+            }
+            (void) cudaFree(device);
+            if (samples.size() == 3) {
+                gp.stage_slots = staging_slots(samples);
+                if (!o.trial) pcie::cal_put(file, key, std::to_string(gp.stage_slots),
+                              [](const std::string& tmp, const std::string& path) {
+                                  std::remove(path.c_str());
+                                  return std::rename(tmp.c_str(), path.c_str()) == 0;
+                              });
+            }
+        }
+        return true;
+    }
+
     bool plan(std::string& err) {
         int ndev = 0;
         CK(cudaGetDeviceCount(&ndev));
@@ -2110,6 +2194,7 @@ struct Model::Impl {
                 if (G[i].bw <= 0) return false;
             }
         }
+        if (!choose_staging(err)) return false;
         kv_auto_reset();
         std::vector<double> free_b(devs.size());
         if (late.gpus.size() != devs.size()) {
@@ -2383,6 +2468,8 @@ struct Model::Impl {
         // the layers over the GPUs in order, each with `rho` of its routed experts in VRAM (the others on the CPU
         // lane): the largest rho the GPUs hold (at most --vram-experts), the GPUs filled in turn
         std::vector<size_t> staged;
+        std::vector<int> stage_counts;
+        for (const Gpu& gp : G) stage_counts.push_back(g.full ? gp.stage_slots : 0);
         std::vector<LayerVram> sizes(L.size());
         for (size_t il = (size_t) g.n_dense_lead; il < L.size(); ++il) sizes[il].expert = expert_bytes((int) il);
         auto place = [&](double rho, bool apply) {
@@ -2390,7 +2477,7 @@ struct Model::Impl {
             const int n = std::min(g.n_expert, (int) std::floor(rho * g.n_expert));
             std::vector<int> placement;
             if (!place_layers(free_b, o.layer_split, sizes, n, g.n_expert, g.full ? kStage : 0,
-                              apply ? &placement : nullptr, apply ? &staged : nullptr)) return false;
+                              apply ? &placement : nullptr, apply ? &staged : nullptr, stage_counts)) return false;
             if (apply) for (size_t il = 0; il < L.size(); ++il) {
                 L[il].gpu = placement[il];
                 L[il].n_res = il < (size_t) g.n_dense_lead ? 0 : n;
@@ -2409,7 +2496,7 @@ struct Model::Impl {
             if (!g.full) for (double& f : free_b) f -= eb * kStage;
             // (one GPU: its staging slots are its scratch's end - a picture's room is lent from both)
             if (vis_lend > 0 && devs.size() == 1 && eb > 768) {
-                vis_lend += (eb - 768) * kStage;
+                vis_lend += (eb - 768) * (g.full ? G[0].stage_slots : kStage);
                 const double keep = vision_keep(vis_room, vis_lend);
                 free_b[(size_t) main_gi] += vis_keep - keep;
                 vis_keep = keep;
@@ -4381,6 +4468,13 @@ struct Model::Impl {
         if (tp > 1) {
             if (!load_tp(err)) return false;
         } else {
+            if (g.full) {
+                std::string sizes;
+                for (const Gpu& gp : G)
+                    sizes += (sizes.empty() ? "" : ", ") + std::string("GPU") + std::to_string(gp.dev) +
+                             "=" + std::to_string(gp.stage_slots);
+                info.push_back("INFO Hy4 prefill staging slots: " + sizes);
+            }
             for (int il = 0; il < g.n_layer; ++il) L[(size_t) il].il = il;
             std::vector<std::string> errs(G.size());
             std::vector<std::thread> th;
@@ -4407,7 +4501,8 @@ struct Model::Impl {
                     used = true;
                     if (l.partial()) local = std::max(local, g.full ? l.blob : blob);
                 }
-                if (used && !scratch(G[gi], err, nullptr, local * kStage)) return false;
+                const int count = g.full ? G[gi].stage_slots : kStage;
+                if (used && !scratch(G[gi], err, nullptr, local * count)) return false;
             }
         }
         // the head
@@ -6620,7 +6715,7 @@ struct Model::Impl {
                 !gp.alloc(gp.fx_ids, (size_t) W * 16, err) || !gp.alloc(gp.fx_rw, (size_t) W * 16, err))
                 return false;
             s.stage = gp.stage;
-            s.n_stage = std::min(kStage, W * 16);
+            s.n_stage = std::min(tp > 1 ? kStage : gp.stage_slots, W * 16);
             fx.n_stage = s.n_stage;
             CK(cudaMemset(s.stats, 0, sizeof(unsigned long long) * 16));
             gp.fxa[0].stats = gp.fxa[1].stats = s.stats + 8;
@@ -7271,6 +7366,7 @@ struct Model::Impl {
         const bool own_ids = share && l.tpm > 0;   // (member 0 has the routing in h_ids: its lane's copy)
         int* ids = gp.prompt_stage ? gp.prompt_stage->ids : own_ids ? gp.hs_ids : h_ids;
         uint8_t* bounce = gp.prompt_stage ? gp.prompt_stage->bounce : share ? gp.hs_stage : h_stage;
+        const int stage_slots = g.full && tp <= 1 ? gp.stage_slots : kStage;
         const int bounce_slots = gp.prompt_stage ? gp.prompt_stage->bounce_slots : kStage;
         int* pmap_h = gp.prompt_stage ? gp.prompt_stage->slots : share ? gp.hs_pmap : h_pmap;
         Stats& stats = gp.prompt_stage ? gp.prompt_stage->stats : st;
@@ -7298,8 +7394,8 @@ struct Model::Impl {
         if (from_ram && u.empty()) return experts_sets(l, gp, T, err, l.slot_d);
         const uint8_t* fetch_ram = from_ram ? prompt_fetch_ram(l) : nullptr;
         const uint8_t* cached_ram = fetch_ram ? fetch_ram : l.prompt_ram;
-        for (size_t p0 = 0; p0 < u.size(); p0 += (size_t) kStage) {
-            const int np = (int) std::min(u.size() - p0, (size_t) kStage);
+        for (size_t p0 = 0; p0 < u.size(); p0 += (size_t) stage_slots) {
+            const int np = (int) std::min(u.size() - p0, (size_t) stage_slots);
             const double tc = now_s();
             auto copy = [&](int it) {
                 const int i = it / 3, role = it % 3, e = u[p0 + (size_t) i];
@@ -8704,6 +8800,10 @@ struct Model::Impl {
                 return Tc;
         return Tc * (int) G.size();
     }
+    const bool pipeline_timing = [] {
+        const char* value = std::getenv("HY4_PREFILL_TIMING");
+        return value && std::atoi(value) != 0;
+    }();
 
     // Keep each stage's layers in order so that a block always sees its own and all earlier KV rows.
     bool prefill_pipe(const int* ids, int n, int64_t pos0, int want, float* logits_out, std::string& err, bool& used) {
@@ -8713,32 +8813,54 @@ struct Model::Impl {
         const size_t hidden_row = E * g.hc * sizeof(float);
         const size_t key_row = (size_t) (g.ix_top_k + 1) * sizeof(int);
         const size_t pos_bytes = (size_t) position_planes() * Tc * sizeof(int);
-        using Pinned = std::unique_ptr<void, decltype(&cudaFreeHost)>;
+        struct Trace {
+            int dev = 0, tokens = 0;
+            cudaEvent_t events[6]{};  // input copy, layer span, output copy
+            double wait_ms = 0.0, wall_ms = 0.0, pack_ms = 0.0;
+            ~Trace() {
+                if (!events[0]) return;
+                (void) cudaSetDevice(dev);
+                for (auto event : events)
+                    if (event) (void) cudaEventDestroy(event);
+            }
+        };
         struct Stage {
             size_t begin, end;
             int gpu;
-            Pinned output{nullptr, cudaFreeHost}, host{nullptr, cudaFreeHost};
+            void *output = nullptr, *host = nullptr;
             bool sends_keys, ready = false;
             PromptStage context;
+            std::unique_ptr<Trace[]> traces;
         };
         std::vector<Stage> stages;
         for (size_t begin = 0, end = 0; begin < L.size(); begin = end) {
             end = begin + 1;
             while (end < L.size() && L[end].gpu == L[begin].gpu) ++end;
-            stages.push_back({begin, end, L[begin].gpu, {nullptr, cudaFreeHost}, {nullptr, cudaFreeHost},
+            stages.push_back({begin, end, L[begin].gpu, nullptr, nullptr,
                               end < L.size() && !L[end].ix});
         }
         const int streamed = (int) std::count_if(stages.begin(), stages.end(),
                                                 [&](const Stage& s) { return G[(size_t) s.gpu].stage_bytes != 0; });
         const int bounce_slots = kStage / std::max(1, streamed);
         if (bounce_slots == 0) return true;
+        const int trace_chunks = (n + Tc - 1) / Tc;
         uint8_t* bounce = h_stage;
+        const double setup_started = now_s();
         for (Stage& stage : stages) {
             Gpu& gp = G[(size_t) stage.gpu];
+            if (pipeline_timing) {
+                CK(cudaSetDevice(gp.dev));
+                stage.traces.reset(new Trace[(size_t) trace_chunks]);
+                for (int i = 0; i < trace_chunks; ++i) {
+                    Trace& trace = stage.traces[(size_t) i];
+                    trace.dev = gp.dev;
+                    for (auto& event : trace.events) CK(cudaEventCreate(&event));
+                }
+            }
             if (gp.stage_bytes) {
                 stage.context.bounce = bounce;
-                stage.context.bounce_slots = bounce_slots;
-                bounce += gp.stage_bytes / kStage * bounce_slots;
+                stage.context.bounce_slots = std::min(bounce_slots, gp.stage_slots);
+                bounce += gp.stage_bytes / gp.stage_slots * stage.context.bounce_slots;
                 if (!gp.prompt_copy) {
                     CK(cudaSetDevice(gp.dev));
                     CK(cudaStreamCreateWithFlags(&gp.prompt_copy, cudaStreamNonBlocking));
@@ -8747,20 +8869,19 @@ struct Model::Impl {
             }
             if (stage.end < L.size()) {
                 const size_t bytes = (size_t) Tc * (hidden_row + (stage.sends_keys ? key_row + sizeof(int) : 0));
-                void* buffer = nullptr;
-                if (cudaMallocHost(&buffer, bytes) != cudaSuccess) {
+                if (!gp.pipe_output && cudaMallocHost(&gp.pipe_output, bytes) != cudaSuccess) {
                     (void) cudaGetLastError();
                     return true;   // the serial path needs no additional hand-off buffers
                 }
-                stage.output.reset(buffer);
+                stage.output = gp.pipe_output;
             }
-            void* host = nullptr;
-            if (cudaMallocHost(&host, pos_bytes + sizeof(int) * ((size_t) Tc * g.n_used + g.n_expert)) != cudaSuccess) {
+            if (!gp.pipe_host &&
+                cudaMallocHost(&gp.pipe_host, pos_bytes + sizeof(int) * ((size_t) Tc * g.n_used + g.n_expert)) != cudaSuccess) {
                 (void) cudaGetLastError();
                 return true;
             }
-            stage.host.reset(host);
-            stage.context.ids = (int*) ((char*) host + pos_bytes);
+            stage.host = gp.pipe_host;
+            stage.context.ids = (int*) ((char*) stage.host + pos_bytes);
             stage.context.slots = stage.context.ids + (size_t) Tc * g.n_used;
         }
         used = true;
@@ -8776,16 +8897,21 @@ struct Model::Impl {
         std::mutex mutex;
         std::condition_variable changed;
         bool failed = false;
-        const int last = std::min(n, Tc), leading = n - last;
+        const int tail = n % Tc;
+        const int last = want == 0 && tail > 0 ? tail : std::min(n, Tc), leading = n - last;
+        const double setup_ms = (now_s() - setup_started) * 1e3;
+        const double pipeline_started = now_s();
         auto run = [&](size_t si, std::string& err) -> bool {
             Stage& stage = stages[si];
             Gpu& gp = G[(size_t) stage.gpu];
             unpin_this_thread();
             CK(cudaSetDevice(gp.dev));
-            int* positions = (int*) stage.host.get();
+            int* positions = (int*) stage.host;
             std::fill_n(positions, (size_t) position_planes() * Tc, 0);
-            auto transfer = [&](const Stage& edge, bool receiving, int T) -> bool {
-                char* states = (char*) edge.output.get();
+            auto transfer = [&](const Stage& edge, bool receiving, int T, Trace* trace) -> bool {
+                const int pair = receiving ? 0 : 4;
+                if (trace) CK(cudaEventRecord(trace->events[pair], gp.s));
+                char* states = (char*) edge.output;
                 const auto kind = receiving ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
                 auto copy = [&](void* host, void* device, size_t bytes) {
                     return cudaMemcpyAsync(receiving ? device : host, receiving ? host : device, bytes, kind, gp.s);
@@ -8797,11 +8923,17 @@ struct Model::Impl {
                     CK(copy(keys, gp.keys, (size_t) T * key_row));
                     CK(copy(counts, gp.knk, (size_t) T * sizeof(int)));
                 }
+                if (trace) CK(cudaEventRecord(trace->events[pair + 1], gp.s));
                 CK(cudaStreamSynchronize(gp.s));
                 return true;
             };
-            for (int off = 0; off < n;) {
+            int chunk = 0;
+            for (int off = 0; off < n; ++chunk) {
                 const int T = off < leading ? std::min(Tc, leading - off) : last;
+                Trace* trace = stage.traces ? &stage.traces[(size_t) chunk] : nullptr;
+                const double started = pipeline_timing ? now_s() : 0.0;
+                const double pack_before = stage.context.stats.stream_ms;
+                if (trace) trace->tokens = T;
                 const int64_t p = pos0 + off;
                 for (int t = 0; t < T; ++t) {
                     positions[t] = (int) (p + t);
@@ -8817,29 +8949,35 @@ struct Model::Impl {
                     k::expand_streams(gp.cur, T, g.hc, (int) E, gp.x, gp.s);
                 } else {
                     Stage& prev = stages[si - 1];
+                    const double waiting = pipeline_timing ? now_s() : 0.0;
                     {
                         std::unique_lock<std::mutex> lock(mutex);
                         changed.wait(lock, [&] { return failed || prev.ready; });
                         if (failed) return false;
                     }
-                    if (!transfer(prev, true, T)) return false;
+                    if (trace) trace->wait_ms += (now_s() - waiting) * 1e3;
+                    if (!transfer(prev, true, T, trace)) return false;
                     {
                         std::lock_guard<std::mutex> lock(mutex);
                         prev.ready = false;
                     }
                     changed.notify_all();
                 }
+                if (trace) CK(cudaEventRecord(trace->events[2], gp.s));
                 for (size_t il = stage.begin; il < stage.end; ++il) {
                     Layer& l = L[il];
                     if (!attention(l, gp, T, p, err) || !ffn(l, gp, T, err)) return false;
                 }
+                if (trace) CK(cudaEventRecord(trace->events[3], gp.s));
                 if (stage.output) {
+                    const double waiting = pipeline_timing ? now_s() : 0.0;
                     {
                         std::unique_lock<std::mutex> lock(mutex);
                         changed.wait(lock, [&] { return failed || !stage.ready; });
                         if (failed) return false;
                     }
-                    if (!transfer(stage, false, T)) return false;
+                    if (trace) trace->wait_ms += (now_s() - waiting) * 1e3;
+                    if (!transfer(stage, false, T, trace)) return false;
                     {
                         std::lock_guard<std::mutex> lock(mutex);
                         stage.ready = true;
@@ -8847,6 +8985,10 @@ struct Model::Impl {
                     changed.notify_all();
                 } else {
                     CK(cudaStreamSynchronize(gp.s));
+                }
+                if (trace) {
+                    trace->wall_ms = (now_s() - started) * 1e3;
+                    trace->pack_ms = stage.context.stats.stream_ms - pack_before;
                 }
                 off += T;
             }
@@ -8884,13 +9026,31 @@ struct Model::Impl {
             if (err.empty()) err = "Hy4: a prefill pipeline stage failed";
             return false;
         }
+        if (pipeline_timing) {
+            std::fprintf(stderr, "maya-hy4: prefill pipeline timing: tokens=%d chunk=%d setup_ms=%.2f pipeline_ms=%.2f\n",
+                         n, Tc, setup_ms, (now_s() - pipeline_started) * 1e3);
+            for (const Stage& stage : stages) {
+                const Gpu& gp = G[(size_t) stage.gpu];
+                CK(cudaSetDevice(gp.dev));
+                for (int i = 0; i < trace_chunks; ++i) {
+                    const Trace& trace = stage.traces[(size_t) i];
+                    float in_ms = 0, layer_ms = 0, out_ms = 0;
+                    if (stage.begin > 0) CK(cudaEventElapsedTime(&in_ms, trace.events[0], trace.events[1]));
+                    CK(cudaEventElapsedTime(&layer_ms, trace.events[2], trace.events[3]));
+                    if (stage.output) CK(cudaEventElapsedTime(&out_ms, trace.events[4], trace.events[5]));
+                    std::fprintf(stderr, "HY4_PIPE gpu=%d chunk=%d tokens=%d input_ms=%.2f layers_ms=%.2f output_ms=%.2f "
+                                 "wait_ms=%.2f pack_ms=%.2f wall_ms=%.2f\n", gp.dev, i, trace.tokens, in_ms, layer_ms,
+                                 out_ms, trace.wait_ms, trace.pack_ms, trace.wall_ms);
+                }
+            }
+        }
         const Stage& end = stages.back();
         Gpu& hg = G[(size_t) head_gpu];
         CK(cudaSetDevice(hg.dev));
         if (want > 0 || df.on) {
             if (end.gpu != head_gpu && !hand_off(end.gpu, head_gpu, hg.x, G[(size_t) end.gpu].x,
                                                 (size_t) last * hidden_row, err)) return false;
-            CK(cudaMemcpyAsync(hg.pos, end.host.get(), pos_bytes, cudaMemcpyHostToDevice, hg.s));
+            CK(cudaMemcpyAsync(hg.pos, end.host, pos_bytes, cudaMemcpyHostToDevice, hg.s));
             if (!head_tail(ids + leading, last, pos0 + leading, want, logits_out, err)) return false;
             CK(cudaStreamSynchronize(hg.s));
         }
@@ -10305,8 +10465,10 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
     m->mtp_apos = -1;
     m->tokens.insert(m->tokens.end(), ids, ids + n);
     m->end = pos0;
-    // the last chunk takes the last min(n, Tc) tokens (the wanted rows among them), the ones before it chunks of Tc
-    const int Tc = m->Tc, last = std::min(n, Tc), head = n - last;
+    // With requested logits, keep their rows in the final chunk. Full Hy4 prompt bodies keep their full chunks
+    // first, then the incomplete tail, matching the server's serial prefill.
+    const int Tc = m->Tc, tail = n % Tc;
+    const int last = m->g.full && want == 0 && tail > 0 ? tail : std::min(n, Tc), head = n - last;
     bool pipelined = false;
     if (!m->prefill_pipe(ids, n, pos0, want, logits_out, err, pipelined)) {
         m->name_fault(err);
@@ -10396,7 +10558,7 @@ int gpus_of(const Options& o) {
 }
 
 std::string draft_key(const Options& o) {
-    std::string d = "Hy4 drafting v1|";
+    std::string d = "Hy4 drafting v2|";
     char buf[512];
     int drv = 0, n = 0;
     (void) cudaDriverGetVersion(&drv);
@@ -10426,6 +10588,10 @@ std::string draft_key(const Options& o) {
                   o.kv_streaming, (long long) o.kv_resident, o.vision ? 1 : 0, split.c_str(), o.gpu_fetch.c_str(),
                   hot ? hot : "");
     d += buf;
+    for (const char* name : {"HY4_STAGE_SLOTS", "HY4_DFLY_ADAPT"}) {
+        const char* value = std::getenv(name);
+        d += std::string("|") + name + "=" + (value ? value : "default");
+    }
     return q4x_memo_key(d, o.cpu_threads);
 }
 int Model::late_check(bool loaded) {

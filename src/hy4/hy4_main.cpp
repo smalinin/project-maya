@@ -105,6 +105,8 @@
 #include "hy4_kernels.cuh"
 #include "hy4_lane.hpp"
 #include "hy4_model.hpp"
+#include "hy4_draft.hpp"
+#include "hy4_plan.hpp"
 #include "hy4_pack.hpp"
 #include "mm3_os.hpp"
 #include "mm3_sample.hpp"
@@ -732,6 +734,12 @@ struct Extra {
     }
 };
 
+hy4::AdaptiveDraft adaptive_draft(const hy4::Model& model, int initial) {
+    const char* setting = std::getenv("HY4_DFLY_ADAPT");
+    return hy4::AdaptiveDraft(initial, model.draft_max(),
+                              model.has_dfly2() && (!setting || std::atoi(setting) != 0));
+}
+
 int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need) {
     for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
@@ -740,7 +748,11 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 m.name(), (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0, st0.experts_all,
                 st0.experts_vram, st0.experts_vram);
     for (const auto& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the web app's map of the GPUs)
-    if (m.has_dfly2()) std::printf("INFO dfly2=%d draft=%d\n", n_draft > 0 ? 1 : 0, n_draft);
+    if (m.has_dfly2()) {
+        const auto initial = adaptive_draft(m, n_draft);
+        std::printf("INFO dfly2=%d draft=%d draft_adaptive=%d draft_max=%d\n", n_draft > 0 ? 1 : 0,
+                    initial.width(), (int) initial.enabled(), initial.capacity());
+    }
     if (!m.room_report().empty()) std::printf("INFO %s\n", m.room_report().c_str());   // (--room-report)
     if (const hy4::VisionGeo* vg = m.vision())   // (serve/hy4_vision.py's Geometry.from_info)
         std::printf("INFO vision=hy4 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
@@ -859,11 +871,10 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         }();
         const bool alone = r.ids.size() - from > 1 && last_alone;
         const size_t body = alone ? r.ids.size() - 1 : r.ids.size();
-        const int batch = m.prompt_batch() / C;
+        const int batch = m.prompt_batch();
         for (size_t a = from; a < r.ids.size();) {
             const size_t pending = (a < body ? body : r.ids.size()) - a;
-            const size_t blocks = std::min((size_t) batch, pending / C);
-            const int T = blocks > 1 ? (int) blocks * C : (int) std::min<size_t>((size_t) C, pending);
+            const int T = hy4::prompt_tokens(pending, C, batch, hy4::k::kMaxWin);
             const bool last = a + (size_t) T == r.ids.size();
             if (!m.forward(r.ids.data() + a, T, (int64_t) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
                 ok = false;
@@ -909,6 +920,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         Extra extra;      // (when a step tries a draft more than the usual ones)
         extra.n_more = n_more;
         extra.need = need;
+        auto window = adaptive_draft(m, n_draft);
         auto stat_line = [&]() {
             const double ms = now() * 1e3 - t1;
             const long long d_ex = (long long) m.stats().experts - ex0;
@@ -920,6 +932,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                         produced > 0 ? (double) d_cpu / (double) produced : 0.0);
             if (d_off > 0) std::printf(" drafts=%.3f draft_acc=%lld draft_off=%lld", (double) d_acc / (double) d_off, d_acc,
                                        d_off);
+            if (m.has_dfly2()) std::printf(" draft_n=%d", window.width());
             std::printf(" engram_ms=%.3f\n", produced > 0 ? d_eg / (double) produced : 0.0);
         };
         const bool spec = m.has_draft() && n_draft > 0 && (r.spec < 0 || r.spec != 0);
@@ -927,7 +940,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         std::vector<int> drafts;
         Weights wts;   // (plain sampling's rows)
         std::vector<float> confs;
-        std::vector<float> lgw(spec ? (size_t) (n_draft + n_more + 1) * m.vocab() : 0);
+        std::vector<float> lgw(spec ? (size_t) (window.capacity() + n_more + 1) * m.vocab() : 0);
         Unpin lgw_unpin{lgw.data(), hy4::Model::pin(lgw.data(), lgw.size() * sizeof(float))};
         std::string fail;
         // one token out: false when the answer ends with it (an end token, max_new, the context)
@@ -961,9 +974,11 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             long long room = std::min<long long>(r.max_new - produced, m.max_ctx() - pos - 2);
             if (in_think) room = std::min<long long>(room, r.think_budget - produced);
             if (in_think && in.wrap.load()) room = 0;
+            const int requested = (int) std::min<long long>(room, window.width() + extra.now());
+            const double step_started = now();
             int k = 0;
             if (spec && room > 0) {
-                if (!m.draft(tok, pos, (int) std::min<long long>(room, n_draft + extra.now()), floor,
+                if (!m.draft(tok, pos, requested, floor,
                              drafts, confs, err, n_draft, sure)) {
                     fail = err;
                     break;
@@ -976,6 +991,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                     fail = err;
                     break;
                 }
+                if (spec && room >= window.width()) window.observe(requested, 0, 0, (now() - step_started) * 1e3);
                 state.push_back(tok);
                 if (plain_sampling(r)) {
                     wts.of(lg.data(), m.vocab(), r.temperature, m.row_top(0));
@@ -991,6 +1007,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 fail = err;
                 break;
             }
+            const double step_ms = (now() - step_started) * 1e3;
             state.push_back(tok);
             d_off += k;
             const long long acc0 = d_acc;
@@ -1046,6 +1063,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 state.push_back(x);
             }
             extra.seen(k, (int) (d_acc - acc0), n_draft);
+            if (more && room >= window.width()) window.observe(requested, k, (int) (d_acc - acc0), step_ms);
             if (!more) break;
             tok = next;
         }
@@ -1312,11 +1330,15 @@ bool trial_answer(hy4::Model& m, const std::vector<int>& p, int gen, const Draft
         Extra extra;
         extra.n_more = n_more;
         extra.need = a.need;
+        auto window = adaptive_draft(m, n_draft);
         int tok = top_of(lg.data(), 0);
         while ((int) out.size() < gen) {
             out.push_back(tok);
             if (tok == m.eos() || (int) out.size() >= gen) break;
-            if (!m.draft(tok, pos, std::min(n_draft + extra.now(), gen - (int) out.size()), floor, drafts, confs, err,
+            const int room = gen - (int) out.size();
+            const int requested = std::min(window.width() + extra.now(), room);
+            const double started = now();
+            if (!m.draft(tok, pos, requested, floor, drafts, confs, err,
                          n_draft, a.sure))
                 return false;
             int k = 0;
@@ -1324,6 +1346,7 @@ bool trial_answer(hy4::Model& m, const std::vector<int>& p, int gen, const Draft
             std::vector<int> win(1, tok);
             win.insert(win.end(), drafts.begin(), drafts.begin() + k);
             if (!m.forward(win.data(), k + 1, pos, k + 1, lg.data(), err)) return false;
+            const double step_ms = (now() - started) * 1e3;
             pos += 1;
             int i = 0;
             for (; i < k; ++i) {
@@ -1333,6 +1356,8 @@ bool trial_answer(hy4::Model& m, const std::vector<int>& p, int gen, const Draft
                 if (drafts[(size_t) i] == m.eos() || (int) out.size() >= gen) break;
             }
             extra.seen(k, i, n_draft);
+            if (room >= window.width() && (int) out.size() < gen && out.back() != m.eos())
+                window.observe(requested, k, i, step_ms);
             if (out.back() == m.eos() || (int) out.size() >= gen) break;
             tok = top_of(lg.data() + (size_t) i * m.vocab(), i);
         }
@@ -1881,7 +1906,8 @@ int main(int argc, char** argv) {
     std::vector<int> out;
     int64_t pos = (int64_t) ids.size();
     if (m.has_draft() && n_draft > 0 && gen > 0) {   // greedy with the drafts (the MTP block's, or the DFly2 drafter's)
-        std::vector<float> lw((size_t) (n_draft + n_more + 1) * m.vocab());
+        auto window = adaptive_draft(m, n_draft);
+        std::vector<float> lw((size_t) (window.capacity() + n_more + 1) * m.vocab());
         const bool lw_pinned = hy4::Model::pin(lw.data(), lw.size() * sizeof(float));
         (void) lw_pinned;
         std::vector<int> drafts;
@@ -1905,7 +1931,9 @@ int main(int argc, char** argv) {
                 return 1;
             }
             const double ta = now();
-            if (!m.draft(tok, pos, std::min(n_draft + extra.now(), gen - (int) out.size()), floor,
+            const int room = gen - (int) out.size();
+            const int requested = std::min(window.width() + extra.now(), room);
+            if (!m.draft(tok, pos, requested, floor,
                          drafts, confs, err, n_draft, sure)) {
                 std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
                 return 1;
@@ -1920,6 +1948,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
                 return 1;
             }
+            const double step_ms = (now() - ta) * 1e3;
             t_verify += now() - tb;
             ++rounds;
             off += k;
@@ -1933,6 +1962,8 @@ int main(int argc, char** argv) {
                 if (drafts[(size_t) i] == m.eos() || (int) out.size() >= gen) break;
             }
             extra.seen(k, i, n_draft);
+            if (room >= window.width() && (int) out.size() < gen && out.back() != m.eos())
+                window.observe(requested, k, i, step_ms);
             if (out.back() == m.eos() || (int) out.size() >= gen) break;
             tok = top_of(lw.data() + (size_t) i * m.vocab(), i);
         }

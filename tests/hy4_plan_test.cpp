@@ -3,6 +3,7 @@
 // on) stays as it was; then 8-bit rows with that room, F16 and 8-bit rows with a smaller picture's room, F16 rows
 // text only, 8-bit rows text only; nothing that fits no way.
 #include "../src/hy4/hy4_plan.hpp"
+#include "../src/hy4/hy4_draft.hpp"
 
 #include <cstdio>
 #include <string>
@@ -35,6 +36,43 @@ hy4::KvPick pick(Card& c, int kv, bool vision, bool vision_auto, long long n_min
 }  // namespace
 
 int main() {
+    {
+        CHECK(hy4::staging_slots({{32, 1}, {64, 2}, {128, 4}}) == 32);
+        CHECK(hy4::staging_slots({{32, 2}, {64, 2}, {128, 4}}) == 64);
+        CHECK(hy4::staging_slots({{32, 2}, {64, 3}, {128, 4}}) == 128);
+        CHECK(hy4::staging_slots({}) == 128);
+        CHECK(hy4::prompt_tokens(4095, 2048, 12288, 16) == 4095);
+        CHECK(hy4::prompt_tokens(4096, 2048, 12288, 16) == 4096);
+        CHECK(hy4::prompt_tokens(4097, 2048, 12288, 16) == 4096);
+        CHECK(hy4::prompt_tokens(4095, 2048, 2048, 16) == 2048);
+        CHECK(hy4::prompt_tokens(17, 2048, 12288, 16) == 17);
+        std::vector<int> placement;
+        std::vector<size_t> staged;
+        CHECK(hy4::place_layers({55, 170}, {1}, {{10, 4}, {10, 4}}, 2, 8, 128,
+                                &placement, &staged, {8, 32}));
+        CHECK(staged == (std::vector<size_t>{32, 128}));
+    }
+    {
+        hy4::AdaptiveDraft draft(3, 6, true);
+        CHECK(draft.width() == 3 && draft.capacity() == 5);
+        int four = 0;
+        for (int i = 0; i < 160; ++i) {
+            const int width = draft.width();
+            CHECK(width >= 2 && width <= 5);
+            four += width == 4;
+            draft.observe(width, width, width < 5 ? width : 1, width < 5 ? 10 + 2 * width : 30);
+        }
+        CHECK(four > 100);
+        hy4::AdaptiveDraft fixed(3, 6, false);
+        fixed.observe(3, 3, 0, 1.0);
+        CHECK(fixed.width() == 3 && fixed.capacity() == 3);
+        hy4::AdaptiveDraft small(3, 2, true);
+        CHECK(small.width() == 2 && small.capacity() == 2);
+        small.observe(1, 1, 0, 1.0);
+        CHECK(small.width() == 2);
+        hy4::AdaptiveDraft default_width(6, 6, true);
+        CHECK(default_width.width() == 5 && default_width.capacity() == 5);
+    }
     {   // Each part fits with its own largest expert and keeps the full prefill batch.
         const std::vector<hy4::LayerVram> layers{{10, 0}, {10, 2}, {10, 2}, {10, 8}};
         const std::vector<double> budgets{60, 80};

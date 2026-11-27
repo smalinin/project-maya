@@ -19,7 +19,8 @@ struct LayerVram {
 // Fit consecutive layers. Each GPU reserves a single staging buffer, sized for its largest partially resident expert.
 inline bool place_layers(const std::vector<double>& budgets, const std::vector<int>& split,
                          const std::vector<LayerVram>& layers, int slots, int experts, int stage_slots,
-                         std::vector<int>* placement = nullptr, std::vector<size_t>* staged = nullptr) {
+                         std::vector<int>* placement = nullptr, std::vector<size_t>* staged = nullptr,
+                         const std::vector<int>& gpu_stage_slots = {}) {
     if (placement) placement->resize(layers.size());
     if (staged) staged->assign(budgets.size(), 0);
     size_t gpu = 0, stage = 0;
@@ -27,7 +28,10 @@ inline bool place_layers(const std::vector<double>& budgets, const std::vector<i
     for (size_t il = 0; il < layers.size(); ++il) {
         const auto& layer = layers[il];
         const double own = layer.fixed + (double) slots * layer.expert;
-        const size_t prompt = slots < experts ? layer.expert * stage_slots : 0;
+        const auto prompt = [&] {
+            const int count = gpu_stage_slots.empty() ? stage_slots : gpu_stage_slots[gpu];
+            return slots < experts ? layer.expert * count : 0;
+        };
         const auto next = [&] {
             ++gpu;
             left = budgets[gpu];
@@ -35,20 +39,43 @@ inline bool place_layers(const std::vector<double>& budgets, const std::vector<i
         };
         if (!split.empty()) {
             while (gpu < split.size() && (int) il >= split[gpu]) next();
-            if (own + (double) (std::max(stage, prompt) - stage) > left) return false;
+            if (own + (double) (std::max(stage, prompt()) - stage) > left) return false;
         } else {
-            while (own + (double) (std::max(stage, prompt) - stage) > left) {
+            while (own + (double) (std::max(stage, prompt()) - stage) > left) {
                 if (gpu + 1 >= budgets.size()) return false;
                 next();
             }
         }
-        const size_t need = std::max(stage, prompt);
+        const size_t need = std::max(stage, prompt());
         left -= own + (double) (need - stage);
         stage = need;
         if (placement) (*placement)[il] = (int) gpu;
         if (staged) (*staged)[gpu] = stage;
     }
     return true;
+}
+
+struct StageSample {
+    int slots;
+    double milliseconds;
+};
+
+// Include an incomplete prompt chunk in the pipeline. A tiny tail still runs alone on the token path.
+inline int prompt_tokens(size_t pending, int chunk, int batch, int window) {
+    int take = (int) std::min(pending, (size_t) batch);
+    if (take > chunk && take % chunk > 0 && take % chunk <= window) take -= take % chunk;
+    return take;
+}
+
+// Choose the smallest buffer whose measured upload bandwidth is within five percent of the best sample.
+inline int staging_slots(const std::vector<StageSample>& samples) {
+    double fastest = 0.0;
+    for (const auto& s : samples)
+        if (s.milliseconds > 0) fastest = std::max(fastest, s.slots / s.milliseconds);
+    int result = 128;
+    for (const auto& s : samples)
+        if (s.milliseconds > 0 && s.slots / s.milliseconds >= fastest * 0.95) result = std::min(result, s.slots);
+    return result;
 }
 
 struct PromptCacheLayer {

@@ -2433,8 +2433,11 @@ files you already have (checked by size and sha256). The model runs on an engine
 (contributed by [@needmorevram](https://github.com/needmorevram), #1040): NVIDIA GPUs (CUDA) from the V100 on, Linux
 and Windows, and AMD GPUs (HIP; its AMD build contributed by [@Cass67](https://github.com/Cass67)) on Linux.
 
-On full Hy4, each GPU's prefill staging buffer holds 128 experts sized for the largest streamed expert on that
-GPU. The planner can use the recovered VRAM for routed experts. DFly2 builds its key lists on the GPU holding
+On full Hy4, each GPU's prefill staging buffer uses 32, 64 or 128 experts sized for the largest streamed expert on
+that GPU. The engine measures upload bandwidth once per GPU, driver and expert size, and picks the smallest
+buffer within 5% of the fastest measured bandwidth. The choice is saved in `<pack>/staging.txt`.
+`HY4_STAGE_SLOTS=32`, `64` or `128` fixes the count on every GPU, and `auto` uses the measurements.
+The planner uses recovered VRAM for routed experts. DFly2 builds its key lists on the GPU holding
 the corresponding trunk layer's index and KV cache. During decode, hot expert swaps can run on separate GPU copy
 streams. The first affected FFN waits for both the new weights and the updated slot table. The engine uses the
 synchronous transfer when the pinned decode buffer is unavailable or a CPU re-encoding worker can access those slots.
@@ -2445,6 +2448,18 @@ overlap another stage's packing. Its pinned expert cache prioritizes stages with
 packing time under the `HY4_PREFILL_RAM_GB` budget. For short windows with at least 32,768 visible positions, the
 indexer selects candidates per tile and merges them with the same score order and tie-breaking as the single-block
 selector. `HY4_DSA_TOPK_MIN` changes that threshold. Set it to `0` to use the single-block selector throughout.
+
+`HY4_PREFILL_TIMING=1` prints `HY4_PIPE` rows for each GPU and chunk, with CUDA event timings for transfers and
+layers, and host timings for packing, neighbour waits and total wall time. It also reports setup time. These
+measurements keep the prefill pipeline active and add no synchronization between its stages.
+The pipeline keeps its pinned hand-off and routing buffers between prompts to avoid repeating their allocation.
+The server also groups incomplete final prompt chunks into the pipeline. With `--chunk 2048`, a prompt body
+of 4095 tokens can pipeline one full chunk and its incomplete tail. The prompt's last token runs separately.
+
+DFly2 adjusts its draft width between 2 and 5, within the drafter's supported limit. `--draft` sets its initial
+width. The controller measures proposal and verification time per committed token, probes each width for four
+steps and periodically revisits its choices as the answer changes. `HY4_DFLY_ADAPT=0` fixes the requested width.
+The engine's `STAT` line includes the current `draft_n`.
 
 With a saved full Hy4 routing profile, `HY4_PROFILE_SLOTS=1` reassigns expert slots between layers on each GPU
 within its existing expert memory budget. Each layer keeps at least half of its previous slots. This mode is opt-in.
