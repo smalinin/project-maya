@@ -137,6 +137,29 @@ class LocalOther(unittest.TestCase):
                 self.assertEqual(maya.review_downloaded_model(SimpleNamespace(), src, self.models, family), 0)
             catalog.assert_called_once()
 
+    def test_abliterated_links_its_own_engram_and_companions(self):
+        for quant in maya.DS4_ABL:
+            with self.subTest(quant=quant):
+                entry = maya.ds4_gguf_model(quant)
+                src = self.root / quant
+                shards = [gguf(src / name, "deepseek41") for name in sorted([*entry["files"], entry["table"]])]
+                draft = gguf(src / "dspark-local.gguf", "dflash", metadata={"dflash.hyper_connection.count": 4})
+                vision = gguf(src / "mmproj-local.gguf", "clip", metadata={"clip.projector_type": "deepseek41v"})
+                with patch.object(maya, "choose", return_value=3):
+                    linked = maya.review_downloaded_model(SimpleNamespace(), src, self.models, "deepseek")
+                self.assertEqual([p.name for p in linked["files"]], [p.name for p in shards])
+                for target, source in [*zip(linked["files"], shards), (linked["drafter"], draft),
+                                       (linked["vision"], vision)]:
+                    self.assertTrue(target.is_symlink())
+                    self.assertEqual(target.resolve(), source)
+                (src / entry["table"]).unlink()
+                with (
+                    patch.object(maya, "choose", return_value=3),
+                    patch.object(maya, "link_model", return_value=0) as catalog,
+                ):
+                    self.assertEqual(maya.review_downloaded_model(SimpleNamespace(), src, self.models, "deepseek"), 0)
+                catalog.assert_called_once()
+
     def test_local_deepseek_pack_does_not_take_unselected_companions(self):
         from tools.test_ds4_vision_pack import gguf as ds4_gguf
         d = self.root / "weights"

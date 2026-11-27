@@ -4057,7 +4057,7 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | di
                     return local
                 continue
             if family in ("deepseek", "minimax") and model["anchor"].suffix.lower() == ".gguf" and \
-                    model["anchor"].name not in published_other_gguf_names(family):
+                    model["anchor"].name not in published_other_gguf_names(family, source=model["anchor"].parent):
                 local = link_other_gguf(models, chosen, family)
                 if local is not None:
                     return local
@@ -4195,12 +4195,20 @@ def link_glm_local(models: Path, chosen: dict, family: str = "glm") -> dict | No
             "vision": dest / "vision" / vision["path"].name if vision else None}
 
 
-def published_other_gguf_names(family: str) -> set[str]:
-    """Keep published downloads on their existing path, including native companion packs and shared tables."""
+def published_other_gguf_names(family: str, *, source: Path | None = None) -> set[str]:
+    """Catalog filenames, except orcarouter's local splits with their own Engram shard present."""
     man = read_json(DS4_GGUF_MANIFEST if family == "deepseek" else MM3_GGUF_MANIFEST)
     sections = [man] + ([man.get("maya") or {}, man.get("abliterated") or {}] if family == "deepseek" else [])
-    return {Path(name).name for section in sections for quant in (section.get("quants") or {}).values()
-            for name in quant.get("files", {})}
+    names = {Path(name).name for section in sections for quant in (section.get("quants") or {}).values()
+             for name in quant.get("files", {})}
+    if family == "deepseek" and source is not None:
+        # The catalog substitutes shared Q6_K tables. The local path indexes the publisher's Engram instead.
+        abliterated = (man.get("abliterated") or {}).get("quants") or {}
+        for quant in abliterated.values():
+            table = quant.get("table")
+            if table and (source / Path(table).name).is_file():
+                names.difference_update(Path(name).name for name in quant.get("files", {}))
+    return names
 
 
 def link_other_gguf(models: Path, chosen: dict, family: str) -> dict | None:
