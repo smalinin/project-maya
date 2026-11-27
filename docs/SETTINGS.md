@@ -2433,6 +2433,12 @@ files you already have (checked by size and sha256). The model runs on an engine
 (contributed by [@needmorevram](https://github.com/needmorevram), #1040): NVIDIA GPUs (CUDA) from the V100 on, Linux
 and Windows, and AMD GPUs (HIP; its AMD build contributed by [@Cass67](https://github.com/Cass67)) on Linux.
 
+On full Hy4, each GPU's prefill staging buffer holds 128 experts sized for the largest streamed expert on that
+GPU. The planner can use the recovered VRAM for routed experts. DFly2 builds its key lists on the GPU holding
+the corresponding trunk layer's index and KV cache. During decode, hot expert swaps can run on separate GPU copy
+streams. The first affected FFN waits for both the new weights and the updated slot table. The engine uses the
+synchronous transfer when the pinned decode buffer is unavailable or a CPU re-encoding worker can access those slots.
+
 **On AMD.** `--backend hip` builds `build-hip/maya-hy4`. On a GPU that shares the PC's memory (Strix Halo / Gorgon Halo) the engine takes what the RAM has available less a headroom for the system - 8 GB, or a tenth of the RAM if that is more (`HY4_RAM_HEADROOM_GB`) - says the figures in one line at its start, and keeps every routed expert in the GPU's memory where the size fits: the model file is not held twice (its file cache is given back as the weights are copied in), and the n-gram table stays on the SSD. Run on a Gorgon Halo (Radeon 8065S, `gfx1151`); Radeon cards (`gfx1100`) by the contributor, with Tencent's Q4_K_M. Tensor parallel on AMD compiles but has not been run. Windows with an AMD GPU: experimental (offered by the setup, not tested by us; [AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)) - there a GPU that shares the PC's memory keeps within the memory Windows dedicates to it (`HY4_APU_DEDICATED_GB=<n>`: n GB instead, a test) and within what Windows can still commit less the same headroom, tensor parallel is not taken unless `--tp N` asks for it, and the engine hands the GPU its queued work at the points where the host or another GPU waits for it (`HY4_WIN_SUBMIT=0`: not, for tests).
 
 **Defaults from Tencent's release**: temperature 0.9, top-p 1.0, no top-k; the thinking budget is 32768 tokens; the

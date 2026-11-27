@@ -35,6 +35,19 @@ hy4::KvPick pick(Card& c, int kv, bool vision, bool vision_auto, long long n_min
 }  // namespace
 
 int main() {
+    {   // Each part fits with its own largest expert and keeps the full prefill batch.
+        const std::vector<hy4::LayerVram> layers{{10, 0}, {10, 2}, {10, 2}, {10, 8}};
+        const std::vector<double> budgets{60, 80};
+        std::vector<int> placement;
+        std::vector<size_t> staged;
+        CHECK(hy4::place_layers(budgets, {}, layers, 4, 8, 4, &placement, &staged));
+        CHECK(placement == (std::vector<int>{0, 0, 0, 1}));
+        CHECK(staged == (std::vector<size_t>{8, 32}));
+        CHECK(hy4::place_layers(budgets, {3}, layers, 4, 8, 4));
+        CHECK(!hy4::place_layers(budgets, {2}, layers, 4, 8, 4));
+        CHECK(hy4::place_layers({62, 74}, {3}, layers, 8, 8, 4, nullptr, &staged));
+        CHECK(staged == (std::vector<size_t>{0, 0}));
+    }
     // fits with F16 rows: F16, nothing else asked (the start is the one before --kv auto reached this layout)
     for (int kv : {-1, 0}) {
         Card c{8.0, 6.0, 1.0, 0.8, ""};

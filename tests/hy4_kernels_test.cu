@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include "../src/hy4/hy4_kernels.cuh"
+#include "../src/hy4/hy4_plan.hpp"
 
 namespace {
 
@@ -1020,6 +1021,29 @@ static void test_f16_range() {
     cudaFree(input);
 }
 
+static void test_dfly_keys() {
+    constexpr int capacity = 2048, rows = 7, pos = 32000, stride = capacity + rows;
+    std::vector<int> picks(capacity);
+    for (int i = 0; i < capacity; ++i) picks[i] = i % 17 == 0 ? -1 : i % 29 == 0 ? pos + 1 : pos - 1 - i;
+    auto* gpu_picks = dev(picks);
+    auto* gpu_keys = dev(std::vector<int>(rows * stride, -1));
+    auto* gpu_sizes = dev(std::vector<int>(rows, -1));
+    for (int n : {0, 5, 127, 193, capacity}) {
+        auto* gpu_count = dev(std::vector<int>{n});
+        hy4::k::dfly_key_lists(gpu_picks, gpu_count, capacity, pos, rows, gpu_keys, stride, gpu_sizes, nullptr);
+        const auto keys = host(gpu_keys, rows * stride), sizes = host(gpu_sizes, rows);
+        std::vector<int> ref(rows * stride), ref_sizes(rows);
+        CHECK(hy4::dfly_keys(picks.data(), n, pos, rows, ref.data(), stride, ref_sizes.data()) > 0);
+        CHECK(sizes == ref_sizes);
+        for (int i = 0; i < rows; ++i)
+            CHECK(std::equal(keys.begin() + i * stride, keys.begin() + i * stride + ref_sizes[i], ref.begin() + i * stride));
+        cudaFree(gpu_count);
+    }
+    cudaFree(gpu_sizes);
+    cudaFree(gpu_keys);
+    cudaFree(gpu_picks);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -1031,6 +1055,7 @@ int main() {
     test_kv_streaming();
     test_router();
     test_indexer();
+    test_dfly_keys();
     test_engram();
     test_row_top();
     test_hc(6144);

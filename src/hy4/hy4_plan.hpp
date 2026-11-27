@@ -10,6 +10,46 @@
 
 namespace hy4 {
 
+struct LayerVram {
+    double fixed;
+    size_t expert;
+};
+
+// Fit consecutive layers. Each GPU reserves a single staging buffer, sized for its largest partially resident expert.
+inline bool place_layers(const std::vector<double>& budgets, const std::vector<int>& split,
+                         const std::vector<LayerVram>& layers, int slots, int experts, int stage_slots,
+                         std::vector<int>* placement = nullptr, std::vector<size_t>* staged = nullptr) {
+    if (placement) placement->resize(layers.size());
+    if (staged) staged->assign(budgets.size(), 0);
+    size_t gpu = 0, stage = 0;
+    double left = budgets[0];
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto& layer = layers[il];
+        const double own = layer.fixed + (double) slots * layer.expert;
+        const size_t prompt = slots < experts ? layer.expert * stage_slots : 0;
+        const auto next = [&] {
+            ++gpu;
+            left = budgets[gpu];
+            stage = 0;
+        };
+        if (!split.empty()) {
+            while (gpu < split.size() && (int) il >= split[gpu]) next();
+            if (own + (double) (std::max(stage, prompt) - stage) > left) return false;
+        } else {
+            while (own + (double) (std::max(stage, prompt) - stage) > left) {
+                if (gpu + 1 >= budgets.size()) return false;
+                next();
+            }
+        }
+        const size_t need = std::max(stage, prompt);
+        left -= own + (double) (need - stage);
+        stage = need;
+        if (placement) (*placement)[il] = (int) gpu;
+        if (staged) (*staged)[gpu] = stage;
+    }
+    return true;
+}
+
 /// A MoE layer's routed experts in VRAM (the INFO line's vram_slots, the Monitor's "Where the experts live"): those a GPU
 /// holds - whole (the layer split: the layer's own slot map) or a slice of (tensor parallel: each member's and each
 /// helper's map; every expert has its blocks on some member, so all of them) - the others the CPU lane's.  `maps`:

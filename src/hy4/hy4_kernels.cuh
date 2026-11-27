@@ -247,6 +247,9 @@ void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, co
 /// own group's positions up to itself -> keys[t][0 .. nk[t]), ldk apart
 void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
                cudaStream_t s, bool token_indexer = false);
+/// DFly2 reuses the committed row's picks, in order, followed by each draft row's causal tail.
+void dfly_key_lists(const int* picks, const int* count, int capacity, int pos, int rows, int* keys, int ldk, int* nk,
+                    cudaStream_t s);
 /// Tensor parallel's exchange of those picks: ix_pack writes the min(nv, top) picked pools of T tokens as 16-bit
 /// numbers into wire (mapped host memory, rows ldw apart - a multiple of 8) and fences them for the host; ix_unpack
 /// makes keys[t][0 .. nk[t]) again from such rows (read past every cache) - ix_select's own keys, the tail its own

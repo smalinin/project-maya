@@ -2552,6 +2552,45 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
     for (int k = tid; k < ntail; k += nth) kt[nsel * kpool + k] = nv * kpool + k;
     if (tid == 0) nk[t] = nsel * kpool + ntail;
 }
+
+constexpr int kDflyKeyThreads = 128;
+__global__ void dfly_key_lists_kernel(const int* picks, const int* count, int capacity, int pos, int rows,
+                                      int* keys, int ldk, int* nk) {
+    __shared__ int prefix[kDflyKeyThreads + 1];
+    const int tid = threadIdx.x, n = *count;
+    if (n < 0 || n > capacity || rows > ldk) {
+        for (int r = tid; r < rows; r += kDflyKeyThreads) nk[r] = 0;
+        return;
+    }
+    const int per = (n + kDflyKeyThreads - 1) / kDflyKeyThreads;
+    const int begin = tid * per, end = min(n, begin + per);
+    int live = 0;
+    for (int i = begin; i < end; ++i) live += picks[i] >= 0 && picks[i] < pos;
+    prefix[tid + 1] = live;
+    __syncthreads();
+    if (tid == 0) {
+        prefix[0] = 0;
+        for (int i = 1; i <= kDflyKeyThreads; ++i) prefix[i] += prefix[i - 1];
+    }
+    __syncthreads();
+    const int kept = prefix[kDflyKeyThreads];
+    if (kept + rows > ldk) {
+        for (int r = tid; r < rows; r += kDflyKeyThreads) nk[r] = 0;
+        return;
+    }
+    int out = prefix[tid];
+    for (int i = begin; i < end; ++i) {
+        const int pick = picks[i];
+        if (pick < 0 || pick >= pos) continue;
+        for (int r = 0; r < rows; ++r) keys[(size_t) r * ldk + out] = pick;
+        ++out;
+    }
+    for (int r = tid; r < rows; r += kDflyKeyThreads) {
+        for (int i = 0; i <= r; ++i) keys[(size_t) r * ldk + kept + i] = pos + i;
+        nk[r] = kept + r + 1;
+    }
+}
+
 // a block a token: its picked pools (ix_select's keys, kpool positions a pool) as 16-bit numbers into the host's row
 __global__ void ix_pack_kernel(const int* __restrict__ keys, int ldk, const int* __restrict__ pos, int kpool, int top,
                                uint16_t* wire, int ldw) {
@@ -3098,6 +3137,11 @@ void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, 
                cudaStream_t s, bool token_indexer) {
     ix_select_kernel<<<T, 1024, 0, s>>>(score, ld, pos, kpool, top, keys, ldk, nk, token_indexer);
     check("ix_select");
+}
+void dfly_key_lists(const int* picks, const int* count, int capacity, int pos, int rows, int* keys, int ldk, int* nk,
+                    cudaStream_t s) {
+    dfly_key_lists_kernel<<<1, kDflyKeyThreads, 0, s>>>(picks, count, capacity, pos, rows, keys, ldk, nk);
+    check("dfly_key_lists");
 }
 void ix_pack(const int* keys, int ldk, int T, const int* pos, int kpool, int top, uint16_t* wire, int ldw,
              cudaStream_t s) {
