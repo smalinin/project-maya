@@ -347,7 +347,7 @@ bool cpu_times(double& all_us, double& self_us) {
 #endif
 }
 
-Lane::Lane(int threads) : p(new Impl) {
+Lane::Lane(int threads, int core_offset) : p(new Impl) {
     const std::vector<std::vector<int>> nodes = node_cores();
     p->n_nodes = std::max(1, std::min((int) nodes.size(), Impl::kMaxNodes));
     const LaneWaits lw = lane_waits();
@@ -362,6 +362,8 @@ Lane::Lane(int threads) : p(new Impl) {
     for (size_t i = 0; i < most; ++i)
         for (int q = 0; q < p->n_nodes; ++q)
             if (i < nodes[(size_t) q].size() && !(q == 0 && i == 0)) order.push_back({nodes[(size_t) q][i], q});
+    if (!order.empty() && core_offset > 0)
+        std::rotate(order.begin(), order.begin() + core_offset % order.size(), order.end());
     const bool auto_size = threads < 0;
     if (threads < 0) threads = (int) order.size();
     // the core reserve: the last workers (the nodes' last cores) parked while other programs run - always, never or

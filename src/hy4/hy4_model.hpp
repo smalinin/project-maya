@@ -117,6 +117,8 @@ public:
     bool draft(int tok, int64_t pos, int n, float floor, std::vector<int>& drafts, std::vector<float>& conf,
                std::string& err, int base = -1, float sure = 0.0f);
     bool has_mtp() const;
+    /// Begin recording the accepted generation routes for a new request, after its prompt has been read.
+    void begin_answer(int64_t first);
     /// The DFly2 drafter is loaded (Options::dfly2): draft() is then its pass - up to n tokens after `tok` from one
     /// pass over the trunk's caches (nothing to keep in step: a forward leaves it what it needs).  has_draft(): either
     /// drafter; draft_default(): the drafts a round the loaded one is made for (3: the MTP block; the drafter's own

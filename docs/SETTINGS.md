@@ -2461,6 +2461,42 @@ width. The controller measures proposal and verification time per committed toke
 steps and periodically revisits its choices as the answer changes. `HY4_DFLY_ADAPT=0` fixes the requested width.
 The engine's `STAT` line includes the current `draft_n`.
 
+Full Hy4 keeps the DFly2 window controller between requests. Its periodic probes still adapt to a new answer.
+`HY4_DFLY_DEVICE=1` (default) caches the quantized token embedding table on the fusion GPU when it is no larger
+than `HY4_DFLY_EMBED_MIB` (1024 MiB). The VRAM planner reserves this memory before placing experts. Later correction
+steps read the preceding token directly on the device, and the whole block's ids and confidences return in one
+transfer. `HY4_DFLY_DEVICE=0` uses the per-token host path; debug dumps also use that path. Confidence filtering and
+target-model verification are unchanged.
+
+`HY4_PREFILL_PACK=1` (default) gives each pipeline stage its own packing queue, with the CPU thread budget divided
+between stages. Two banks share the existing host and device staging memory. CUDA events protect their reuse while
+copies overlap computation. The known host routes also supply the expert-set row counts, without reading the GPU
+bounds back. `HY4_PREFILL_PACK=0` uses the shared packing pool and the previous staging path.
+
+`HY4_PREFILL_TUNE=1` (default) records layer timings with CUDA events and saves them in `<pack>/prefill-tuning.txt`
+(`HY4_PREFILL_TUNING_FILE` overrides the path). On suitable prompts the first trials cover 2048, 1024 and 512 token
+chunks up to the allocated `--chunk` limit; subsequent prompts use an estimate calibrated against the whole pipeline's
+elapsed time, including CPU packing and queues. Occasional probes revisit alternatives as the load changes.
+`HY4_PREFILL_CHUNK=N` fixes the pipeline chunk for comparisons. `HY4_PREFILL_TUNE=0` disables collection and automatic
+chunk selection. At the next load, `HY4_PREFILL_BALANCE=1` (default) uses these timings to search nearby consecutive
+layer boundaries, refitting each GPU's expert and staging memory. Candidates keep at least 98% of the resident
+expert slots and limit the estimated increase in misses using the saved hot profile. This is a cost-model search,
+not an exhaustive benchmark of every placement. `HY4_PREFILL_BALANCE=0` or an explicit `--layer-split` keeps the
+memory-based or requested boundaries. Measurements are keyed by the model, GPU/driver and start settings; drafting
+trials and warm-up do not write them.
+
+Full Hy4 also records a long-term prior in `<pack>/expert-history.bin`, independently of `expert-hot.bin`.
+`HY4_HISTORY=0` disables it; `HY4_HISTORY_FILE` sets its path. `HY4_HISTORY_LEARN` controls writes (by default it
+follows the hot profile's learning setting, so setup's `HY4_HOT_LEARN=1` enables it). The history records only settled
+generation inputs: prompts, warm-up, repeated positions and rejected drafts are excluded. Each request contributes
+at most 4096 token-equivalents to the full-answer table; its first 512 tokens have a separate table. Checkpoints
+after 512 newly counted tokens or 60 seconds replace that request's contribution, avoiding double counting, and the
+answer's end saves the remainder. Per-file locks serialize writers; a version, model identity and checksum validate
+the two F64 tables. Failed or incompatible reads leave hot-profile placement available and do not overwrite the file.
+At load the normalized prior uses 60% early-answer and 40% full-answer frequencies, mixed with the hot profile by
+`HY4_HISTORY_WEIGHT` (0.8 by default, ramped in over the first 4096 recorded tokens). The log reports the file and
+the number of recorded tokens and requests. The live hot cache keeps its existing fast adaptation.
+
 With a saved full Hy4 routing profile, `HY4_PROFILE_SLOTS=1` reassigns expert slots between layers on each GPU
 within its existing expert memory budget. Each layer keeps at least half of its previous slots. This mode is opt-in.
 

@@ -3033,6 +3033,43 @@ bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, 
 #undef FR_
     return cudaGetLastError() == cudaSuccess;
 }
+template <int T>
+__global__ void embed_rows_kernel(const uint8_t* table, size_t stride, const int* ids, int n, int k, int vocab,
+                                  float* out) {
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n * (k / 8); q += gridDim.x * blockDim.x) {
+        const int r = q / (k / 8), at = q % (k / 8), token = ids[r] >= 0 && ids[r] < vocab ? ids[r] : 0;
+        float values[8];
+        deq8<T>(table + (size_t) token * stride, at >> 2, at & 3, tab, values);
+        for (int j = 0; j < 8; ++j) out[(size_t) r * k + at * 8 + j] = values[j];
+    }
+}
+__global__ void embed_plain_kernel(int type, const uint8_t* table, size_t stride, const int* ids, int n, int k,
+                                   int vocab, float* out) {
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n * k; q += gridDim.x * blockDim.x) {
+        const int r = q / k, token = ids[r] >= 0 && ids[r] < vocab ? ids[r] : 0, col = q % k;
+        const uint8_t* row = table + (size_t) token * stride;
+        out[q] = type == 0 ? ((const float*) row)[col] : type == 30 ?
+                 __uint_as_float((uint32_t) ((const uint16_t*) row)[col] << 16) :
+                 __half2float(((const __half*) row)[col]);
+    }
+}
+bool embed_rows(int type, const uint8_t* table, size_t stride, const int* ids, int n, int k, int vocab,
+                float* out, cudaStream_t s) {
+    if (n <= 0 || k <= 0 || k % 32 || vocab <= 0) return false;
+    if (type == 0 || type == 1 || type == 30) {
+        embed_plain_kernel<<<grid_for((long long) n * k), kThreads, 0, s>>>(type, table, stride, ids, n, k, vocab, out);
+        return cudaGetLastError() == cudaSuccess;
+    }
+    if (k % block_values(type)) return false;
+    const unsigned blocks = grid_for((long long) n * (k / 8));
+#define ER_(T) embed_rows_kernel<T><<<blocks, kThreads, 0, s>>>(table, stride, ids, n, k, vocab, out)
+    DS4_IQ_SWITCH_MV(type, ER_)
+#undef ER_
+    return cudaGetLastError() == cudaSuccess;
+}
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s) {
     pdl_launch(gather_f16_kernel, grid_for((long long) n * (k / 8)), kThreads, 0, s, x, ldx, idx, n, k, dst);
 }

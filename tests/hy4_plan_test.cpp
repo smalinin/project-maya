@@ -4,8 +4,11 @@
 // text only, 8-bit rows text only; nothing that fits no way.
 #include "../src/hy4/hy4_plan.hpp"
 #include "../src/hy4/hy4_draft.hpp"
+#include "../src/hy4/hy4_history.hpp"
+#include "../src/hy4/hy4_prefill.hpp"
 
 #include <cstdio>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -36,6 +39,98 @@ hy4::KvPick pick(Card& c, int kv, bool vision, bool vision_auto, long long n_min
 }  // namespace
 
 int main() {
+    {
+        const std::vector<int> placement{0, 0, 0, 1, 1, 1}, slots(6, 10);
+        hy4::PrefillTuning tuning(6, 2, "fixture");
+        CHECK(tuning.choose(4096, 2048, placement) == 2048);
+        for (int il = 0; il < 6; ++il) tuning.observe(2048, placement[(size_t) il], il, 20, 10);
+        CHECK(tuning.choose(4096, 2048, placement) == 1024);
+        for (int il = 0; il < 6; ++il) tuning.observe(1024, placement[(size_t) il], il, 10, 10);
+        CHECK(tuning.choose(4096, 2048, placement) == 512);
+        for (int il = 0; il < 6; ++il) tuning.observe(512, placement[(size_t) il], il, 11, 10);
+        CHECK(tuning.choose(4096, 2048, placement) == 1024);
+        CHECK(tuning.costs(1024, placement, std::vector<double>(6, 1)).size() == 2);
+        tuning.observe_pipeline(1024, 4096, placement, 400); // Include packing and queue overhead beyond kernel times.
+        CHECK(tuning.choose(4096, 2048, placement) == 2048);
+        const auto file = std::filesystem::temp_directory_path() /
+            ("hy4-prefill-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        CHECK(tuning.save(file.string()));
+        hy4::PrefillTuning restored(6, 2, "fixture"), different(6, 2, "other hardware");
+        CHECK(restored.load(file.string()));
+        CHECK(restored.choose(4096, 2048, placement) == 2048);
+        CHECK(!different.load(file.string()));
+        { std::ofstream broken(file); broken << "HY4PREF2 6 2\nfixture\nnan 1\n"; }
+        CHECK(!restored.load(file.string()));
+        std::filesystem::remove(file);
+        const std::vector<std::vector<double>> costs{std::vector<double>(6, 1), std::vector<double>(6, 2)};
+        const auto balanced = hy4::balance_prefill({100, 100}, std::vector<hy4::LayerVram>(6, {1, 1}),
+                                                  {1, 1}, costs, placement, slots, 20, 20);
+        CHECK(balanced.gpu == (std::vector<int>{0, 0, 0, 0, 1, 1}));
+        CHECK(balanced.cost < 27);
+        const auto fixed = hy4::balance_prefill({33, 33}, std::vector<hy4::LayerVram>(6, {1, 1}),
+                                               {1, 1}, costs, placement, slots, 10, 20);
+        CHECK(fixed.gpu == placement);
+        std::vector<int> six(18);
+        for (int il = 0; il < 18; ++il) six[(size_t) il] = il / 3;
+        auto six_costs = std::vector<std::vector<double>>(6, std::vector<double>(18, 1));
+        six_costs.back().assign(18, 2); // The last card is slower; enough memory permits moving one of its layers.
+        const auto six_balanced = hy4::balance_prefill(std::vector<double>(6, 100),
+            std::vector<hy4::LayerVram>(18, {1, 1}), std::vector<int>(6, 1), six_costs, six,
+            std::vector<int>(18, 20), 20, 20);
+        CHECK(six_balanced.gpu[15] == 4 && six_balanced.gpu[16] == 5);
+        CHECK(six_balanced.cost < 39 && six_balanced.slots == std::vector<int>(18, 20));
+        const auto six_fixed = hy4::balance_prefill(std::vector<double>(6, 64),
+            std::vector<hy4::LayerVram>(18, {1, 1}), std::vector<int>(6, 1), six_costs, six,
+            std::vector<int>(18, 20), 20, 20);
+        CHECK(six_fixed.gpu == six); // A move that would evict too many experts is rejected.
+    }
+    {
+        const auto dir = std::filesystem::temp_directory_path() /
+            ("hy4-history-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directory(dir);
+        const std::string path = (dir / "history.bin").string();
+        std::string error;
+        hy4::ExpertHistory a(17, 2, 3), b(17, 2, 3);
+        const int routes[] = {0, 1, 2, 0,  1, 2, 0, 1};
+        const char present[] = {1, 1};
+        a.begin(100);
+        a.observe(98, 4, 4, 1, routes, present); // prompt rows are excluded
+        CHECK(a.pending_tokens() == 2);
+        CHECK(a.save(path, error));
+        CHECK(a.save(path, error));
+        CHECK(a.data().tokens == 2 && a.data().requests == 1);
+        CHECK(a.data().all[0] == 1 && a.data().all[2] == 1);
+        a.observe(100, 4, 4, 1, routes, present); // two repeated positions, two new positions
+        CHECK(a.pending_tokens() == 2);
+        b.begin(0);
+        b.observe(0, 4, 4, 1, routes, present);
+        CHECK(b.save(path, error));
+        CHECK(a.save(path, error));
+        hy4::ExpertHistory reloaded(17, 2, 3);
+        CHECK(reloaded.load(path, error));
+        CHECK(reloaded.data().tokens == 8 && reloaded.data().requests == 2);
+        CHECK(reloaded.data().all[0] == 4 && reloaded.data().all[1] == 1 && reloaded.data().all[2] == 3);
+        CHECK(!hy4::ExpertHistory(18, 2, 3).load(path, error));
+        a.finish();
+        a.observe(104, 4, 4, 1, routes, present);
+        CHECK(a.pending_tokens() == 0);
+        const std::string capped = (dir / "capped.bin").string();
+        hy4::ExpertHistory long_answer(19, 1, 2);
+        std::vector<int> many(8192, 1);
+        const char one[] = {1};
+        long_answer.begin(0);
+        long_answer.observe(0, 4096, 8192, 1, many.data(), one);
+        CHECK(long_answer.save(capped, error));
+        long_answer.observe(4096, 4096, 8192, 1, many.data(), one);
+        CHECK(long_answer.save(capped, error));
+        CHECK(long_answer.data().all[1] == 4096 && long_answer.data().start[1] == 512);
+        CHECK(long_answer.data().tokens == 8192 && long_answer.data().requests == 1);
+        const auto initial = long_answer.initial({8192, 0}, 1);
+        CHECK(initial[1] > initial[0]);
+        { std::ofstream broken(capped, std::ios::binary | std::ios::trunc); broken << "broken"; }
+        CHECK(!long_answer.load(capped, error));
+        std::filesystem::remove_all(dir);
+    }
     {
         CHECK(hy4::staging_slots({{32, 1}, {64, 2}, {128, 4}}) == 32);
         CHECK(hy4::staging_slots({{32, 2}, {64, 2}, {128, 4}}) == 64);

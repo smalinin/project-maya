@@ -794,6 +794,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
     };
     std::vector<float> lg((size_t) m.vocab());
     Unpin lg_unpin{lg.data(), hy4::Model::pin(lg.data(), lg.size() * sizeof(float))};
+    auto learned_window = adaptive_draft(m, n_draft);
     unsigned long long counter = 0;
     std::string line, err;
     auto done_cancel = [&](size_t n_ids) {
@@ -907,6 +908,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             continue;
         }
         ++counter;
+        m.begin_answer((int64_t) r.ids.size());
         std::mt19937_64 rng(r.seed != 0 ? r.seed : 0x9E3779B97F4A7C15ull * counter);
         long long produced = 0;
         const char* finish = "length";
@@ -920,7 +922,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         Extra extra;      // (when a step tries a draft more than the usual ones)
         extra.n_more = n_more;
         extra.need = need;
-        auto window = adaptive_draft(m, n_draft);
+        auto& window = learned_window;
         auto stat_line = [&]() {
             const double ms = now() * 1e3 - t1;
             const long long d_ex = (long long) m.stats().experts - ex0;
@@ -1314,6 +1316,7 @@ void draft_params(const hy4::Model& m, const DraftArgs& a, int& n_draft, float& 
 bool trial_answer(hy4::Model& m, const std::vector<int>& p, int gen, const DraftArgs& a, std::vector<float>& lg,
                   int& made, double& secs, std::string& err) {
     if (!m.forward(p.data(), (int) p.size(), 0, 1, lg.data(), err)) return false;
+    m.begin_answer((int64_t) p.size());
     int n_draft = 0, n_more = 0;
     float floor = 0.0f;
     draft_params(m, a, n_draft, floor, n_more);
@@ -1905,6 +1908,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "\n");
     std::vector<int> out;
     int64_t pos = (int64_t) ids.size();
+    m.begin_answer(pos);
     if (m.has_draft() && n_draft > 0 && gen > 0) {   // greedy with the drafts (the MTP block's, or the DFly2 drafter's)
         auto window = adaptive_draft(m, n_draft);
         std::vector<float> lw((size_t) (window.capacity() + n_more + 1) * m.vocab());

@@ -22,7 +22,7 @@ namespace hy4 {
 class Lane {
 public:
     /// threads: workers besides the caller (0: the caller alone); < 0: one a physical core but the caller's
-    explicit Lane(int threads);
+    explicit Lane(int threads, int core_offset = 0);
     ~Lane();
     Lane(const Lane&) = delete;
     Lane& operator=(const Lane&) = delete;

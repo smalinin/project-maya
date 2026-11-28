@@ -142,6 +142,9 @@ bool set_down(const SetArgs& a, cudaStream_t s);
 /// apart - as FP16 rows (ldd apart), the values the tensor-core tiles multiply (their loader's, rounded to FP16 the same
 /// way), for the caller's GEMM: the tiles decode an expert's weights again for every 64 of its rows.
 bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, cudaStream_t s);
+/// Device-selected embedding rows, decoded directly to F32. Invalid speculative ids read row zero.
+bool embed_rows(int type, const uint8_t* table, size_t stride, const int* ids, int n, int k, int vocab,
+                float* out, cudaStream_t s);
 /// dst[r] = x[idx[r]] for r < n (FP16 rows of k values; x ldx apart, dst k apart)
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s);
 /// h[r][c] = FP16 of the tiles' clamped SwiGLU of gu[r][c] (gate) and gu[r][ff + c] (up), F32 rows ld apart

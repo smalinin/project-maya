@@ -23,6 +23,10 @@
 
 namespace iq = maya::ds4::gguf::iq;
 
+extern "C" void dequantize_row_q4_K(const void*, float*, int64_t);
+extern "C" void dequantize_row_q5_K(const void*, float*, int64_t);
+extern "C" void dequantize_row_q6_K(const void*, float*, int64_t);
+
 namespace {
 
 int fails = 0;
@@ -752,6 +756,61 @@ void lane_waits_cases() {
     std::printf("  CPU lane's waits by system and environment: %s\n", fails ? "FAILED" : "ok");
 }
 
+void test_embedding_rows() {
+    constexpr int E = 512, vocab = 3;
+    const int ids[] = {2, 0, 2, -1, vocab, 1};
+    std::mt19937 rng(42);
+    for (int type : {0, 1, 30, iq::kQ8_0, iq::kQ4_K, iq::kQ5_K, iq::kQ6_K}) {
+        const size_t stride = type == 0 ? E * 4 : type == 1 || type == 30 ? E * 2 : iq::row_bytes(type, E);
+        std::vector<uint8_t> table(stride * vocab);
+        std::vector<float> decoded((size_t) vocab * E);
+        for (int r = 0; r < vocab; ++r) {
+            auto* row = table.data() + r * stride;
+            auto* out = decoded.data() + r * E;
+            for (int c = 0; c < E; ++c) out[c] = (float) ((c + r * 7) % 47 - 23) / 31;
+            if (type == 0) std::memcpy(row, out, stride);
+            else if (type == 1 || type == 30) {
+                for (int c = 0; c < E; ++c) {
+                    uint32_t bits;
+                    std::memcpy(&bits, out + c, 4);
+                    const uint16_t value = type == 1 ? f2h(out[c]) : (uint16_t) (bits >> 16);
+                    std::memcpy(row + 2 * c, &value, 2);
+                    if (type == 1) out[c] = __half2float(__ushort_as_half(value));
+                    else { bits = (uint32_t) value << 16; std::memcpy(out + c, &bits, 4); }
+                }
+            } else if (type == iq::kQ8_0) {
+                quant_q8_0(out, E, row);
+                for (int c = 0; c < E; ++c) {
+                    uint16_t scale;
+                    std::memcpy(&scale, row + (c / 32) * 34, 2);
+                    out[c] = __half2float(__ushort_as_half(scale)) * (int8_t) row[(c / 32) * 34 + 2 + c % 32];
+                }
+            } else {
+                random_k(type, E, row, rng);
+                if (type == iq::kQ4_K) dequantize_row_q4_K(row, out, E);
+                else if (type == iq::kQ5_K) dequantize_row_q5_K(row, out, E);
+                else dequantize_row_q6_K(row, out, E);
+            }
+        }
+        uint8_t* weights = nullptr;
+        int* tokens = nullptr;
+        float* output = nullptr;
+        CU(cudaMalloc(&weights, table.size()));
+        CU(cudaMalloc(&tokens, sizeof ids));
+        CU(cudaMalloc(&output, sizeof(float) * 6 * E));
+        CU(cudaMemcpy(weights, table.data(), table.size(), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(tokens, ids, sizeof ids, cudaMemcpyHostToDevice));
+        CHECK(iq::embed_rows(type, weights, stride, tokens, 6, E, vocab, output, nullptr));
+        std::vector<float> result(6 * E);
+        CU(cudaMemcpy(result.data(), output, result.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int r = 0; r < 6; ++r) {
+            const int id = ids[r] >= 0 && ids[r] < vocab ? ids[r] : 0;
+            for (int c = 0; c < E; ++c) CHECK(std::abs(result[r * E + c] - decoded[id * E + c]) < 1e-6f);
+        }
+        cudaFree(weights); cudaFree(tokens); cudaFree(output);
+    }
+}
+
 int main() {
     lane_waits_cases();
     int n = 0;
@@ -760,6 +819,7 @@ int main() {
         std::printf("hy4_experts_test: no GPU, skipped\n");
         return 0;
     }
+    test_embedding_rows();
     if (std::getenv("HY4_MV_BENCH")) {
         mv_heads_bench();
         std::printf("hy4_experts_test (mv_heads bench): %s\n", fails ? "FAILED" : "ok");
