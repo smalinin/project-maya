@@ -81,6 +81,7 @@ inline int staging_slots(const std::vector<StageSample>& samples) {
 struct PromptCacheLayer {
     int gpu;
     size_t bytes;
+    double saved_ms = 0;
 };
 
 struct ExpertSlotLayer {
@@ -129,11 +130,17 @@ inline std::vector<int> profile_expert_slots(const std::vector<ExpertSlotLayer>&
 // A stage's cold experts have to be packed and uploaded on each chunk. Spend the pinned cache on the
 // stage with the most estimated work remaining. A wholly cached layer needs no dispatch to the packing pool.
 inline std::vector<size_t> prompt_cache_layers(const std::vector<PromptCacheLayer>& layers,
-                                               const std::vector<double>& seconds_per_byte, size_t budget) {
-    std::vector<size_t> pending(seconds_per_byte.size(), 0), chosen;
+                                               const std::vector<double>& ms_per_byte, size_t budget,
+                                               const std::vector<double>& fixed = {}) {
+    std::vector<size_t> chosen;
+    std::vector<double> pending(ms_per_byte.size(), 0);
+    if (fixed.size() == pending.size()) pending = fixed;
+    auto work = [&](const PromptCacheLayer& layer) {
+        return layer.saved_ms > 0 ? layer.saved_ms : layer.bytes * ms_per_byte[(size_t) layer.gpu];
+    };
     std::vector<bool> cached(layers.size(), false);
     for (const auto& layer : layers)
-        if (layer.bytes) pending[(size_t) layer.gpu] += layer.bytes;
+        if (layer.bytes) pending[(size_t) layer.gpu] += work(layer);
     while (budget > 0) {
         size_t best = layers.size();
         double slowest = -1.0;
@@ -141,7 +148,7 @@ inline std::vector<size_t> prompt_cache_layers(const std::vector<PromptCacheLaye
             const auto& layer = layers[il];
             if (cached[il] || layer.bytes == 0 || layer.bytes > budget) continue;
             const size_t gpu = (size_t) layer.gpu;
-            const double cost = pending[gpu] * seconds_per_byte[gpu];
+            const double cost = pending[gpu];
             if (best == layers.size() || cost > slowest || (cost == slowest && layer.bytes > layers[best].bytes)) {
                 best = il;
                 slowest = cost;
@@ -149,7 +156,7 @@ inline std::vector<size_t> prompt_cache_layers(const std::vector<PromptCacheLaye
         }
         if (best == layers.size()) break;
         const auto& layer = layers[best];
-        pending[(size_t) layer.gpu] -= layer.bytes;
+        pending[(size_t) layer.gpu] -= work(layer);
         budget -= layer.bytes;
         cached[best] = true;
         chosen.push_back(best);

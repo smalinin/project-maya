@@ -2456,10 +2456,12 @@ The pipeline keeps its pinned hand-off and routing buffers between prompts to av
 The server also groups incomplete final prompt chunks into the pipeline. With `--chunk 2048`, a prompt body
 of 4095 tokens can pipeline one full chunk and its incomplete tail. The prompt's last token runs separately.
 
-DFly2 adjusts its draft width between 2 and 5, within the drafter's supported limit. `--draft` sets its initial
-width. The controller measures proposal and verification time per committed token, probes each width for four
-steps and periodically revisits its choices as the answer changes. `HY4_DFLY_ADAPT=0` fixes the requested width.
-The engine's `STAT` line includes the current `draft_n`.
+DFly2 jointly adjusts its width from 0 to 5, within the drafter's supported limit, and its confidence threshold.
+`--draft` and `--draft-floor` seed the controller. Width 0 runs the target alone. Trials cover the initial threshold,
+0 and 0.8, with two rounds per pair; the cost is proposal plus verification time per committed token. Occasional
+probes revisit alternatives. An explicit request confidence fixes that request's threshold while width may adapt.
+`HY4_DFLY_ADAPT=width` keeps the previous width-only controller (2 to 5); `0` fixes both settings.
+The engine's `STAT` line includes the current `draft_n` and `draft_floor`.
 
 Full Hy4 keeps the DFly2 window controller between requests. Its periodic probes still adapt to a new answer.
 `HY4_DFLY_DEVICE=1` (default) caches the quantized token embedding table on the fusion GPU when it is no larger
@@ -2467,6 +2469,12 @@ than `HY4_DFLY_EMBED_MIB` (1024 MiB). The VRAM planner reserves this memory befo
 steps read the preceding token directly on the device, and the whole block's ids and confidences return in one
 transfer. `HY4_DFLY_DEVICE=0` uses the per-token host path; debug dumps also use that path. Confidence filtering and
 target-model verification are unchanged.
+
+`HY4_DFLY_EARLY=1` (default) runs the correction chain in a conditional CUDA graph on the fusion GPU. A step whose
+previous proposal fell below the confidence threshold skips its embedding, correction and output-head kernels.
+The result still returns once per block. `draft_heads` and `draft_skip` in `STAT` count executed and skipped heads.
+This path is enabled in NVIDIA CUDA 13 builds; older toolkits and a failed capture use direct correction.
+`HY4_DFLY_EARLY=0` selects the previous full device chain; `HY4_DFLY_DEVICE=0` selects the host chain.
 
 `HY4_PREFILL_PACK=1` (default) gives each pipeline stage its own packing queue, with the CPU thread budget divided
 between stages. Two banks share the existing host and device staging memory. CUDA events protect their reuse while
@@ -2485,6 +2493,22 @@ not an exhaustive benchmark of every placement. `HY4_PREFILL_BALANCE=0` or an ex
 memory-based or requested boundaries. Measurements are keyed by the model, GPU/driver and start settings; drafting
 trials and warm-up do not write them.
 
+Full Hy4's `HY4_PREFILL_RAM_GB=auto` (the setup default) tests 8, 16, 32 and 64 GB of pinned expert-cache memory.
+It excludes the first cold prompt, then compares two samples per budget with the same chunk count and similar
+tail fullness, using pipeline time per input token. Cache preparation is outside that measurement. Growth can
+lengthen the calibration requests; the chosen budget is allocated at subsequent starts. The smallest budget within
+3% of the fastest wins. A completed calibration supplies the default for other prompt shapes, avoiding repeated
+growth and shrinkage. `HY4_PREFILL_RAM_MAX_GB` caps automatic trials (64 by default); available RAM also limits them,
+keeping at least 10% of total RAM or 4 GiB free. A number instead of `auto` is a manual GB limit; `0` disables the cache.
+Explicit numeric settings are preserved by setup.
+
+The measurements are kept in `<pack>/prefill-ram-tuning.txt` (`HY4_PREFILL_RAM_FILE` overrides it), keyed by model,
+hardware and layer placement. Layer packing times and the remaining stage work prioritize which layers enter the
+cache. Pending expert copies finish before a resize. Automatic chunk exploration waits for RAM calibration, and a
+changed RAM budget invalidates old chunk estimates. Warm-up and drafting trials do not train the RAM tuner.
+Cached layers share large pinned pools; growth registers each added pool once, and shrinkage releases whole pools.
+The log separates weight-packing time from CUDA registration time during preparation.
+
 Full Hy4 also records a long-term prior in `<pack>/expert-history.bin`, independently of `expert-hot.bin`.
 `HY4_HISTORY=0` disables it; `HY4_HISTORY_FILE` sets its path. `HY4_HISTORY_LEARN` controls writes (by default it
 follows the hot profile's learning setting, so setup's `HY4_HOT_LEARN=1` enables it). The history records only settled
@@ -2497,8 +2521,17 @@ At load the normalized prior uses 60% early-answer and 40% full-answer frequenci
 `HY4_HISTORY_WEIGHT` (0.8 by default, ramped in over the first 4096 recorded tokens). The log reports the file and
 the number of recorded tokens and requests. The live hot cache keeps its existing fast adaptation.
 
-With a saved full Hy4 routing profile, `HY4_PROFILE_SLOTS=1` reassigns expert slots between layers on each GPU
-within its existing expert memory budget. Each layer keeps at least half of its previous slots. This mode is opt-in.
+`HY4_COST_CACHE=1` (default) learns CPU milliseconds per routed expert and samples GPU expert time once per 32
+small forwards using CUDA events, without waiting for those events separately. `<pack>/expert-costs.txt`
+(`HY4_COST_FILE` overrides it) stores the measurements with a model and hardware key. Warm-up and drafting trials
+do not update them. Expert promotions use expected CPU time saved over the next up-to-512 tokens, less packing,
+upload and, when needed, eviction-copy cost. Unprofitable copies are skipped; existing frequency margins and swap
+limits still apply. `HY4_COST_CACHE=0` keeps the frequency-only policy.
+
+Once at least half the layers have cost samples and a routing profile exists, startup also redistributes slots
+between layers by expected saved time per byte, within each GPU's existing expert budget. Each layer keeps at least
+half its previous slots. `HY4_PROFILE_SLOTS=0` disables this redistribution; `1` enables it even before cost samples
+exist, using routing frequencies alone until measured costs are available.
 
 For windows of 17 to 256 prompt tokens, the full Hy4 layer split with GPU fetch off can use measured CPU expert
 costs and PCIe bandwidth to choose where to compute each layer's nonresident experts. The long prefill pipeline

@@ -734,10 +734,11 @@ struct Extra {
     }
 };
 
-hy4::AdaptiveDraft adaptive_draft(const hy4::Model& model, int initial) {
+hy4::AdaptiveDraft adaptive_draft(const hy4::Model& model, int initial, float floor = 0.55f, bool fixed_floor = false) {
     const char* setting = std::getenv("HY4_DFLY_ADAPT");
     return hy4::AdaptiveDraft(initial, model.draft_max(),
-                              model.has_dfly2() && (!setting || std::atoi(setting) != 0));
+                              model.has_dfly2() && (!setting || std::string(setting) == "width" || std::string(setting) == "auto" || std::atoi(setting) != 0),
+                              floor, !setting || std::string(setting) != "width", !fixed_floor);
 }
 
 int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need) {
@@ -749,7 +750,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 st0.experts_vram, st0.experts_vram);
     for (const auto& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the web app's map of the GPUs)
     if (m.has_dfly2()) {
-        const auto initial = adaptive_draft(m, n_draft);
+        const auto initial = adaptive_draft(m, n_draft, floor0);
         std::printf("INFO dfly2=%d draft=%d draft_adaptive=%d draft_max=%d\n", n_draft > 0 ? 1 : 0,
                     initial.width(), (int) initial.enabled(), initial.capacity());
     }
@@ -794,7 +795,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
     };
     std::vector<float> lg((size_t) m.vocab());
     Unpin lg_unpin{lg.data(), hy4::Model::pin(lg.data(), lg.size() * sizeof(float))};
-    auto learned_window = adaptive_draft(m, n_draft);
+    auto learned_window = adaptive_draft(m, n_draft, floor0);
     unsigned long long counter = 0;
     std::string line, err;
     auto done_cancel = [&](size_t n_ids) {
@@ -919,10 +920,12 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         // experts run, those of them on the CPU lane, the host's n-gram gathers
         const long long ex0 = (long long) m.stats().experts, cpu0 = (long long) m.stats().cpu_experts;
         const double eg0 = m.stats().engram_ms;
+        const auto heads0 = m.stats().draft_heads, skipped0 = m.stats().draft_skipped;
         Extra extra;      // (when a step tries a draft more than the usual ones)
         extra.n_more = n_more;
         extra.need = need;
-        auto& window = learned_window;
+        auto request_window = adaptive_draft(m, n_draft, r.conf, true);
+        auto& window = r.conf >= 0.0f ? request_window : learned_window;
         auto stat_line = [&]() {
             const double ms = now() * 1e3 - t1;
             const long long d_ex = (long long) m.stats().experts - ex0;
@@ -934,11 +937,12 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                         produced > 0 ? (double) d_cpu / (double) produced : 0.0);
             if (d_off > 0) std::printf(" drafts=%.3f draft_acc=%lld draft_off=%lld", (double) d_acc / (double) d_off, d_acc,
                                        d_off);
-            if (m.has_dfly2()) std::printf(" draft_n=%d", window.width());
+            if (m.has_dfly2()) std::printf(" draft_n=%d draft_floor=%.3f", window.width(), window.floor());
+            if (m.has_dfly2()) std::printf(" draft_heads=%lld draft_skip=%lld",
+                (long long) (m.stats().draft_heads - heads0), (long long) (m.stats().draft_skipped - skipped0));
             std::printf(" engram_ms=%.3f\n", produced > 0 ? d_eg / (double) produced : 0.0);
         };
         const bool spec = m.has_draft() && n_draft > 0 && (r.spec < 0 || r.spec != 0);
-        const float floor = r.conf >= 0.0f ? r.conf : floor0;
         std::vector<int> drafts;
         Weights wts;   // (plain sampling's rows)
         std::vector<float> confs;
@@ -976,10 +980,11 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             long long room = std::min<long long>(r.max_new - produced, m.max_ctx() - pos - 2);
             if (in_think) room = std::min<long long>(room, r.think_budget - produced);
             if (in_think && in.wrap.load()) room = 0;
-            const int requested = (int) std::min<long long>(room, window.width() + extra.now());
+            const int requested = window.width() > 0 ? (int) std::min<long long>(room, window.width() + extra.now()) : 0;
+            const float floor = window.floor();
             const double step_started = now();
             int k = 0;
-            if (spec && room > 0) {
+            if (spec && room > 0 && requested > 0) {
                 if (!m.draft(tok, pos, requested, floor,
                              drafts, confs, err, n_draft, sure)) {
                     fail = err;
@@ -993,7 +998,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                     fail = err;
                     break;
                 }
-                if (spec && room >= window.width()) window.observe(requested, 0, 0, (now() - step_started) * 1e3);
+                if (spec && room > 0 && room >= window.width()) window.observe(requested, 0, 0, (now() - step_started) * 1e3);
                 state.push_back(tok);
                 if (plain_sampling(r)) {
                     wts.of(lg.data(), m.vocab(), r.temperature, m.row_top(0));
@@ -1333,19 +1338,21 @@ bool trial_answer(hy4::Model& m, const std::vector<int>& p, int gen, const Draft
         Extra extra;
         extra.n_more = n_more;
         extra.need = a.need;
-        auto window = adaptive_draft(m, n_draft);
+        hy4::AdaptiveDraft window(n_draft, m.draft_max(), false, floor);
         int tok = top_of(lg.data(), 0);
         while ((int) out.size() < gen) {
             out.push_back(tok);
             if (tok == m.eos() || (int) out.size() >= gen) break;
             const int room = gen - (int) out.size();
-            const int requested = std::min(window.width() + extra.now(), room);
+            const int requested = window.width() > 0 ? std::min(window.width() + extra.now(), room) : 0;
+            const float step_floor = window.floor();
+            drafts.clear(); confs.clear();
             const double started = now();
-            if (!m.draft(tok, pos, requested, floor, drafts, confs, err,
+            if (requested > 0 && !m.draft(tok, pos, requested, step_floor, drafts, confs, err,
                          n_draft, a.sure))
                 return false;
             int k = 0;
-            while (k < (int) drafts.size() && confs[(size_t) k] >= floor) ++k;
+            while (k < (int) drafts.size() && confs[(size_t) k] >= step_floor) ++k;
             std::vector<int> win(1, tok);
             win.insert(win.end(), drafts.begin(), drafts.begin() + k);
             if (!m.forward(win.data(), k + 1, pos, k + 1, lg.data(), err)) return false;
@@ -1910,7 +1917,7 @@ int main(int argc, char** argv) {
     int64_t pos = (int64_t) ids.size();
     m.begin_answer(pos);
     if (m.has_draft() && n_draft > 0 && gen > 0) {   // greedy with the drafts (the MTP block's, or the DFly2 drafter's)
-        auto window = adaptive_draft(m, n_draft);
+        auto window = adaptive_draft(m, n_draft, floor);
         std::vector<float> lw((size_t) (window.capacity() + n_more + 1) * m.vocab());
         const bool lw_pinned = hy4::Model::pin(lw.data(), lw.size() * sizeof(float));
         (void) lw_pinned;
@@ -1936,15 +1943,17 @@ int main(int argc, char** argv) {
             }
             const double ta = now();
             const int room = gen - (int) out.size();
-            const int requested = std::min(window.width() + extra.now(), room);
-            if (!m.draft(tok, pos, requested, floor,
+            const int requested = window.width() > 0 ? std::min(window.width() + extra.now(), room) : 0;
+            const float step_floor = window.floor();
+            drafts.clear(); confs.clear();
+            if (requested > 0 && !m.draft(tok, pos, requested, step_floor,
                          drafts, confs, err, n_draft, sure)) {
                 std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
                 return 1;
             }
             t_draft += now() - ta;
             int k = 0;
-            while (k < (int) drafts.size() && confs[(size_t) k] >= floor) ++k;
+            while (k < (int) drafts.size() && confs[(size_t) k] >= step_floor) ++k;
             std::vector<int> win(1, tok);
             win.insert(win.end(), drafts.begin(), drafts.begin() + k);
             const double tb = now();

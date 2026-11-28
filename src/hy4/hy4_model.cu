@@ -22,6 +22,8 @@
 #include "hy4_ring.hpp"
 #include "hy4_history.hpp"
 #include "hy4_prefill.hpp"
+#include "hy4_cost.hpp"
+#include "hy4_ram.hpp"
 #include "hy4_spill.hpp"
 #include "../ds4/ds4_iq.cuh"
 #include "../ds4/ds4_lt.hpp"
@@ -70,6 +72,19 @@ namespace {
 
 constexpr int kF32 = 0, kF16 = 1, kBF16 = 30, kF8 = 43;
 constexpr int W = k::kMaxWin;
+
+struct DflyControl { int count; float floor; int executed; };
+#if !defined(MAYA_USE_HIP) && CUDART_VERSION >= 13000
+__global__ void dfly_condition(cudaGraphConditionalHandle handle, float* top, DflyControl* control,
+                                int step, int vocab) {
+    const int previous = step ? ((const int*) top)[2 * (step - 1)] : 0;
+    const bool run = step < control->count && (!step || (previous >= 0 && previous < vocab &&
+                                                         top[2 * (step - 1) + 1] >= control->floor));
+    if (!run) { ((int*) top)[2 * step] = -1; top[2 * step + 1] = 0; }
+    else ++control->executed;
+    cudaGraphSetConditional(handle, run);
+}
+#endif
 
 int type_id(const std::string& s) {
     static const std::pair<const char*, int> names[] = {
@@ -608,6 +623,10 @@ struct Model::Impl {
               *gu = nullptr, *hd = nullptr, *top = nullptr;
         float* h_emb = nullptr;                 // pinned [W][E]
         uint8_t* embedding = nullptr;           // quantized rows used by the device correction chain
+        DflyControl *control = nullptr, *h_control = nullptr;
+        std::array<cudaGraph_t, W> correction_graph{};
+        std::array<cudaGraphExec_t, W> correction_exec{};
+        bool graph_tried = false;
         int64_t snap_p0 = -1;
         int snap_T = 0;
         const Keys* current = nullptr;          // the draft layer's lists during attention
@@ -627,6 +646,14 @@ struct Model::Impl {
     std::vector<std::unique_ptr<Lane>> prompt_lanes;
     std::unique_ptr<PrefillTuning> prefill_tuning;
     std::string prefill_tuning_file;
+    std::unique_ptr<RamTuning> ram_tuning;
+    std::string ram_tuning_file;
+    struct RamPool { uint8_t* data; size_t bytes; std::vector<size_t> layers; };
+    std::vector<RamPool> ram_pools;
+    double ram_configured_gb = -1;
+    int ram_budget_gb = 0;
+    int ram_pin_maximum = 64;
+    bool ram_auto = false;
     std::thread placer;               // (place_experts in the background: the CPU lane's experts over the NUMA nodes)
     std::atomic<bool> placer_stop{false};
     // (the CPU lane's most routed experts re-coded at 4 bits in spare RAM, by q4x_builder from the routing counts)
@@ -682,6 +709,13 @@ struct Model::Impl {
         uint8_t* bounce = nullptr;    // one decode batch, sliced into disjoint ranges for its GPUs
         bool bounce_tried = false;
     } hot;
+    std::unique_ptr<ExpertCosts> costs;
+    struct CostTiming { cudaEvent_t begin = nullptr, end = nullptr; int entries = 0; bool pending = false; };
+    std::vector<CostTiming> cost_timing;
+    std::string cost_file;
+    bool cost_sample = false;
+    unsigned long long cost_tick = 0;
+    uint64_t identity_ = 0;
     std::unique_ptr<ExpertHistory> history;
     std::string history_file;
     bool history_learn = false;
@@ -1045,10 +1079,18 @@ struct Model::Impl {
             if (gp.prompt_copy) cudaStreamSynchronize(gp.prompt_copy);
             if (gp.hot_copy) cudaStreamSynchronize(gp.hot_copy);
         }
-        for (Layer& l : L) {
-            if (!l.prompt_ram) continue;
-            cudaHostUnregister(l.prompt_ram);
-            ram_free(l.prompt_ram, l.prompt_ram_bytes);
+        for (size_t il = 0; il < cost_timing.size(); ++il) {
+            cudaSetDevice(G[(size_t) L[il].gpu].dev);
+            if (cost_timing[il].begin) cudaEventDestroy(cost_timing[il].begin);
+            if (cost_timing[il].end) cudaEventDestroy(cost_timing[il].end);
+        }
+        if (!G.empty()) cudaSetDevice(G[(size_t) head_gpu].dev);
+        for (auto exec : df.correction_exec) if (exec) cudaGraphExecDestroy(exec);
+        for (auto graph : df.correction_graph) if (graph) cudaGraphDestroy(graph);
+        if (df.h_control) cudaFreeHost(df.h_control);
+        for (auto& pool : ram_pools) {
+            cudaHostUnregister(pool.data);
+            ram_free(pool.data, pool.bytes);
         }
         for (size_t i = 0; i < fx.mem.size(); ++i) {
             if (fx.pinned[i]) cudaHostUnregister(fx.mem[i]);
@@ -1735,7 +1777,13 @@ struct Model::Impl {
 
     void place_profile_slots() {
         const char* enabled = std::getenv("HY4_PROFILE_SLOTS");
-        if (!g.full || tp > 1 || !enabled || std::atoi(enabled) == 0 || (!hot.loaded && prof_in.empty())) return;
+        const bool measured = costs && costs->ready_layers() >= std::max(1, g.n_layer / 2);
+        if (!g.full || tp > 1 || (enabled ? std::atoi(enabled) == 0 : !measured) || (!hot.loaded && prof_in.empty())) return;
+        double typical = 0;
+        int measured_count = 0;
+        if (measured) for (int il = 0; il < g.n_layer; ++il)
+            if (costs->ready(il) && costs->miss_ms(il) > 0) { typical += costs->miss_ms(il); ++measured_count; }
+        typical = measured_count ? typical / measured_count : 1;
         const int limit = (int) std::floor(std::max(0.0, std::min(1.0, o.vram_experts)) * g.n_expert);
         int moved = 0;
         for (size_t gi = 0; gi < G.size(); ++gi) {
@@ -1760,6 +1808,10 @@ struct Model::Impl {
                 if (total <= 0.0) continue;
                 std::sort(slots.frequency.rbegin(), slots.frequency.rend());
                 for (double& weight : slots.frequency) weight /= total;
+                if (measured && costs->ready((int) il)) {
+                    const double benefit = std::clamp(costs->miss_ms((int) il) / typical, 0.25, 4.0);
+                    for (double& weight : slots.frequency) weight *= benefit;
+                }
                 indices.push_back(il);
                 layers.push_back(std::move(slots));
             }
@@ -1771,7 +1823,7 @@ struct Model::Impl {
         }
         if (moved)
             info.push_back("INFO Hy4 expert placement: " + std::to_string(moved) +
-                           " VRAM slots reassigned between layers by the routing profile");
+                           " VRAM slots reassigned between layers by routing" + (measured ? " and measured miss costs" : ""));
     }
     size_t layer_bytes(int il) const {
         size_t b = 0;
@@ -4482,6 +4534,7 @@ struct Model::Impl {
         }
         hot_init();
         history_init();
+        cost_init();
         place_profile_slots();
         // the host's parts: the token embeddings and the Engram table, read in place
         const Tensor* te = need("token_embd.weight", err);
@@ -7077,9 +7130,8 @@ struct Model::Impl {
                     hot.score[(size_t) il * g.n_expert + e] = (float) (c[e] / sum * g.n_used * 256.0);
             }
     }
-    void history_init() {
-        const char* enabled = std::getenv("HY4_HISTORY");
-        if (!g.full || tp > 1 || !hot.on || (enabled && std::atoi(enabled) == 0)) return;
+    uint64_t model_identity() {
+        if (identity_) return identity_;
         uint64_t identity = 1469598103934665603ull;
         auto hash = [&](const void* p, size_t n) {
             for (const auto* b = (const uint8_t*) p; n--; ++b) identity = (identity ^ *b) * 1099511628211ull;
@@ -7091,7 +7143,55 @@ struct Model::Impl {
             hash(tensor.ne.data(), tensor.ne.size() * sizeof(int64_t));
             hash(pk.data(tensor), std::min<size_t>(32, tensor.bytes));
         }
-        history = std::make_unique<ExpertHistory>(identity, g.n_layer, g.n_expert);
+        identity_ = identity;
+        return identity_;
+    }
+    void cost_init() {
+        const char* enabled = std::getenv("HY4_COST_CACHE");
+        if (!g.full || tp > 1 || (enabled && std::atoi(enabled) == 0)) return;
+        costs = std::make_unique<ExpertCosts>(g.n_layer, draft_key(o) + "|weights=" + std::to_string(model_identity()));
+        cost_timing.resize((size_t) g.n_layer);
+        const char* path = std::getenv("HY4_COST_FILE");
+        cost_file = path && *path ? path : o.pack + "/expert-costs.txt";
+        costs->load(cost_file);
+        info.push_back("INFO Hy4 expert costs: " + std::to_string(costs->ready_layers()) +
+                       " measured layers from " + cost_file + "; promotions account for CPU and copy time");
+    }
+    void cost_collect() {
+        if (!costs) return;
+        int previous = -1, device = -1;
+        for (size_t il = 0; il < cost_timing.size(); ++il) {
+            auto& timing = cost_timing[il];
+            if (!timing.pending) continue;
+            if (previous < 0 && cudaGetDevice(&previous) != cudaSuccess) previous = -1;
+            const int next = G[(size_t) L[il].gpu].dev;
+            if (next != device) { cudaSetDevice(next); device = next; }
+            if (cudaEventQuery(timing.end) == cudaSuccess) {
+                float ms = 0;
+                if (cudaEventElapsedTime(&ms, timing.begin, timing.end) == cudaSuccess)
+                    costs->gpu((int) il, ms, timing.entries);
+                timing.pending = false;
+            }
+        }
+        if (previous >= 0 && device != previous) cudaSetDevice(previous);
+    }
+    void cost_begin(const Layer& l, Gpu& gp) {
+        if (!cost_sample || l.il >= g.n_layer) return;
+        auto& timing = cost_timing[(size_t) l.il];
+        if (!timing.begin) {
+            if (cudaEventCreate(&timing.begin) != cudaSuccess || cudaEventCreate(&timing.end) != cudaSuccess) {
+                if (timing.begin) cudaEventDestroy(timing.begin);
+                timing.begin = timing.end = nullptr;
+                (void) cudaGetLastError();
+                return;
+            }
+        }
+        cudaEventRecord(timing.begin, gp.s);
+    }
+    void history_init() {
+        const char* enabled = std::getenv("HY4_HISTORY");
+        if (!g.full || tp > 1 || !hot.on || (enabled && std::atoi(enabled) == 0)) return;
+        history = std::make_unique<ExpertHistory>(model_identity(), g.n_layer, g.n_expert);
         const char* file = std::getenv("HY4_HISTORY_FILE");
         history_file = file && *file ? file : o.pack + "/expert-history.bin";
         const char* learn = std::getenv("HY4_HISTORY_LEARN");
@@ -7200,6 +7300,7 @@ struct Model::Impl {
         std::vector<Sw> plan;
         size_t wanted = 0;
         std::vector<int> res, cpu;
+        const bool cost_aware = costs && costs->ready_layers();
         for (Layer& l : lane_layers()) {
             if (!l.partial() || l.il >= g.n_layer) continue;
             float* sc = hot.score.data() + (size_t) l.il * g.n_expert;
@@ -7214,9 +7315,18 @@ struct Model::Impl {
             for (int e = 0; e < g.n_expert; ++e) (l.slot_of[(size_t) e] >= 0 ? res : cpu).push_back(e);
             std::stable_sort(res.begin(), res.end(), [&](int a, int b) { return sc[a] < sc[b]; });
             std::stable_sort(cpu.begin(), cpu.end(), [&](int a, int b) { return sc[a] > sc[b]; });
+            const double total = std::accumulate(sc, sc + g.n_expert, 0.0);
             for (size_t i = 0; i < res.size() && i < cpu.size(); ++i) {
                 if (sc[cpu[i]] <= (float) hot.ratio * sc[res[i]] + (float) hot.margin) break;
-                plan.push_back({sc[cpu[i]] - sc[res[i]], l.il, res[i], cpu[i]});
+                double gain = sc[cpu[i]] - sc[res[i]];
+                if (cost_aware) {
+                    if (!costs->ready(l.il)) continue;
+                    const double copy = costs->copy_ms(l.blob, copy_gbs, G[(size_t) l.gpu].h2d_gbs,
+                                                       l.prompt_ram && l.prompt_slots[(size_t) cpu[i]] >= 0);
+                    gain = costs->promotion_ms(l.il, gain, total, g.n_used, std::min(512.0, hot.horizon), copy);
+                    if (gain <= 0) continue;
+                }
+                plan.push_back({(float) gain, l.il, res[i], cpu[i]});
             }
         }
         wanted = plan.size();
@@ -7435,70 +7545,135 @@ struct Model::Impl {
         return fx.mode == 2 && l.fx_on ? l.fx_mem : nullptr;
     }
 
-    bool prompt_ram_setup(std::string& err) {
+    int ram_maximum() const {
+        size_t used = 0;
+        for (const auto& l : L) used += l.prompt_ram_bytes;
+        const double reserve = std::max(4.0 * 1073741824.0, 0.1 * (double) ram_total());
+        const char* maximum = std::getenv("HY4_PREFILL_RAM_MAX_GB");
+        const double cap = maximum ? std::atof(maximum) : 64.0;
+        return (int) std::max(0.0, std::min(std::min((double) ram_pin_maximum, cap),
+                                           ((double) ram_available() + used - reserve) / 1e9));
+    }
+    bool prompt_ram_setup(std::string& err, double requested = -1) {
         const char* route_env = std::getenv("HY4_ROUTE");
         const char* stream_env = std::getenv("HY4_STREAM");
         if (route_env && route_env[0] == 'l') return true;
         if ((!route_env || route_env[0] != 's') && stream_env && stream_env[0] == '0') return true;
+        if (!ram_tuning) {
+            std::string key = draft_key(o) + "|weights=" + std::to_string(model_identity()) + "|layout=";
+            for (const auto& l : L) key += std::to_string(l.gpu) + ",";
+            ram_tuning = std::make_unique<RamTuning>(key, (int) L.size());
+            const char* file = std::getenv("HY4_PREFILL_RAM_FILE");
+            ram_tuning_file = file && *file ? file : o.pack + "/prefill-ram-tuning.txt";
+            ram_tuning->load(ram_tuning_file);
+        }
+        const char* limit = std::getenv("HY4_PREFILL_RAM_GB");
+        ram_auto = !limit || std::string(limit) == "auto";
+        char* end = nullptr;
+        const double manual = ram_auto ? 0 : std::strtod(limit, &end);
+        if (!ram_auto && (!end || end == limit || *end)) { err = "invalid HY4_PREFILL_RAM_GB"; return false; }
+        double target = requested >= 0 ? requested : ram_auto ? ram_tuning->initial(ram_maximum()) : manual;
+        if (!std::isfinite(target) || target < 0) { err = "HY4_PREFILL_RAM_GB must be auto or a nonnegative number"; return false; }
+        if (target == ram_configured_gb) return true;
+        if (ram_configured_gb >= 0 && prefill_tuning) prefill_tuning->clear();
+        if (!hot_drain(err)) return false;
         const double reserve = std::max(4.0 * 1073741824.0, 0.1 * (double) ram_total());
-        double budget = (double) ram_available() - reserve;
-        if (const char* limit = std::getenv("HY4_PREFILL_RAM_GB")) budget = std::min(budget, std::atof(limit) * 1e9);
-        if (budget <= 0) return true;
+        size_t held = 0;
+        for (const auto& l : L) held += l.prompt_ram_bytes;
+        while (!ram_pools.empty() && held > target * 1e9) {
+            const auto& pool = ram_pools.back();
+            CK(cudaSetDevice(G[(size_t) head_gpu].dev));
+            CK(cudaHostUnregister(pool.data));
+            ram_free(pool.data, pool.bytes);
+            held -= pool.bytes;
+            for (size_t il : pool.layers) {
+                Layer& l = L[il]; l.prompt_ram = nullptr; l.prompt_ram_bytes = 0; l.prompt_slots.clear();
+            }
+            ram_pools.pop_back();
+        }
+        const double budget = std::max(0.0, std::min((double) ram_available() - reserve, target * 1e9 - held));
+        ram_configured_gb = target;
+        ram_budget_gb = (int) std::min(100000.0, target);
         std::vector<PromptCacheLayer> candidates;
-        std::vector<double> copy_cost;
-        for (const Gpu& gp : G) copy_cost.push_back(1.0 / std::max(0.1, gp.h2d_gbs) + 1.0 / copy_gbs);
+        std::vector<double> copy_cost, fixed(G.size());
+        for (const Gpu& gp : G) copy_cost.push_back(1e-6 * (1.0 / std::max(0.1, gp.h2d_gbs) + 1.0 / copy_gbs));
         for (const Layer& l : L) {
-            const size_t bytes = l.partial() && !prompt_fetch_ram(l) ? (size_t) l.n_lane() * l.blob : 0;
-            candidates.push_back({l.gpu, bytes});
+            const size_t bytes = l.partial() && !l.prompt_ram && !prompt_fetch_ram(l) ? (size_t) l.n_lane() * l.blob : 0;
+            candidates.push_back({l.gpu, bytes, ram_tuning->packing(l.il)});
+            fixed[(size_t) l.gpu] += ram_tuning->fixed(l.il);
         }
         int cached = 0, layers = 0;
-        size_t used = 0;
         const double started = now_s();
-        double last_report = started;
-        for (size_t il : prompt_cache_layers(candidates, copy_cost, (size_t) budget)) {
-            Layer& l = L[il];
-            const size_t bytes = candidates[il].bytes;
-            Gpu& gp = G[(size_t) l.gpu];
-            CK(cudaSetDevice(gp.dev));
-            auto* ram = (uint8_t*) ram_alloc(bytes);
-            if (!ram) break;
-            std::vector<int> experts;
-            l.prompt_slots.assign((size_t) g.n_expert, -1);
-            for (int e = 0; e < g.n_expert; ++e) {
-                if (!l.on_lane(e)) continue;
-                l.prompt_slots[(size_t) e] = (int) experts.size();
-                experts.push_back(e);
-            }
-            lane->parallel_for((int) (3 * experts.size()), [&](int task) {
-                const size_t slot = (size_t) task / 3;
-                pack_expert(l, experts[slot], task % 3, ram + slot * l.blob);
-            });
-            if (cudaHostRegister(ram, bytes, cudaHostRegisterPortable) != cudaSuccess) {
-                (void) cudaGetLastError();
-                ram_free(ram, bytes);
-                l.prompt_slots.clear();
-                break;
-            }
-            l.prompt_ram = ram;
-            l.prompt_ram_bytes = bytes;
-            if (!gp.prompt_copy) {
-                CK(cudaStreamCreateWithFlags(&gp.prompt_copy, cudaStreamNonBlocking));
-                CK(cudaEventCreateWithFlags(&gp.prompt_ready, cudaEventDisableTiming));
-            }
-            used += bytes;
-            cached += (int) experts.size();
-            ++layers;
-            const double now = now_s();
-            if (now - last_report >= 20) {
-                std::fprintf(stderr, "maya-hy4: warming prefill RAM: %.1f GB, %d experts in %d layers after %.0f s\n",
-                             (double) used / 1e9, cached, layers, now - started);
-                last_report = now;
-            }
+        auto selected = prompt_cache_layers(candidates, copy_cost, (size_t) budget, fixed);
+        size_t used = 0;
+        for (size_t il : selected) used += candidates[il].bytes;
+        const bool adding = used > 0;
+        double packed_s = 0, registered_s = 0;
+        if (used) {
+            auto* ram = (uint8_t*) ram_alloc(used);
+            if (ram) {
+                const double pack_start = now_s();
+                double last_report = pack_start;
+                size_t offset = 0;
+                size_t packed_layers = 0;
+                for (size_t il : selected) {
+                    Layer& l = L[il];
+                    std::vector<int> experts;
+                    l.prompt_slots.assign((size_t) g.n_expert, -1);
+                    for (int e = 0; e < g.n_expert; ++e) if (l.on_lane(e)) {
+                        l.prompt_slots[(size_t) e] = (int) experts.size(); experts.push_back(e);
+                    }
+                    lane->parallel_for((int) (3 * experts.size()), [&](int task) {
+                        const size_t slot = (size_t) task / 3;
+                        pack_expert(l, experts[slot], task % 3, ram + offset + slot * l.blob);
+                    });
+                    offset += candidates[il].bytes;
+                    ++packed_layers;
+                    const double report_time = now_s();
+                    if (report_time - last_report >= 20) {
+                        std::fprintf(stderr, "maya-hy4: packing prefill RAM: %.1f of %.1f GB, %zu of %zu layers in %.0f s\n",
+                                     offset / 1e9, used / 1e9, packed_layers, selected.size(), report_time - pack_start);
+                        last_report = report_time;
+                    }
+                }
+                packed_s = now_s() - pack_start;
+                CK(cudaSetDevice(G[(size_t) head_gpu].dev));
+                const double register_start = now_s();
+                const auto status = cudaHostRegister(ram, used, cudaHostRegisterPortable);
+                registered_s = now_s() - register_start;
+                if (status == cudaSuccess) {
+                    ram_pools.push_back({ram, used, selected});
+                    offset = 0;
+                    for (size_t il : selected) {
+                        Layer& l = L[il]; Gpu& gp = G[(size_t) l.gpu];
+                        l.prompt_ram = ram + offset; l.prompt_ram_bytes = candidates[il].bytes;
+                        offset += l.prompt_ram_bytes;
+                        CK(cudaSetDevice(gp.dev));
+                        if (!gp.prompt_copy) {
+                            CK(cudaStreamCreateWithFlags(&gp.prompt_copy, cudaStreamNonBlocking));
+                            CK(cudaEventCreateWithFlags(&gp.prompt_ready, cudaEventDisableTiming));
+                        }
+                    }
+                } else {
+                    (void) cudaGetLastError();
+                    for (size_t il : selected) L[il].prompt_slots.clear();
+                    ram_free(ram, used); used = 0;
+                }
+            } else used = 0;
         }
-        char message[192];
+        if (adding && !used && ram_auto) {
+            ram_pin_maximum = std::max(0, (int) std::ceil(target) - 1);
+            ram_budget_gb = -1; // A refused allocation must not train the requested, larger cache size.
+            std::fprintf(stderr, "maya-hy4: prefill RAM growth refused; automatic trials capped below %.0f GB\n", target);
+        }
+        for (const auto& l : L) if (l.prompt_ram) { cached += (int) (l.prompt_ram_bytes / l.blob); ++layers; }
+        char message[256];
         std::snprintf(message, sizeof message, "INFO Hy4 prefill: %d experts in %d layers cached in %.2f GB of pinned RAM "
-                      "in %.1f s", cached, layers, (double) used / 1e9, now_s() - started);
+                      "in %.1f s", cached, layers, (double) (held + used) / 1e9, now_s() - started);
         info.push_back(message);
+        std::fprintf(stderr, "maya-hy4: prefill RAM cache %.2f GB, budget %.0f GB%s\n",
+                     (held + used) / 1e9, target, ram_auto ? " (auto)" : "");
+        std::fprintf(stderr, "maya-hy4: prefill RAM preparation: packing %.2f s, CUDA registration %.2f s\n", packed_s, registered_s);
         return true;
     }
 
@@ -7908,8 +8083,14 @@ struct Model::Impl {
                 CK(cudaStreamWaitEvent(s, gp.fx_ev1, 0));
                 ok = ok && routed_token(l, gp, T, nullptr, gp.latout, gp.fxs.eptr, fx.mode == 2 ? gp.fxs.who : nullptr);
             } else {
+                if (lane_on && cost_sample) cost_begin(l, gp);
                 ok = ok && routed_token(l, gp, T, slot, gp.latout, nullptr, nullptr,
                                         l.tpm >= 0 && model_sum && !lane_on ? &lat_pre : nullptr, forked);
+                if (lane_on && cost_sample && cost_timing[(size_t) l.il].begin) {
+                    auto& timing = cost_timing[(size_t) l.il];
+                    cudaEventRecord(timing.end, gp.s);
+                    timing.pending = true;
+                }
             }
             if (lane_on && !streamed) {   // (the GPU's experts run meanwhile)
                 k::submit(s);   // (AMD under Windows: they would sit in the queue until the next wait - after the lane's)
@@ -7934,6 +8115,10 @@ struct Model::Impl {
                     cpu_experts(*lane, l.cex, lane_entries, h_lat, T, h_cpu, g.full && T <= W);
                 }
                 const double ms = (now_s() - tc) * 1e3;
+                if (costs && !o.trial && !hot.quiet && T <= W) {
+                    costs->cpu(l.il, ms, (int) lane_entries.size());
+                    if (cost_sample) cost_timing[(size_t) l.il].entries = T * nu - (int) lane_entries.size();
+                }
                 st.cpu_ms += ms;
                 if (prof) prof_acc[T > W ? " lane: the CPU's experts (prompt)" : " lane: the CPU's experts (token)"] += ms * 1e-3;
                 if (T > W && route_side == 0) route_add(l, 0, ms * 1e-3, route_amount);   // (the route's turns)
@@ -8607,6 +8792,8 @@ struct Model::Impl {
             CK(cudaMemcpy(df.embedding, tok_embd, bytes, cudaMemcpyHostToDevice));
             info.push_back("INFO DFly2 device correction: quantized embedding cache " +
                            std::to_string(bytes >> 20) + " MiB; one draft-result transfer per block");
+            if (!hg.alloc(df.control, 1, err)) return false;
+            CK(cudaMallocHost(&df.h_control, sizeof(DflyControl)));
         }
         df.vram = std::accumulate(G.begin(), G.end(), size_t{0}, [](size_t sum, const Gpu& gp) { return sum + gp.used; }) - used0;
         df.on = true;
@@ -8654,6 +8841,87 @@ struct Model::Impl {
     // draft from its row's state, corrected by the token before it; stops after a draft below `floor`.  The block's
     // latent rows go into the trunk layers' caches at pos .. pos + n: the trunk rewrites a position's row before it
     // reads it, so they are never read by it.
+    bool dfly_correct(int step, const float* prev, float* result, std::string& err) {
+        Gpu& hg = G[(size_t) head_gpu];
+        const int E = g.n_embd, ci = df.c_gate.n;
+        const float* hrow = df.h + (size_t) (step + 1) * E;
+        k::rmsnorm(hrow, E, 1, E, df.c_hnorm, g.eps, df.in, 2 * (size_t) E, hg.s);
+        k::rmsnorm(prev, E, 1, E, df.c_enorm, g.eps, df.in + E, 2 * (size_t) E, hg.s);
+        bool ok = mm_multi(hg, {{&df.c_gate, df.cg, (size_t) ci}, {&df.c_up, df.cg + ci, (size_t) ci}},
+                           df.in, 2 * (size_t) E, 1);
+        k::swiglu(df.cg, df.cg + ci, (size_t) ci, 1, ci, df.ch, (size_t) ci, hg.s);
+        ok = ok && mm(hg, df.c_down, df.ch, (size_t) ci, 1, df.t, E);
+        k::add(df.t, hrow, (size_t) E, hg.s);
+        ok = ok && mm(hg, out_draft, df.t, E, 1, hg.logits, g.n_vocab);
+        if (!ok) { err = "DFly2 correction / head: unsupported GEMV"; return false; }
+        k::top1(hg.logits, g.n_vocab, result, hg.s);
+        return true;
+    }
+    bool dfly_device_step(int step, std::string& err) {
+        if (step && !iq::embed_rows(tok_type, df.embedding, tok_ld, (const int*) (df.top + 2 * (step - 1)),
+                                    1, g.n_embd, g.n_vocab, df.t, G[(size_t) head_gpu].s)) {
+            err = "DFly2: device embedding decoder failed";
+            return false;
+        }
+        return dfly_correct(step, step ? df.t : df.e0, df.top + 2 * step, err);
+    }
+    bool dfly_graph_build(int count) {
+#if !defined(MAYA_USE_HIP) && CUDART_VERSION >= 13000
+        Gpu& hg = G[(size_t) head_gpu];
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        cudaStream_t capture = nullptr;
+        cudaError_t status = cudaGraphCreate(&graph, 0);
+        if (status == cudaSuccess) status = cudaStreamCreateWithFlags(&capture, cudaStreamNonBlocking);
+        cudaGraphNode_t previous = nullptr;
+        const auto saved_stream = hg.s;
+        for (int step = 0; status == cudaSuccess && step < count; ++step) {
+            cudaGraphConditionalHandle handle{};
+            status = cudaGraphConditionalHandleCreate(&handle, graph, 0, cudaGraphCondAssignDefault);
+            if (status != cudaSuccess) break;
+            cudaKernelNodeParams kernel{};
+            int vocab = g.n_vocab;
+            void* args[] = {&handle, &df.top, &df.control, &step, &vocab};
+            kernel.func = (void*) dfly_condition;
+            kernel.gridDim = dim3(1); kernel.blockDim = dim3(1); kernel.kernelParams = args;
+            cudaGraphNode_t decide = nullptr, conditional = nullptr;
+            status = cudaGraphAddKernelNode(&decide, graph, previous ? &previous : nullptr, previous ? 1 : 0, &kernel);
+            if (status != cudaSuccess) break;
+            cudaGraphNodeParams node{};
+            node.type = cudaGraphNodeTypeConditional;
+            node.conditional.handle = handle;
+            node.conditional.type = cudaGraphCondTypeIf;
+            node.conditional.size = 1;
+            status = cudaGraphAddNode(&conditional, graph, &decide, nullptr, 1, &node);
+            if (status != cudaSuccess) break;
+            status = cudaStreamBeginCaptureToGraph(capture, node.conditional.phGraph_out[0], nullptr, nullptr, 0,
+                                                   cudaStreamCaptureModeThreadLocal);
+            if (status != cudaSuccess) break;
+            hg.s = capture;
+            std::string error;
+            const bool ok = dfly_device_step(step, error);
+            hg.s = saved_stream;
+            cudaGraph_t ended = nullptr;
+            status = cudaStreamEndCapture(capture, &ended);
+            if (!ok && status == cudaSuccess) status = cudaErrorInvalidValue;
+            previous = conditional;
+        }
+        hg.s = saved_stream;
+        if (status == cudaSuccess) status = cudaGraphInstantiate(&exec, graph, 0);
+        if (capture) cudaStreamDestroy(capture);
+        if (status == cudaSuccess) {
+            df.correction_graph[(size_t) count] = graph;
+            df.correction_exec[(size_t) count] = exec;
+            return true;
+        }
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+        std::fprintf(stderr, "maya-hy4: DFly2 conditional graph unavailable (%s); using direct correction\n",
+                     cudaGetErrorString(status));
+        (void) cudaGetLastError();
+#endif
+        return false;
+    }
     bool dfly_draft(int tok, int64_t pos, int n, float floor, std::vector<int>& d, std::vector<float>& conf,
                     std::string& err) {
         d.clear();
@@ -8754,35 +9022,35 @@ struct Model::Impl {
         // The quantized embedding cache lets later correction steps consume the previous device top1 directly.
         const char* device_setting = std::getenv("HY4_DFLY_DEVICE");
         const bool device_chain = df.embedding && n > 1 && !dmp && !(device_setting && std::atoi(device_setting) == 0);
-        // each draft: its row's state corrected by the token before it, then the head
-        for (int i = 0; i < n; ++i) {
-            const float* hrow = df.h + (size_t) (i + 1) * E;
-            const float* prev = df.e0;
-            if (i > 0) {
-                if (device_chain) {
-                    if (!iq::embed_rows(tok_type, df.embedding, tok_ld, (const int*) (df.top + 2 * (i - 1)),
-                                        1, E, g.n_vocab, df.t, s)) {
-                        err = "DFly2: device embedding decoder failed";
-                        return false;
-                    }
-                } else {
+        const char* early = std::getenv("HY4_DFLY_EARLY");
+        bool graphed = false;
+        if (device_chain && df.control && !(early && std::atoi(early) == 0)) {
+            if (!df.graph_tried) {
+                df.graph_tried = true;
+                for (int count = 2; count <= std::min(df.n_def, W - 1); ++count) dfly_graph_build(count);
+                if (df.correction_exec[(size_t) n])
+                    std::fprintf(stderr, "maya-hy4: DFly2 correction uses per-width conditional CUDA graphs\n");
+            }
+            if (df.correction_exec[(size_t) n]) {
+                *df.h_control = {n, floor, 0};
+                CK(cudaMemcpyAsync(df.control, df.h_control, sizeof(DflyControl), cudaMemcpyHostToDevice, s));
+                CK(cudaGraphLaunch(df.correction_exec[(size_t) n], s));
+                graphed = true;
+            }
+        }
+        for (int i = 0; !graphed && i < n; ++i) {
+            if (device_chain) {
+                if (!dfly_device_step(i, err)) return false;
+            } else {
+                const float* prev = df.e0;
+                if (i > 0) {
                     tok_row(tok_type, tok_embd + (size_t) d.back() * tok_ld, E, df.h_emb);
                     CK(cudaMemcpyAsync(df.t, df.h_emb, rb, cudaMemcpyHostToDevice, s));
+                    prev = df.t;
                 }
-                prev = df.t;
+                if (!dfly_correct(i, prev, df.top, err)) return false;
             }
-            k::rmsnorm(hrow, E, 1, E, df.c_hnorm, g.eps, df.in, 2 * (size_t) E, s);
-            k::rmsnorm(prev, E, 1, E, df.c_enorm, g.eps, df.in + E, 2 * (size_t) E, s);
-            ok = mm_multi(hg, {{&df.c_gate, df.cg, (size_t) ci}, {&df.c_up, df.cg + ci, (size_t) ci}}, df.in, 2 * (size_t) E, 1);
-            k::swiglu(df.cg, df.cg + ci, (size_t) ci, 1, ci, df.ch, (size_t) ci, s);
-            ok = ok && mm(hg, df.c_down, df.ch, (size_t) ci, 1, df.t, E);
-            k::add(df.t, hrow, (size_t) E, s);
-            ok = ok && mm(hg, out_draft, df.t, E, 1, hg.logits, g.n_vocab);
-            if (!ok) {
-                err = "the DFly2 drafter's correction / head: a GEMV the kernels do not take";
-                return false;
-            }
-            k::top1(hg.logits, g.n_vocab, df.top + (device_chain ? 2 * i : 0), s);
+            ++st.draft_heads;
             if (device_chain) continue;
             float r[2];
             CK(cudaMemcpyAsync(r, df.top, sizeof r, cudaMemcpyDeviceToHost, s));
@@ -8798,7 +9066,9 @@ struct Model::Impl {
         if (device_chain) {
             float result[2 * W];
             CK(cudaMemcpyAsync(result, df.top, sizeof(float) * 2 * n, cudaMemcpyDeviceToHost, s));
+            if (graphed) CK(cudaMemcpyAsync(df.h_control, df.control, sizeof(DflyControl), cudaMemcpyDeviceToHost, s));
             CK(cudaStreamSynchronize(s));
+            if (graphed) { st.draft_heads += df.h_control->executed; st.draft_skipped += n - df.h_control->executed; }
             for (int i = 0; i < n; ++i) {
                 int id;
                 std::memcpy(&id, result + 2 * i, sizeof id);
@@ -9053,9 +9323,18 @@ struct Model::Impl {
         const char* requested_chunk = std::getenv("HY4_PREFILL_CHUNK");
         int C = requested_chunk && *requested_chunk ? std::atoi(requested_chunk) :
                 tuning_enabled ? prefill_tuning->choose(n, Tc, placement) : Tc;
+        if ((!requested_chunk || !*requested_chunk) && ram_auto && ram_tuning && ram_maximum() >= 8 && !ram_tuning->calibrated(ram_maximum()))
+            C = std::min(2048, Tc);
         if (C <= W || C > Tc) { err = "HY4_PREFILL_CHUNK must be between 17 and --chunk"; return false; }
         if (n <= C || (n % C != 0 && n % C <= W)) return true;
+        if (!o.trial && !hot.quiet && ram_tuning) {
+            const char* limit = std::getenv("HY4_PREFILL_RAM_GB");
+            const bool automatic = !limit || std::string(limit) == "auto";
+            const double budget = automatic ? ram_tuning->choose(n, C, ram_maximum()) : -1;
+            if (!prompt_ram_setup(err, budget)) return false;
+        }
         const bool measuring = tuning_enabled && !o.trial && !hot.quiet && (C == 512 || C == 1024 || C == 2048);
+        const bool layer_measuring = !o.trial && !hot.quiet && (measuring || (ram_tuning && ram_configured_gb > 0));
         const size_t E = (size_t) g.n_embd;
         const size_t hidden_row = E * g.hc * sizeof(float);
         const size_t key_row = (size_t) (g.ix_top_k + 1) * sizeof(int);
@@ -9079,6 +9358,7 @@ struct Model::Impl {
             PromptStage context;
             std::unique_ptr<Trace[]> traces;
             std::unique_ptr<Trace[]> layers;
+            std::vector<double> pack_layer;
         };
         std::vector<Stage> stages;
         for (size_t begin = 0, end = 0; begin < L.size(); begin = end) {
@@ -9108,8 +9388,9 @@ struct Model::Impl {
         const double setup_started = now_s();
         for (Stage& stage : stages) {
             Gpu& gp = G[(size_t) stage.gpu];
-            if (measuring) {
+            if (layer_measuring) {
                 CK(cudaSetDevice(gp.dev));
+                stage.pack_layer.resize(stage.end - stage.begin);
                 stage.layers.reset(new Trace[stage.end - stage.begin]);
                 for (size_t il = stage.begin; il < stage.end; ++il) {
                     Trace& trace = stage.layers[il - stage.begin];
@@ -9246,9 +9527,13 @@ struct Model::Impl {
                 for (size_t il = stage.begin; il < stage.end; ++il) {
                     Layer& l = L[il];
                     Trace* measured = stage.layers && chunk == sample_chunk ? &stage.layers[il - stage.begin] : nullptr;
+                    const double packed_before = stage.context.stats.stream_ms;
                     if (measured) { measured->tokens = T; CK(cudaEventRecord(measured->events[2], gp.s)); }
                     if (!attention(l, gp, T, p, err) || !ffn(l, gp, T, err)) return false;
-                    if (measured) CK(cudaEventRecord(measured->events[3], gp.s));
+                    if (measured) {
+                        CK(cudaEventRecord(measured->events[3], gp.s));
+                        stage.pack_layer[il - stage.begin] = stage.context.stats.stream_ms - packed_before;
+                    }
                 }
                 if (trace) CK(cudaEventRecord(trace->events[3], gp.s));
                 if (stage.output) {
@@ -9308,19 +9593,31 @@ struct Model::Impl {
             if (err.empty()) err = "Hy4: a prefill pipeline stage failed";
             return false;
         }
-        if (measuring) {
+        if (layer_measuring) {
             for (const Stage& stage : stages) {
                 CK(cudaSetDevice(G[(size_t) stage.gpu].dev));
                 for (size_t il = stage.begin; il < stage.end; ++il) {
                     const Trace& trace = stage.layers[il - stage.begin];
                     float ms = 0;
                     CK(cudaEventElapsedTime(&ms, trace.events[2], trace.events[3]));
-                    prefill_tuning->observe(C, stage.gpu, (int) il, ms * C / std::max(1, trace.tokens), L[il].n_res);
+                    const double scaled = ms * C / std::max(1, trace.tokens);
+                    if (measuring) prefill_tuning->observe(C, stage.gpu, (int) il, scaled, L[il].n_res);
+                    if (ram_tuning) ram_tuning->layer((int) il, stage.pack_layer[il - stage.begin], scaled);
                 }
             }
-            prefill_tuning->observe_pipeline(C, n, placement, (now_s() - pipeline_started) * 1e3);
+        }
+        const double elapsed_ms = (now_s() - pipeline_started) * 1e3;
+        if (measuring) {
+            prefill_tuning->observe_pipeline(C, n, placement, elapsed_ms);
             if (!prefill_tuning->save(prefill_tuning_file))
                 std::fprintf(stderr, "maya-hy4: could not save prefill timings to %s\n", prefill_tuning_file.c_str());
+        }
+        if (ram_tuning && !o.trial && !hot.quiet && pos0 <= C) {
+            ram_tuning->observe(ram_budget_gb, n, C, elapsed_ms, ram_maximum());
+            if (ram_auto && prefill_tuning && ram_tuning->initial(ram_maximum()) != ram_budget_gb) {
+                prefill_tuning->clear();
+                if (measuring) prefill_tuning->save(prefill_tuning_file);
+            }
         }
         if (pipeline_timing) {
             std::fprintf(stderr, "maya-hy4: prefill pipeline timing: tokens=%d chunk=%d setup_ms=%.2f pipeline_ms=%.2f\n",
@@ -10682,7 +10979,7 @@ bool Model::load(const Options& o, std::string& err) {
             ok = false;
         }
     }
-    if (ok && has_mtp()) {
+    if (ok && has_draft() && !(has_dfly2() && m->dfly_dump)) {
         std::vector<int> d;
         std::vector<float> c;
         const int bad0 = m->n_bad_drafts;
@@ -10739,6 +11036,8 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
         err = "logits of at most " + std::to_string(W) + " positions a call";
         return false;
     }
+    m->cost_collect();
+    m->cost_sample = m->costs && !m->o.trial && !m->hot.quiet && n <= W && (++m->cost_tick % 32 == 1);
     m->tops_n = 0;
     // (HY4_HOT: the last token window's rows before pos0 were kept - their routes count - the others are read again
     //  or were drafts not kept; this one's rows wait until the next forward or decode boundary says which are kept)
@@ -10860,7 +11159,7 @@ int gpus_of(const Options& o) {
 }
 
 std::string draft_key(const Options& o) {
-    std::string d = "Hy4 drafting v3|";
+    std::string d = "Hy4 drafting v4|";
     char buf[512];
     int drv = 0, n = 0;
     (void) cudaDriverGetVersion(&drv);
@@ -10890,7 +11189,7 @@ std::string draft_key(const Options& o) {
                   o.kv_streaming, (long long) o.kv_resident, o.vision ? 1 : 0, split.c_str(), o.gpu_fetch.c_str(),
                   hot ? hot : "");
     d += buf;
-    for (const char* name : {"HY4_STAGE_SLOTS", "HY4_DFLY_ADAPT", "HY4_DFLY_DEVICE", "HY4_DFLY_EMBED_MIB"}) {
+    for (const char* name : {"HY4_STAGE_SLOTS", "HY4_DFLY_ADAPT", "HY4_DFLY_DEVICE", "HY4_DFLY_EMBED_MIB", "HY4_DFLY_EARLY", "HY4_COST_CACHE", "HY4_PROFILE_SLOTS", "HY4_PREFILL_RAM_GB"}) {
         const char* value = std::getenv(name);
         d += std::string("|") + name + "=" + (value ? value : "default");
     }
@@ -10924,6 +11223,11 @@ void Model::unpin(void* p) {
     if (p && cudaHostUnregister(p) != cudaSuccess) (void) cudaGetLastError();
 }
 bool Model::save_profile(std::string& err) const {
+    m->cost_collect();
+    if (m->ram_tuning && !m->o.trial && !m->ram_tuning->save(m->ram_tuning_file))
+        std::fprintf(stderr, "maya-hy4: could not save prefill RAM tuning to %s\n", m->ram_tuning_file.c_str());
+    if (m->costs && !m->o.trial && m->costs->ready_layers() && !m->costs->save(m->cost_file))
+        std::fprintf(stderr, "maya-hy4: could not save expert costs to %s\n", m->cost_file.c_str());
     m->history_checkpoint(true);
     if (m->history) m->history->finish();
     if (!m->hot_save(err)) return false;   // (HY4_HOT's scores, with the profile)

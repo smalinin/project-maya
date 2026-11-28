@@ -11624,6 +11624,7 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     env = {**(old.get("env") or {}), "HY4_HOT_LEARN": "1", **parse_env(a.env)}
     if full:
         env.setdefault("HY4_LANE_WARM", "1")
+        env.setdefault("HY4_PREFILL_RAM_GB", "auto")
     if rmark is not None:
         rmark[0](env, *rmark[1:])
     cfg["env"] = env

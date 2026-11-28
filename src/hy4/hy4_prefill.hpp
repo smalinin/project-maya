@@ -30,6 +30,7 @@ public:
     struct Sample { double ms = 0; int slots = 0, observations = 0; };
     PrefillTuning(int layers, int gpus, std::string key)
         : layers_(layers), gpus_(gpus), key_(std::move(key)), samples_(3 * layers * gpus) {}
+    void clear() { std::fill(samples_.begin(), samples_.end(), Sample{}); pipeline_ = {}; }
     bool load(const std::string& file) {
         std::ifstream in(file);
         std::string magic, key;

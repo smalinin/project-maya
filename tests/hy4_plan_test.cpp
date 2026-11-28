@@ -6,6 +6,8 @@
 #include "../src/hy4/hy4_draft.hpp"
 #include "../src/hy4/hy4_history.hpp"
 #include "../src/hy4/hy4_prefill.hpp"
+#include "../src/hy4/hy4_cost.hpp"
+#include "../src/hy4/hy4_ram.hpp"
 
 #include <cstdio>
 #include <chrono>
@@ -39,6 +41,73 @@ hy4::KvPick pick(Card& c, int kv, bool vision, bool vision_auto, long long n_min
 }  // namespace
 
 int main() {
+    {
+        hy4::AdaptiveDraft joint(3, 6, true, 0.55f, true);
+        int best = 0, off = 0, one = 0;
+        for (int i = 0; i < 800; ++i) {
+            const int n = joint.width(); const float floor = joint.floor();
+            CHECK(n >= 0 && n <= 5 && floor >= 0 && floor <= 1);
+            off += n == 0; one += n == 1;
+            best += n == 3 && floor == 0.8f;
+            const int accepted = floor == 0.8f && n <= 3 ? n : 0;
+            joint.observe(n, n, accepted, n ? 6 + 2 * n : 10);
+        }
+        CHECK(best > 600 && off > 0 && one > 0);
+        hy4::AdaptiveDraft plain(3, 6, true, 0.55f, true);
+        int no_draft = 0;
+        for (int i = 0; i < 400; ++i) {
+            const int n = plain.width(); no_draft += n == 0;
+            plain.observe(n, n, 0, n ? 15 : 4);
+        }
+        CHECK(no_draft > 280);
+        hy4::AdaptiveDraft confidence(3, 6, true, 0.4f, true, false);
+        for (int i = 0; i < 50; ++i) {
+            CHECK(confidence.floor() == 0.4f);
+            confidence.observe(confidence.width(), 0, 0, 1);
+        }
+    }
+    {
+        const auto path = std::filesystem::temp_directory_path() /
+            ("hy4-cost-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        hy4::ExpertCosts costs(2, "fixture");
+        for (int i = 0; i < 4; ++i) { costs.cpu(0, 4, 2); costs.cpu(1, 0.2, 2); }
+        costs.gpu(0, 0.1, 2); costs.gpu(1, 0.02, 2);
+        CHECK(costs.ready_layers() == 2 && costs.miss_ms(0) > costs.miss_ms(1));
+        CHECK(costs.promotion_ms(0, 5, 100, 8, 128, 1) > costs.promotion_ms(1, 10, 100, 8, 128, 1));
+        CHECK(costs.promotion_ms(1, 0.001, 100, 8, 128, 100) < 0);
+        CHECK(std::abs(costs.copy_ms(100000000, 10, 10, false) - 20) < 1e-6);
+        CHECK(std::abs(costs.copy_ms(100000000, 10, 10, true) - 30) < 1e-6);
+        CHECK(costs.save(path.string()));
+        hy4::ExpertCosts restored(2, "fixture"), wrong(2, "different hardware");
+        CHECK(restored.load(path.string()) && restored.ready_layers() == 2);
+        CHECK(!wrong.load(path.string()));
+        std::filesystem::remove(path);
+    }
+    {
+        hy4::RamTuning ram("fixture", 2);
+        ram.observe(8, 4095, 2048, 90000); // Cold prompt is not a calibration sample.
+        CHECK(ram.choose(4095, 2048, 64) == 8);
+        for (const auto& pair : std::vector<std::pair<int, int>>{{8, 32000}, {16, 20000}, {32, 18000}, {64, 17800}}) {
+            CHECK(ram.choose(4095, 2048, 64) == pair.first);
+            for (int i = 0; i < 2; ++i) ram.observe(pair.first, 4095, 2048, pair.second);
+        }
+        CHECK(ram.calibrated(64) && ram.initial(64) == 32); // Smallest cache within 3% of the fastest.
+        CHECK(ram.choose(4095, 2048, 64) == 32 && ram.initial(16) == 16 && ram.initial(0) == 0);
+        ram.observe(32, 8192, 2048, 50000); // A different prompt shape must not reset a completed calibration.
+        CHECK(ram.initial(64) == 32);
+        ram.layer(0, 50, 100); ram.layer(0, 0, 20);
+        CHECK(ram.packing(0) == 50 && ram.fixed(0) == 50);
+        const auto file = std::filesystem::temp_directory_path() /
+            ("hy4-ram-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        CHECK(ram.save(file.string()));
+        hy4::RamTuning restored("fixture", 2), wrong("other hardware", 2);
+        CHECK(restored.load(file.string()) && restored.initial(64) == 32 && restored.packing(0) == 50);
+        CHECK(!wrong.load(file.string()));
+        std::filesystem::remove(file);
+        const std::vector<hy4::PromptCacheLayer> layers{{0, 4, 1}, {1, 4, 10}};
+        CHECK(hy4::prompt_cache_layers(layers, {1, 1}, 4) == std::vector<size_t>{1});
+        CHECK(hy4::prompt_cache_layers(layers, {1, 1}, 4, {15, 0}) == std::vector<size_t>{0});
+    }
     {
         const std::vector<int> placement{0, 0, 0, 1, 1, 1}, slots(6, 10);
         hy4::PrefillTuning tuning(6, 2, "fixture");

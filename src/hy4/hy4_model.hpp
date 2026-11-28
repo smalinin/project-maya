@@ -96,6 +96,7 @@ struct Stats {
     double cpu_ms = 0;                       // the CPU lane's time
     int64_t streamed = 0;                    // experts a prompt's chunks copied to the GPUs (not in VRAM)
     double stream_ms = 0;                    // ... their copies into the pinned bounce
+    int64_t draft_heads = 0, draft_skipped = 0; // correction heads run and skipped by device confidence checks
 };
 
 class Model {
