@@ -2433,6 +2433,11 @@ files you already have (checked by size and sha256). The model runs on an engine
 (contributed by [@needmorevram](https://github.com/needmorevram), #1040): NVIDIA GPUs (CUDA) from the V100 on, Linux
 and Windows, and AMD GPUs (HIP; its AMD build contributed by [@Cass67](https://github.com/Cass67)) on Linux.
 
+Hy4 and Hy4-Flash's HC matrices (`hc_attn_fn`, `hc_ffn_fn`, `output_hc_fn`) are decoded once into F32 at load.
+F32, F16, BF16 and the pack's quantized types with ggml scalar decoders are accepted, including Q8_0 builds that
+quantize HC weights. Both HC kernel layouts use the decoded values, and the VRAM planner counts their F32 size.
+The original GGUF files are unchanged.
+
 On full Hy4, each GPU's prefill staging buffer uses 32, 64 or 128 experts sized for the largest streamed expert on
 that GPU. The engine measures upload bandwidth once per GPU, driver and expert size, and picks the smallest
 buffer within 5% of the fastest measured bandwidth. The choice is saved in `<pack>/staging.txt`.

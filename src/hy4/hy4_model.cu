@@ -18,6 +18,7 @@
 #include "hy4_lane.hpp"
 #include "hy4_tp.hpp"
 #include "hy4_pack.hpp"
+#include "hy4_hc.hpp"
 #include "hy4_plan.hpp"
 #include "hy4_ring.hpp"
 #include "hy4_history.hpp"
@@ -1204,28 +1205,20 @@ struct Model::Impl {
         p = (float*) v;
         return true;
     }
-    // an F32 tensor of rows x cols values uploaded by column - [cols][rows]: the hyper-connections' weights by element
-    // (hc_pre / hc_head's fn_by_element; hc_el: whether the rows allow it - a multiple of 4)
-    bool f32_by_col(Gpu& gp, const std::string& n, float*& p, std::string& err, int rows, int cols) {
+    bool hc_el() const { return g.hc % 4 == 0 && !std::getenv("HY4_HC_ROWS"); }
+    // Decode HC weights once, then upload the F32 layout selected by hc_pre / hc_head.
+    bool hc_fn(Gpu& gp, const std::string& n, float*& p, std::string& err, int rows) {
         const Tensor* t = need(n, err);
         if (!t) return false;
-        if (t->type != "F32" || t->bytes != (size_t) rows * (size_t) cols * 4) {
-            err = n + ": not F32 of " + std::to_string((int64_t) rows * cols) + " values";
+        std::vector<float> h;
+        if (!decode_hc_weights(pk.data(*t), t->bytes, type_id(t->type), t->ne,
+                               rows, g.hc * g.n_embd, hc_el(), h, err)) {
+            err = n + ": " + t->type + ": " + err;
             return false;
         }
-        std::vector<float> h((size_t) rows * (size_t) cols);
-        const uint8_t* src = pk.data(*t);
-        for (int r = 0; r < rows; ++r)
-            for (int c = 0; c < cols; ++c)
-                std::memcpy(&h[(size_t) c * rows + r], src + ((size_t) r * cols + c) * 4, 4);
         if (!gp.alloc(p, h.size(), err)) return false;
         CK(cudaMemcpy(p, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
         return true;
-    }
-    bool hc_el() const { return g.hc % 4 == 0 && !std::getenv("HY4_HC_ROWS"); }
-    bool hc_fn(Gpu& gp, const std::string& n, float*& p, std::string& err, int rows) {
-        return hc_el() ? f32_by_col(gp, n, p, err, rows, g.hc * g.n_embd)
-                       : f32(gp, n, p, err, (int64_t) rows * g.hc * g.n_embd);
     }
     bool mat(Gpu& gp, const std::string& n, Mat& m, std::string& err, int k = -1, int nout = -1, int batch = 1,
              int rope_block = 0) {
@@ -1748,13 +1741,19 @@ struct Model::Impl {
                                           (double) ring * 2 * g.ix_dim * pb;
         return b / 1e9;
     }
+    size_t tensor_vram_bytes(const Tensor& t, bool widen_bf16 = false) const {
+        if (t.name.find(".hc_attn_fn.weight") != std::string::npos ||
+            t.name.find(".hc_ffn_fn.weight") != std::string::npos || t.name == "output_hc_fn.weight")
+            return (size_t) t.n(0) * (size_t) t.n(1) * sizeof(float);
+        return t.bytes * (widen_bf16 && t.type == "BF16" ? 2 : 1);
+    }
     // a layer's VRAM without its routed experts (its dense matrices and caches), and an expert's (its blob)
     size_t dense_bytes(int il) const {
         size_t b = 0;
         const std::string pre = "blk." + std::to_string(il) + ".";
         for (const auto& [n, t] : pk.t)
             if (n.compare(0, pre.size(), pre) == 0 && n.find("_exps.") == std::string::npos)
-                b += t.bytes + 256 + (il < g.n_layer && t.type == "BF16" ? t.bytes : 0);   // (BF16: F32 in VRAM, mat())
+                b += tensor_vram_bytes(t, il < g.n_layer) + 256;
         if (g.full) {
             b += (size_t) o.max_ctx * kv_rb() + full_index_bytes(il);
             if (df_room && !df.layer_plan.empty()) b += df.layer_plan[(size_t) il];
@@ -1830,9 +1829,7 @@ struct Model::Impl {
         const std::string pre = "blk." + std::to_string(il) + ".";
         for (const auto& [n, t] : pk.t)
             if (n.compare(0, pre.size(), pre) == 0) {
-                b += t.bytes + 256;
-                // (a trunk layer's BF16 matrices sit in VRAM as F32 - mat(); the MTP block's are rounded to Q8_0)
-                if (il < g.n_layer && t.type == "BF16" && n.find("_exps.") == std::string::npos) b += t.bytes;
+                b += tensor_vram_bytes(t, il < g.n_layer && n.find("_exps.") == std::string::npos) + 256;
             }
         // caches
         if (g.full) b += (size_t) o.max_ctx * kv_rb() + full_index_bytes(il);
@@ -2961,7 +2958,8 @@ struct Model::Impl {
                 for (const char* x : split) sp |= rest == x;
                 const bool half = rest == "ffn_gate_inp.weight" && narrowable(n);   // (kept as BF16: mat_narrow)
                 b += ex ? (experts ? (double) t.bytes * expert_share(il, 1) * 1.02 + 4096 : 0.0)
-                        : sp ? (double) t.bytes / N * 1.02 + 4096 : (double) t.bytes * (half ? 0.5 : 1.0) + 256;
+                        : sp ? (double) t.bytes / N * 1.02 + 4096
+                             : (double) tensor_vram_bytes(t) * (half ? 0.5 : 1.0) + 256;
             }
             if (g.swa[(size_t) il]) b += (double) ring * kv_rb();
             else
